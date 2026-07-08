@@ -893,6 +893,10 @@ impl Ui {
 
 impl Ui {
     pub fn open_document(&mut self, path: PathBuf) {
+        // Opening a different file while a password prompt is up abandons
+        // the prompt; restore the stashed doc first so it isn't silently
+        // lost (password_cancel is a no-op outside Password mode).
+        self.app.password_cancel();
         if self.app.doc().is_none() {
             self.app.mode = crate::app::Mode::Loading { path: path.clone() };
         }
