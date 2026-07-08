@@ -74,13 +74,30 @@ impl PageCache {
         self.entries.len()
     }
 
-    pub fn put(&mut self, entry: CachedPage) {
+    /// Insert `entry`, then evict down to the cap/byte budget — but never
+    /// evict a page in `protected`. `protected` must be exactly the set
+    /// `wanted_renders()` would re-request (the current page plus its
+    /// immediate neighbors): evicting one of those pages here would make it
+    /// look uncached to `wanted_renders`, which re-requests it, whose reply
+    /// then evicts a sibling protected entry in turn — an infinite
+    /// render/evict loop. Protecting the whole working set means eviction can
+    /// leave the cache over budget, but only by a BOUNDED amount (at most
+    /// `cap` entries across at most 3 pages — same-(page, px) puts replace in
+    /// place, and a page flip resets zoom so old sizes age out normally).
+    /// That bounded overshoot is the price of guaranteed convergence.
+    pub fn put(&mut self, entry: CachedPage, protected: &[u16]) {
         self.entries.retain(|e| !(e.page == entry.page && e.px == entry.px));
         self.entries.push_front(entry);
-        while self.entries.len() > 1
-            && (self.entries.len() > self.cap || self.total_bytes() > self.max_bytes)
+        while (self.entries.len() > self.cap || self.total_bytes() > self.max_bytes)
+            && self.entries.len() > 1
         {
-            self.entries.pop_back();
+            // Scan from the back (oldest) for the first evictable entry.
+            match self.entries.iter().rposition(|e| !protected.contains(&e.page)) {
+                Some(idx) => {
+                    self.entries.remove(idx);
+                }
+                None => break, // every remaining entry is protected: bounded overshoot
+            }
         }
     }
 
@@ -343,7 +360,21 @@ impl App {
     /// exact size — pdfium may round differently than layout::render_size).
     pub fn rendered(&mut self, page: CachedPage) {
         self.pending.retain(|k| k.0 != page.page);
-        self.cache.put(page);
+        let protected: Vec<u16> = self
+            .doc()
+            .map(|d| {
+                let c = d.current;
+                let mut p = vec![c];
+                if c > 0 {
+                    p.push(c - 1);
+                }
+                if c + 1 < d.pages {
+                    p.push(c + 1);
+                }
+                p
+            })
+            .unwrap_or_default();
+        self.cache.put(page, &protected);
     }
 
     /// RenderFailed reply. Superseded requests may be re-issued; a genuine
@@ -608,9 +639,9 @@ mod tests {
     fn cache_evicts_oldest_beyond_cap() {
         let mut c = PageCache::new(2);
         let px = SizeU { w: 10, h: 10 };
-        c.put(cached(0, px));
-        c.put(cached(1, px));
-        c.put(cached(2, px));
+        c.put(cached(0, px), &[]);
+        c.put(cached(1, px), &[]);
+        c.put(cached(2, px), &[]);
         assert!(c.get_any(0).is_none(), "0 was evicted");
         assert!(c.get_any(1).is_some());
         assert!(c.get_any(2).is_some());
@@ -625,11 +656,11 @@ mod tests {
             bgra: vec![0; bytes],
             links: vec![],
         };
-        c.put(big(0, 60));
-        c.put(big(1, 60)); // 120 > 100: page 0 evicted
+        c.put(big(0, 60), &[]);
+        c.put(big(1, 60), &[]); // 120 > 100: page 0 evicted
         assert!(c.get_any(0).is_none());
         assert!(c.get_any(1).is_some());
-        c.put(big(2, 300)); // oversized alone: still kept (newest never evicted)
+        c.put(big(2, 300), &[]); // oversized alone: still kept (newest never evicted)
         assert!(c.get_any(2).is_some());
         assert_eq!(c.len(), 1);
     }
@@ -637,17 +668,17 @@ mod tests {
     #[test]
     fn cache_replaces_same_key_instead_of_duplicating() {
         let mut c = PageCache::new(4);
-        c.put(cached(0, SizeU { w: 10, h: 10 }));
-        c.put(cached(0, SizeU { w: 10, h: 10 }));
+        c.put(cached(0, SizeU { w: 10, h: 10 }), &[]);
+        c.put(cached(0, SizeU { w: 10, h: 10 }), &[]);
         assert_eq!(c.len(), 1);
-        c.put(cached(0, SizeU { w: 20, h: 20 })); // different size = separate entry
+        c.put(cached(0, SizeU { w: 20, h: 20 }), &[]); // different size = separate entry
         assert_eq!(c.len(), 2);
     }
 
     #[test]
     fn cache_has_close_tolerates_render_rounding() {
         let mut c = PageCache::new(4);
-        c.put(cached(0, SizeU { w: 800, h: 1000 }));
+        c.put(cached(0, SizeU { w: 800, h: 1000 }), &[]);
         assert!(c.has_close(0, SizeU { w: 801, h: 999 }));
         assert!(!c.has_close(0, SizeU { w: 850, h: 1000 }));
         assert!(!c.has_close(1, SizeU { w: 800, h: 1000 }));
@@ -656,12 +687,36 @@ mod tests {
     #[test]
     fn cache_get_best_prefers_size_match_then_freshest() {
         let mut c = PageCache::new(4);
-        c.put(cached(0, SizeU { w: 100, h: 100 }));
-        c.put(cached(0, SizeU { w: 200, h: 200 })); // freshest
+        c.put(cached(0, SizeU { w: 100, h: 100 }), &[]);
+        c.put(cached(0, SizeU { w: 200, h: 200 }), &[]); // freshest
         let best = c.get_best(0, SizeU { w: 101, h: 100 }).unwrap();
         assert_eq!(best.px, SizeU { w: 100, h: 100 }, "size match wins over freshness");
         let fallback = c.get_best(0, SizeU { w: 999, h: 999 }).unwrap();
         assert_eq!(fallback.px, SizeU { w: 200, h: 200 }, "no size match -> freshest");
+    }
+
+    #[test]
+    fn render_reply_loop_converges_under_budget_pressure() {
+        let mut a = App::new();
+        a.set_client(SizeU { w: 1000, h: 1000 });
+        a.cache = PageCache::with_budget(6, 100);
+        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![]);
+        a.flip(1); // current = 1; working set {0, 1, 2}
+        let mut rounds = 0;
+        loop {
+            let reqs = a.wanted_renders();
+            if reqs.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds <= 4, "render request loop failed to converge (eviction livelock)");
+            for r in reqs {
+                a.mark_pending(&r);
+                let bytes = if r.visible { 60 } else { 30 }; // 60+30+30 = 120 > budget 100
+                a.rendered(CachedPage { page: r.page, px: r.px, bgra: vec![0; bytes], links: vec![] });
+            }
+        }
+        assert!(a.cache.get_any(1).is_some(), "visible page must remain cached");
     }
 
     #[test]
