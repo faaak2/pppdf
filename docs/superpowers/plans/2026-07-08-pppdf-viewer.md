@@ -3383,6 +3383,8 @@ Replace the `window::run(App::new())` call:
     if let Err(e) = window::run(App::new(), initial) {
 ```
 
+**Implementation note (from execution):** the first frame must be presented BEFORE `ShowWindow` (a `paint_now()` helper calling the renderer directly, plus a synchronous `UpdateWindow` right after `ShowWindow` in `run()`). Otherwise the window becomes visible showing its uninitialized WHITE redirection surface while the heavy first D2D present is in flight, and that racy present can be dropped — leaving the window permanently white. Also: never swallow `Renderer::new()` errors with `.ok()` alone — surface them in a MessageBox, or a dead renderer is indistinguishable from this white-window bug.
+
 - [ ] **Step 4: Verify — the app now views PDFs**
 
 Run: `cargo test`
