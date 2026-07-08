@@ -7,7 +7,6 @@ description = "Borderless native PDF viewer for tabletop RPG sessions"
 
 [dependencies]
 pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "thread_safe"] }
-windows-numerics = "0.3.1"
 
 [dependencies.windows]
 version = "0.62.2"

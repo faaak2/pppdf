@@ -1,8 +1,8 @@
 //! Application state machine + page cache. Pure logic — no OS types.
 
 use crate::layout::{
-    self, clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size,
-    zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
+    clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size, zoom_scroll,
+    PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
 use crate::types::{LinkTarget, OutlineItem, PageLink};
@@ -28,15 +28,29 @@ fn close(a: SizeU, b: SizeU) -> bool {
         && (a.h as i32 - b.h as i32).abs() <= SIZE_TOLERANCE
 }
 
+/// Upper bound on total cached pixel bytes (~384 MB). Entry-count alone is
+/// no budget: one zoomed 4K render is ~350 MB.
+const CACHE_BYTE_BUDGET: usize = 384 * 1024 * 1024;
+
 /// Tiny insertion-ordered cache keyed by (page, pixel size). Front = newest.
 pub struct PageCache {
     entries: VecDeque<CachedPage>,
     cap: usize,
+    max_bytes: usize,
 }
 
 impl PageCache {
     pub fn new(cap: usize) -> Self {
-        Self { entries: VecDeque::new(), cap }
+        Self { entries: VecDeque::new(), cap, max_bytes: CACHE_BYTE_BUDGET }
+    }
+
+    /// Used by tests to exercise the byte-budget eviction with small numbers.
+    pub fn with_budget(cap: usize, max_bytes: usize) -> Self {
+        Self { entries: VecDeque::new(), cap, max_bytes }
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.entries.iter().map(|e| e.bgra.len()).sum()
     }
 
     /// Freshest cached render of this page at any size (soft preview).
@@ -63,7 +77,9 @@ impl PageCache {
     pub fn put(&mut self, entry: CachedPage) {
         self.entries.retain(|e| !(e.page == entry.page && e.px == entry.px));
         self.entries.push_front(entry);
-        while self.entries.len() > self.cap {
+        while self.entries.len() > 1
+            && (self.entries.len() > self.cap || self.total_bytes() > self.max_bytes)
+        {
             self.entries.pop_back();
         }
     }
@@ -191,6 +207,9 @@ impl App {
     /// Change page by delta; returns true if the page changed. Resets zoom/scroll.
     pub fn flip(&mut self, delta: i32) -> bool {
         let Some(d) = self.doc_mut() else { return false };
+        if d.pages == 0 {
+            return false;
+        }
         let target = (d.current as i32 + delta).clamp(0, d.pages as i32 - 1) as u16;
         if target == d.current {
             return false;
@@ -448,6 +467,17 @@ mod tests {
         assert_eq!(a.doc().unwrap().current, 2);
     }
 
+    #[test]
+    fn zero_page_doc_navigation_is_safe() {
+        let mut a = App::new();
+        a.set_client(SizeU { w: 1000, h: 1000 });
+        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![]);
+        assert!(!a.flip(1));
+        assert!(!a.flip(-1));
+        assert!(!a.goto(5));
+        assert_eq!(a.wheel(1), WheelOutcome::None);
+    }
+
     // --- wheel ---
 
     #[test]
@@ -584,6 +614,24 @@ mod tests {
         assert!(c.get_any(0).is_none(), "0 was evicted");
         assert!(c.get_any(1).is_some());
         assert!(c.get_any(2).is_some());
+    }
+
+    #[test]
+    fn cache_evicts_by_byte_budget_keeping_newest() {
+        let mut c = PageCache::with_budget(6, 100);
+        let big = |page: u16, bytes: usize| CachedPage {
+            page,
+            px: SizeU { w: 1, h: 1 },
+            bgra: vec![0; bytes],
+            links: vec![],
+        };
+        c.put(big(0, 60));
+        c.put(big(1, 60)); // 120 > 100: page 0 evicted
+        assert!(c.get_any(0).is_none());
+        assert!(c.get_any(1).is_some());
+        c.put(big(2, 300)); // oversized alone: still kept (newest never evicted)
+        assert!(c.get_any(2).is_some());
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

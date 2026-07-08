@@ -1,7 +1,7 @@
 //! Direct2D/DirectWrite: device management and ALL drawing.
 
 use crate::app::{App, Mode};
-use crate::layout::{page_rect, PointF, RectF, SizeU};
+use crate::layout::{RectF, SizeU};
 use windows::core::*;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::*;

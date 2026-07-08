@@ -135,8 +135,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             // failed open leaves the current book fully usable.
             match pdfium.load_pdf_from_file(&path, password.as_deref()) {
                 Ok(d) => {
-                    let _ = reply_tx.send(describe(&d, &path));
-                    doc = Some(d);
+                    if d.pages().len() <= 0 {
+                        let _ = reply_tx.send(PdfReply::LoadFailed {
+                            path,
+                            reason: "document has no pages".into(),
+                        });
+                    } else {
+                        let _ = reply_tx.send(describe(&d, &path));
+                        doc = Some(d);
+                    }
                 }
                 Err(PdfiumError::PdfiumLibraryInternalError(
                     PdfiumInternalError::PasswordError,

@@ -70,6 +70,10 @@ pub struct Ui {
     pub suppress_click: bool,
     /// Pre-F11 window rect, so a second F11 restores it exactly.
     pub saved_rect: Option<RECT>,
+    /// Leftover sub-notch WM_MOUSEWHEEL delta (precision touchpads send many
+    /// small deltas instead of whole 120-unit notches); accumulated across
+    /// events so they aren't truncated to zero forever.
+    pub wheel_residual: i32,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -106,6 +110,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             drag: None,
             suppress_click: false,
             saved_rect: None,
+            wheel_residual: 0,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -331,7 +336,13 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEWHEEL => {
-                    let notches = -(((wparam.0 >> 16) & 0xFFFF) as i16 as i32) / 120; // wheel down = +1
+                    // Precision touchpads send many small deltas (±20-60); accumulate to
+                    // whole 120-unit notches instead of truncating each event to zero.
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    self.wheel_residual += delta;
+                    let steps = self.wheel_residual / 120;
+                    self.wheel_residual -= steps * 120;
+                    let notches = -steps; // wheel down = +1
                     let mut pt = windows::Win32::Foundation::POINT {
                         x: (lparam.0 & 0xFFFF) as i16 as i32,
                         y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
@@ -375,6 +386,7 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDOWN => {
+                    self.suppress_click = false;
                     let p = self.mouse_point(lparam);
                     let over_panel = self.app.doc().map_or(false, |d| {
                         d.overlay.is_some() && p.x < crate::overlay::PANEL_W * self.dpi_scale()
@@ -447,9 +459,7 @@ impl Ui {
                     // this WndProc), and that arm clears self.drag — taking it afterwards
                     // would always see None and every pan release would count as a click.
                     let was_pan = self.drag.take().map_or(false, |d| d.moved);
-                    unsafe {
-                        let _ = ReleaseCapture();
-                    }
+                    let _ = ReleaseCapture();
                     if !was_pan && !suppress {
                         let p = self.mouse_point(lparam);
                         self.on_click(p);
@@ -983,7 +993,6 @@ impl Ui {
 
     fn pump_pdf_replies(&mut self) {
         let Some(rx) = self.reply_rx.take() else { return };
-        let mut page_changed = false;
         while let Ok(reply) = rx.try_recv() {
             match reply {
                 PdfReply::Loaded { path, pages, page_sizes, outline } => {
@@ -995,7 +1004,6 @@ impl Ui {
                         r.clear_page_cache();
                     }
                     self.show_badge();
-                    page_changed = true;
                 }
                 PdfReply::Rendered { page, px, bgra, links } => {
                     self.app.rendered(crate::app::CachedPage { page, px, bgra, links });
@@ -1038,7 +1046,6 @@ impl Ui {
             }
         }
         self.reply_rx = Some(rx);
-        let _ = page_changed;
         self.sync_renders();
         self.invalidate();
     }
