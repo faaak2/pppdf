@@ -6,6 +6,7 @@ use crate::layout::{
 };
 use crate::overlay::OutlineState;
 use crate::types::{LinkTarget, OutlineItem, PageLink};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -99,6 +100,17 @@ impl PageCache {
                 None => break, // every remaining entry is protected: bounded overshoot
             }
         }
+        // Keep at most the newest 2 entries per page: wanted_renders needs at
+        // most one size per page at any instant (always the newest same-page
+        // insert), and the second slot absorbs a stray stale reply — so this
+        // cannot break request convergence, while stopping a slow zoom crawl
+        // from retaining every intermediate size of a protected page.
+        let mut per_page: HashMap<u16, usize> = HashMap::new();
+        self.entries.retain(|e| {
+            let n = per_page.entry(e.page).or_insert(0);
+            *n += 1;
+            *n <= 2
+        });
     }
 
     pub fn clear(&mut self) {
@@ -693,6 +705,24 @@ mod tests {
         assert_eq!(best.px, SizeU { w: 100, h: 100 }, "size match wins over freshness");
         let fallback = c.get_best(0, SizeU { w: 999, h: 999 }).unwrap();
         assert_eq!(fallback.px, SizeU { w: 200, h: 200 }, "no size match -> freshest");
+    }
+
+    #[test]
+    fn cache_keeps_at_most_two_sizes_per_page() {
+        let mut c = PageCache::with_budget(6, usize::MAX);
+        for i in 0..12u32 {
+            c.put(
+                CachedPage {
+                    page: 1,
+                    px: SizeU { w: 100 + i, h: 100 + i },
+                    bgra: vec![0; 10],
+                    links: vec![],
+                },
+                &[1], // page 1 is protected — the crawl must still be bounded
+            );
+        }
+        assert!(c.len() <= 2, "len = {}", c.len());
+        assert!(c.has_close(1, SizeU { w: 111, h: 111 }), "newest size must survive");
     }
 
     #[test]
