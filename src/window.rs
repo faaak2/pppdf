@@ -17,11 +17,13 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemServices::MK_CONTROL;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F11,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, SHAppBarMessage, ShellExecuteW, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE,
@@ -43,6 +45,14 @@ const MIN_SIZE_DIP: i32 = 200;
 pub const TIMER_RESIZE: usize = 1;
 pub const TIMER_BADGE: usize = 2;
 
+/// In-progress left-button drag-pan: origin point, scroll at drag start, and
+/// whether the pointer has moved past the OS drag threshold (click vs. pan).
+pub struct Drag {
+    start: PointF,
+    start_scroll: PointF,
+    moved: bool,
+}
+
 pub struct Ui {
     pub hwnd: HWND,
     pub app: App,
@@ -52,6 +62,8 @@ pub struct Ui {
     pub initial_pdf: Option<PathBuf>,
     /// Bottom-right "N / total" pill: (text, ticks since shown at 33 ms/tick).
     pub badge: Option<(String, u32)>,
+    /// Active drag-pan state while the left button is held over a zoomed page.
+    pub drag: Option<Drag>,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -85,6 +97,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             reply_rx: None,
             initial_pdf,
             badge: None,
+            drag: None,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -221,9 +234,14 @@ impl Ui {
                 }
                 WM_NCLBUTTONDBLCLK => {
                     // DefWindowProc would toggle maximize on caption dbl-click.
-                    // Swallow it; Task 9 wires this to reset-zoom.
+                    // Swallow it, resetting zoom instead (double-click on the
+                    // caption-draggable page body resets to fit).
                     if wparam.0 as u32 == HTCAPTION {
-                        return LRESULT(0);
+                        if self.app.reset_zoom() {
+                            self.sync_renders();
+                            self.invalidate();
+                        }
+                        return LRESULT(0); // never let DefWindowProc maximize
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
                 }
@@ -311,6 +329,17 @@ impl Ui {
                         y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
                     };
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+                    let ctrl = (wparam.0 & 0xFFFF) as u32 & MK_CONTROL.0 != 0;
+                    if ctrl {
+                        let cursor = PointF { x: pt.x as f32, y: pt.y as f32 };
+                        // 1.1 per notch; wheel up (negative notches here) zooms in.
+                        let factor = 1.1_f32.powi(-notches);
+                        if self.app.zoom_by(cursor, factor) {
+                            self.sync_renders(); // crisp render at the new size; soft preview meanwhile
+                            self.invalidate();
+                        }
+                        return LRESULT(0);
+                    }
                     let s = self.dpi_scale();
                     let over_panel = self.app.doc().map_or(false, |d| {
                         d.overlay.is_some() && (pt.x as f32) < crate::overlay::PANEL_W * s
@@ -337,9 +366,78 @@ impl Ui {
                     }
                     LRESULT(0)
                 }
-                WM_LBUTTONUP => {
+                WM_LBUTTONDOWN => {
                     let p = self.mouse_point(lparam);
-                    self.on_click(p);
+                    let over_panel = self.app.doc().map_or(false, |d| {
+                        d.overlay.is_some() && p.x < crate::overlay::PANEL_W * self.dpi_scale()
+                    });
+                    let zoomed = self.app.doc().map_or(false, |d| d.zoom > 1.0 + 1e-4);
+                    let ctrl = (wparam.0 & 0xFFFF) as u32 & MK_CONTROL.0 != 0;
+                    if zoomed && ctrl && !over_panel {
+                        // Move the borderless window from a zoomed state: hand the drag to
+                        // the OS as a caption drag (winit ships this exact pattern).
+                        let _ = ReleaseCapture();
+                        let _ = PostMessageW(
+                            Some(self.hwnd),
+                            WM_NCLBUTTONDOWN,
+                            WPARAM(HTCAPTION as usize),
+                            LPARAM(0),
+                        );
+                    } else if zoomed && !over_panel {
+                        SetCapture(self.hwnd);
+                        let scroll = self.app.doc().map(|d| d.scroll).unwrap_or_default();
+                        self.drag = Some(Drag { start: p, start_scroll: scroll, moved: false });
+                    }
+                    LRESULT(0)
+                }
+                WM_MOUSEMOVE => {
+                    let p = self.mouse_point(lparam);
+                    if let Some(drag) = &mut self.drag {
+                        let (dx, dy) = (p.x - drag.start.x, p.y - drag.start.y);
+                        let (tx, ty) =
+                            (GetSystemMetrics(SM_CXDRAG) as f32, GetSystemMetrics(SM_CYDRAG) as f32);
+                        if dx.abs() > tx || dy.abs() > ty {
+                            drag.moved = true;
+                        }
+                        let moved = drag.moved;
+                        let start_scroll = drag.start_scroll;
+                        if moved {
+                            let want =
+                                PointF { x: start_scroll.x - dx, y: start_scroll.y - dy };
+                            if let (Some(px), Some(_)) = (self.app.current_px(), self.app.doc()) {
+                                let client = self.app.client;
+                                if let Some(d) = self.app.doc_mut() {
+                                    d.scroll = crate::layout::clamp_scroll(px, client, want);
+                                }
+                            }
+                            self.invalidate();
+                        }
+                    }
+                    LRESULT(0)
+                }
+                WM_CAPTURECHANGED => {
+                    self.drag = None;
+                    LRESULT(0)
+                }
+                WM_LBUTTONDBLCLK => {
+                    // Client-space double click (only reachable when zoomed / over links).
+                    if self.app.reset_zoom() {
+                        self.sync_renders();
+                        self.invalidate();
+                    }
+                    LRESULT(0)
+                }
+                WM_LBUTTONUP => {
+                    // ORDER MATTERS: take the drag state BEFORE ReleaseCapture().
+                    // ReleaseCapture delivers WM_CAPTURECHANGED synchronously (reentering
+                    // this WndProc), and that arm clears self.drag — taking it afterwards
+                    // would always see None and every pan release would count as a click.
+                    let was_pan = self.drag.take().map_or(false, |d| d.moved);
+                    let _ = ReleaseCapture();
+                    if !was_pan {
+                        let p = self.mouse_point(lparam);
+                        self.on_click(p);
+                    }
                     LRESULT(0)
                 }
                 WM_SETCURSOR => {
@@ -527,6 +625,13 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            _ if vk == 0x30 || vk == VK_NUMPAD0.0 => {
+                // '0': reset to fit
+                if self.app.reset_zoom() {
+                    self.sync_renders();
+                    self.invalidate();
+                }
+            }
             _ => {}
         }
     }
@@ -593,7 +698,13 @@ impl Ui {
                 self.app.toggle_overlay();
                 self.invalidate();
             }
-            // CMD_OPEN (Task 10), CMD_FIT (Task 9)
+            CMD_FIT => {
+                if self.app.reset_zoom() {
+                    self.sync_renders();
+                    self.invalidate();
+                }
+            }
+            // CMD_OPEN (Task 10)
             _ => {}
         }
     }
