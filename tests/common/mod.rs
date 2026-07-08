@@ -1,8 +1,9 @@
 //! Builds a small fixture PDF entirely in memory: 3 US-Letter pages, each
-//! with a filled black rectangle; page 1 has a GoTo link and a URI link;
-//! outline: "Chapter One" -> p2, "Chapter Two" -> p3 with child "Section 2.1".
-//! Object numbers are fixed; byte offsets for the xref are computed, never
-//! hand-counted.
+//! with a filled pure-red rectangle (red is asymmetric across channels, so a
+//! render proves BGRA vs RGBA byte order — black could not); page 1 has a
+//! GoTo link and a URI link; outline: "Chapter One" -> p2, "Chapter Two" ->
+//! p3 with child "Section 2.1". Object numbers are fixed; byte offsets for
+//! the xref are computed, never hand-counted.
 
 pub fn build_fixture_pdf() -> Vec<u8> {
     fn stream_obj(content: &str) -> String {
@@ -20,9 +21,9 @@ pub fn build_fixture_pdf() -> Vec<u8> {
         ),
         (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>".into()),
         (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>".into()),
-        (6, stream_obj("0 0 0 rg 100 600 200 100 re f")),
-        (7, stream_obj("0 0 0 rg 100 500 300 150 re f")),
-        (8, stream_obj("0 0 0 rg 200 300 150 300 re f")),
+        (6, stream_obj("1 0 0 rg 100 600 200 100 re f")),
+        (7, stream_obj("1 0 0 rg 100 500 300 150 re f")),
+        (8, stream_obj("1 0 0 rg 200 300 150 300 re f")),
         (9, "<< /Type /Outlines /First 10 0 R /Last 11 0 R /Count 3 >>".into()),
         (
             10,

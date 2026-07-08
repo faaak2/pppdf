@@ -112,6 +112,20 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 PdfCmd::Render { page, px, visible: false } => prefetch.push((page, px)),
             }
         }
+        // Dedup prefetches per page (keep the newest) and drop ones that
+        // duplicate the visible page. Dropping silently is safe here only
+        // because the surviving same-page request's reply clears the UI's
+        // pending set by page.
+        let visible_page = visible.map(|(p, _)| p);
+        let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut kept: Vec<(u16, SizeU)> = Vec::new();
+        for &(page, px) in prefetch.iter().rev() {
+            if Some(page) != visible_page && seen.insert(page) {
+                kept.push((page, px));
+            }
+        }
+        kept.reverse();
+        let prefetch = kept;
         for page in superseded {
             let _ = reply_tx.send(PdfReply::RenderFailed { page, reason: "superseded".into() });
         }
@@ -139,7 +153,13 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let work: Vec<(u16, SizeU)> = visible.into_iter().chain(prefetch).collect();
         let mut dropped_after: Option<usize> = None;
         for (i, (page, px)) in work.iter().enumerate() {
-            let Some(d) = &doc else { break };
+            let Some(d) = &doc else {
+                // No document (e.g. the first-ever load failed): every
+                // remaining request still needs a reply or the UI's
+                // pending set would be stranded forever.
+                dropped_after = Some(i);
+                break;
+            };
             let _ = reply_tx.send(render_page(d, *page, *px));
             wake();
             // Preempt: if new commands arrived mid-batch (e.g. a rapid page

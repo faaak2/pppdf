@@ -49,9 +49,10 @@ fn load_render_outline_links() {
     assert_eq!(rpage, 0);
     assert_eq!(rpx, px);
     assert_eq!(bgra.len(), (px.w * px.h * 4) as usize);
-    // The content stream fills a black rect: some pixel must be dark.
-    let dark = bgra.chunks_exact(4).any(|p| p[0] < 60 && p[1] < 60 && p[2] < 60);
-    assert!(dark, "rendered page has no dark pixels — rendering failed?");
+    // The content stream fills a pure-red rect; in BGRA byte order that is
+    // [B~0, G~0, R~255, ...] — asserting BOTH rendering and channel order.
+    let red_bgra = bgra.chunks_exact(4).any(|p| p[0] < 60 && p[1] < 60 && p[2] > 200);
+    assert!(red_bgra, "no red-in-BGRA pixels - rendering or byte order wrong");
 
     // --- links on page 1 ---
     assert_eq!(links.len(), 2);
