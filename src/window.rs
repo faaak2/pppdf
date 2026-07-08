@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_DONOTROUND, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromWindow, HBRUSH, MONITORINFO,
+    BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromWindow, UpdateWindow, HBRUSH, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -114,7 +114,20 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
         DragAcceptFiles(hwnd, true);
+        // Present the first Direct2D frame into the window surface BEFORE the
+        // window is shown. The hwnd render target is created lazily in the
+        // first WM_PAINT, and its first present is far heavier than a GDI fill
+        // (it spins up the D3D device + hwnd render target). Left to the
+        // ordinary async paint, the window becomes visible showing its
+        // uninitialised (white) redirection surface while that first present
+        // is still in flight and the window-open composition can drop it — in
+        // empty mode nothing ever invalidates the window again, so a dropped
+        // first present leaves it permanently white. Painting here initialises
+        // the surface with the real (dark) scene up front, so DWM composites
+        // content from the very first frame of the open animation.
+        ui.paint_now();
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
@@ -248,7 +261,25 @@ impl Ui {
                     };
                     self.pdf_tx = Some(crate::pdf::spawn(reply_tx, wake));
                     self.reply_rx = Some(reply_rx);
-                    self.renderer = Renderer::new().ok();
+                    // Do NOT silently swallow renderer init failure: a dead
+                    // renderer paints nothing, so the window would just sit
+                    // there white with no other symptom. Surface it instead.
+                    self.renderer = match Renderer::new() {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            let msg: Vec<u16> =
+                                format!("pppdf: Direct2D renderer failed to initialise:\n{e}\0")
+                                    .encode_utf16()
+                                    .collect();
+                            MessageBoxW(
+                                Some(self.hwnd),
+                                PCWSTR(msg.as_ptr()),
+                                w!("pppdf"),
+                                MB_OK | MB_ICONERROR,
+                            );
+                            None
+                        }
+                    };
                     self.app.set_client(self.client_size());
                     self.app.dpi = GetDpiForWindow(self.hwnd);
                     // CRITICAL: forward the window's actual DPI to the renderer NOW.
@@ -470,6 +501,15 @@ impl Ui {
     fn invalidate(&self) {
         unsafe {
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// Render one frame directly (outside WM_PAINT). Used once before the
+    /// window is shown so the surface holds real content from the first frame.
+    pub fn paint_now(&mut self) {
+        if let Some(mut r) = self.renderer.take() {
+            let _ = r.draw(self.hwnd, &self.app, None);
+            self.renderer = Some(r);
         }
     }
 
