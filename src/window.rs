@@ -64,6 +64,7 @@ pub struct Ui {
     pub badge: Option<(String, u32)>,
     /// Active drag-pan state while the left button is held over a zoomed page.
     pub drag: Option<Drag>,
+    pub suppress_click: bool,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -98,6 +99,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             initial_pdf,
             badge: None,
             drag: None,
+            suppress_click: false,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -425,16 +427,24 @@ impl Ui {
                         self.sync_renders();
                         self.invalidate();
                     }
+                    // A dblclk is followed by a second WM_LBUTTONUP with no
+                    // matching BUTTONDOWN; without this flag that UP would fire
+                    // on_click() again against the just-reset page geometry
+                    // (spurious link navigation).
+                    self.suppress_click = true;
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
+                    let suppress = std::mem::take(&mut self.suppress_click);
                     // ORDER MATTERS: take the drag state BEFORE ReleaseCapture().
                     // ReleaseCapture delivers WM_CAPTURECHANGED synchronously (reentering
                     // this WndProc), and that arm clears self.drag — taking it afterwards
                     // would always see None and every pan release would count as a click.
                     let was_pan = self.drag.take().map_or(false, |d| d.moved);
-                    let _ = ReleaseCapture();
-                    if !was_pan {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    if !was_pan && !suppress {
                         let p = self.mouse_point(lparam);
                         self.on_click(p);
                     }
