@@ -8,6 +8,22 @@ use windows::Win32::UI::HiDpi::{
 };
 
 fn main() {
+    // Any thread's panic (incl. the PDF thread) surfaces visibly, then exits —
+    // no zombie chromeless window.
+    std::panic::set_hook(Box::new(|info| {
+        let text: Vec<u16> = format!("pppdf crashed:\n{info}\0").encode_utf16().collect();
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+            MessageBoxW(
+                None,
+                windows::core::PCWSTR(text.as_ptr()),
+                windows::core::w!("pppdf"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+        std::process::exit(1);
+    }));
+
     // Belt and suspenders with the embedded manifest; must precede any HWND.
     // Access-denied here just means the manifest already set it.
     unsafe {

@@ -18,6 +18,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::MK_CONTROL;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -26,8 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, SHAppBarMessage, ShellExecuteW, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE,
-    ABS_AUTOHIDE, APPBARDATA,
+    DragAcceptFiles, DragFinish, DragQueryFileW, SHAppBarMessage, ShellExecuteW, HDROP,
+    ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -65,6 +68,8 @@ pub struct Ui {
     /// Active drag-pan state while the left button is held over a zoomed page.
     pub drag: Option<Drag>,
     pub suppress_click: bool,
+    /// Pre-F11 window rect, so a second F11 restores it exactly.
+    pub saved_rect: Option<RECT>,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -100,6 +105,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             badge: None,
             drag: None,
             suppress_click: false,
+            saved_rect: None,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -545,6 +551,35 @@ impl Ui {
                     self.on_key(wparam.0 as u16);
                     LRESULT(0)
                 }
+                WM_CHAR => {
+                    if matches!(self.app.mode, crate::app::Mode::Password { .. }) {
+                        let c = char::from_u32(wparam.0 as u32).unwrap_or('\0');
+                        match c {
+                            '\r' => {
+                                if let Some((path, pw)) = self.app.password_take() {
+                                    self.send_pdf(PdfCmd::Load { path, password: Some(pw) });
+                                }
+                            }
+                            '\u{8}' => self.app.password_backspace(),
+                            c if !c.is_control() => self.app.password_char(c),
+                            _ => {}
+                        }
+                        self.invalidate();
+                    }
+                    LRESULT(0)
+                }
+                WM_DROPFILES => {
+                    let hdrop = HDROP(wparam.0 as *mut core::ffi::c_void);
+                    let mut buf = [0u16; 1024];
+                    let n = DragQueryFileW(hdrop, 0, Some(&mut buf));
+                    DragFinish(hdrop);
+                    if n > 0 {
+                        self.open_document(PathBuf::from(String::from_utf16_lossy(
+                            &buf[..n as usize],
+                        )));
+                    }
+                    LRESULT(0)
+                }
                 WM_DESTROY => {
                     PostQuitMessage(0);
                     LRESULT(0)
@@ -604,6 +639,15 @@ impl Ui {
     }
 
     fn on_key(&mut self, vk: u16) {
+        if matches!(self.app.mode, crate::app::Mode::Password { .. }) {
+            if vk == VK_ESCAPE.0 {
+                // Restores the stashed doc if one was open, else Empty.
+                self.app.password_cancel();
+                self.sync_renders();
+                self.invalidate();
+            }
+            return; // printable input + Enter/Backspace arrive via WM_CHAR
+        }
         if self.overlay_key(vk) {
             return;
         }
@@ -612,6 +656,8 @@ impl Ui {
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            0x4F if ctrl => self.open_dialog(), // Ctrl+O
+            _ if vk == VK_F11.0 => self.toggle_fill(),
             _ if vk == VK_TAB.0 => {
                 self.app.toggle_overlay();
                 self.invalidate();
@@ -681,6 +727,46 @@ impl Ui {
         }
     }
 
+    /// F11: fill the current monitor's work area edge to edge (taskbar stays
+    /// visible); a second press restores the previous size/position.
+    /// Independent of native maximize (Win+Up).
+    fn toggle_fill(&mut self) {
+        unsafe {
+            if let Some(saved) = self.saved_rect.take() {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    saved.left,
+                    saved.top,
+                    saved.right - saved.left,
+                    saved.bottom - saved.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                return;
+            }
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut rc);
+            let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: core::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                self.saved_rect = Some(rc);
+                let w = mi.rcWork;
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    w.left,
+                    w.top,
+                    w.right - w.left,
+                    w.bottom - w.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
     fn show_menu(&mut self, sx: i32, sy: i32) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
@@ -714,7 +800,7 @@ impl Ui {
                     self.invalidate();
                 }
             }
-            // CMD_OPEN (Task 10)
+            CMD_OPEN => self.open_dialog(),
             _ => {}
         }
     }
@@ -807,9 +893,38 @@ impl Ui {
 
 impl Ui {
     pub fn open_document(&mut self, path: PathBuf) {
-        self.app.mode = crate::app::Mode::Loading { path: path.clone() };
+        if self.app.doc().is_none() {
+            self.app.mode = crate::app::Mode::Loading { path: path.clone() };
+        }
         self.send_pdf(PdfCmd::Load { path, password: None });
         self.invalidate();
+    }
+
+    fn open_dialog(&mut self) {
+        let mut file_buf = [0u16; 1024];
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: core::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: self.hwnd,
+            // w!() const-encodes the embedded NULs of the classic filter format.
+            lpstrFilter: w!("PDF documents (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0"),
+            nFilterIndex: 1,
+            lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+            nMaxFile: file_buf.len() as u32,
+            lpstrTitle: w!("Open PDF"),
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+            ..Default::default()
+        };
+        if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
+            let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
+            self.open_document(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])));
+        }
+    }
+
+    fn error_box(&self, text: &str) {
+        let wide: Vec<u16> = format!("{text}\0").encode_utf16().collect();
+        unsafe {
+            MessageBoxW(Some(self.hwnd), PCWSTR(wide.as_ptr()), w!("pppdf"), MB_OK | MB_ICONERROR);
+        }
     }
 
     fn send_pdf(&self, cmd: PdfCmd) {
@@ -885,13 +1000,36 @@ impl Ui {
                     self.app.render_failed(page, reason == "superseded");
                 }
                 PdfReply::NeedsPassword { path } => {
-                    // Task 10 shows the in-window password prompt.
-                    let _ = path;
+                    // Stash a currently open document so Esc can restore it
+                    // (the PDF thread kept it loaded, too — Task 4).
+                    let prev = match std::mem::replace(&mut self.app.mode, crate::app::Mode::Empty)
+                    {
+                        crate::app::Mode::Doc(d) => Some(Box::new(d)),
+                        _ => None,
+                    };
+                    self.app.mode =
+                        crate::app::Mode::Password { path, buf: String::new(), prev };
                 }
                 PdfReply::LoadFailed { path, reason } => {
-                    // Task 10 shows the error box; until then keep the state sane.
-                    let _ = (path, reason);
-                    self.app.mode = crate::app::Mode::Empty;
+                    if path.as_os_str().is_empty() {
+                        // pdfium.dll itself failed to load — nothing can work.
+                        self.error_box(
+                            "pdfium.dll could not be loaded.\n\nIt must sit in the same \
+                             folder as pppdf.exe. Run fetch-pdfium.ps1 or re-copy the dll, \
+                             then start pppdf again.",
+                        );
+                        self.quit();
+                    } else {
+                        self.error_box(&format!(
+                            "Could not open\n{}\n\n{reason}",
+                            path.display()
+                        ));
+                        // A previously open document is untouched (the PDF thread
+                        // kept it); only fall back to Empty if nothing is open.
+                        if matches!(self.app.mode, crate::app::Mode::Loading { .. }) {
+                            self.app.mode = crate::app::Mode::Empty;
+                        }
+                    }
                 }
             }
         }
