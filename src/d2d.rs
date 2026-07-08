@@ -127,6 +127,9 @@ impl Renderer {
             if centered {
                 f.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
                 f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            } else {
+                f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?; // vertical centering in row rects
+                f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
             }
             self.formats.push((key, f.clone()));
             Ok(f)
@@ -245,11 +248,101 @@ impl Renderer {
                             rt.DrawBitmap(&bmp, Some(&rectf(dest)), 1.0, mode, None);
                         }
                     }
-                    // Overlay + badge drawing lands in Task 8.
-                    let _ = badge;
+                    if let Some(ov) = &d.overlay {
+                        self.draw_overlay(rt, ov, client)?;
+                    }
+                    if let Some((text, alpha)) = badge {
+                        self.draw_badge(rt, text, alpha, client)?;
+                    }
                 }
             }
             rt.EndDraw(None, None)
         }
+    }
+
+    fn draw_overlay(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        ov: &crate::overlay::OutlineState,
+        client: SizeU,
+    ) -> Result<()> {
+        use crate::overlay::{CHEVRON_W, INDENT, PANEL_W, ROW_H};
+        let s = self.scale();
+        let panel =
+            RectF { left: 0.0, top: 0.0, right: PANEL_W * s, bottom: client.h as f32 };
+        unsafe {
+            let bg = rt.CreateSolidColorBrush(&color(0.055, 0.055, 0.055, 0.85), None)?;
+            rt.FillRectangle(&rectf(panel), &bg);
+        }
+        if ov.items.is_empty() {
+            let fmt = self.text_format(14.0, true)?;
+            return self.draw_text(rt, "No table of contents", &fmt, panel, color(1.0, 1.0, 1.0, 0.4));
+        }
+        let fmt = self.text_format(14.0, false)?;
+        let panel_h_dip = client.h as f32 / s;
+        for (pos, &idx) in ov.visible().iter().enumerate() {
+            let top_dip = ov.row_top(pos);
+            if top_dip + ROW_H < 0.0 {
+                continue;
+            }
+            if top_dip > panel_h_dip {
+                break;
+            }
+            let it = &ov.items[idx];
+            let y = top_dip * s;
+            let row = RectF { left: 0.0, top: y, right: PANEL_W * s, bottom: y + ROW_H * s };
+            if idx == ov.selected {
+                unsafe {
+                    let sel = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.12), None)?;
+                    rt.FillRectangle(&rectf(row), &sel);
+                }
+            }
+            let indent = it.depth as f32 * INDENT * s;
+            if it.has_children {
+                let chev_rect = RectF {
+                    left: indent + 4.0 * s,
+                    top: row.top,
+                    right: indent + CHEVRON_W * s,
+                    bottom: row.bottom,
+                };
+                let glyph = if ov.is_expanded(idx) { "▾" } else { "▸" };
+                self.draw_text(rt, glyph, &fmt, chev_rect, color(1.0, 1.0, 1.0, 0.55))?;
+            }
+            let title_rect = RectF {
+                left: indent + CHEVRON_W * s + 2.0 * s,
+                top: row.top,
+                right: PANEL_W * s - 8.0 * s,
+                bottom: row.bottom,
+            };
+            self.draw_text(rt, &it.title, &fmt, title_rect, color(1.0, 1.0, 1.0, 0.9))?;
+        }
+        Ok(())
+    }
+
+    fn draw_badge(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        text: &str,
+        alpha: f32,
+        client: SizeU,
+    ) -> Result<()> {
+        if alpha <= 0.0 {
+            return Ok(());
+        }
+        let s = self.scale();
+        let (bw, bh, m) = (110.0 * s, 36.0 * s, 24.0 * s);
+        let r = RectF {
+            left: client.w as f32 - bw - m,
+            top: client.h as f32 - bh - m,
+            right: client.w as f32 - m,
+            bottom: client.h as f32 - m,
+        };
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT { rect: rectf(r), radiusX: bh / 2.0, radiusY: bh / 2.0 };
+            let bg = rt.CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 0.7 * alpha), None)?;
+            rt.FillRoundedRectangle(&rr, &bg);
+        }
+        let fmt = self.text_format(14.0, true)?;
+        self.draw_text(rt, text, &fmt, r, color(1.0, 1.0, 1.0, 0.9 * alpha))
     }
 }

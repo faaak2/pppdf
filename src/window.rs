@@ -3,7 +3,7 @@
 use crate::app::App;
 use crate::d2d::Renderer;
 use crate::layout::{hit_zone, PointF, SizeU, Zone};
-use crate::types::{PdfCmd, PdfReply};
+use crate::types::{LinkTarget, PdfCmd, PdfReply};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use windows::core::*;
@@ -20,12 +20,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
-    VK_SHIFT, VK_SPACE,
+    GetKeyState, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, SHAppBarMessage, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE,
-    APPBARDATA,
+    DragAcceptFiles, SHAppBarMessage, ShellExecuteW, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE,
+    ABS_AUTOHIDE, APPBARDATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -50,7 +50,12 @@ pub struct Ui {
     pub pdf_tx: Option<Sender<PdfCmd>>,
     pub reply_rx: Option<Receiver<PdfReply>>,
     pub initial_pdf: Option<PathBuf>,
+    /// Bottom-right "N / total" pill: (text, ticks since shown at 33 ms/tick).
+    pub badge: Option<(String, u32)>,
 }
+
+const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
+const BADGE_FADE_TICKS: u32 = 10; // ~330 ms fade
 
 pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
     unsafe {
@@ -79,6 +84,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             pdf_tx: None,
             reply_rx: None,
             initial_pdf,
+            badge: None,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -300,15 +306,78 @@ impl Ui {
                 }
                 WM_MOUSEWHEEL => {
                     let notches = -(((wparam.0 >> 16) & 0xFFFF) as i16 as i32) / 120; // wheel down = +1
-                    if notches != 0 && self.app.wheel(notches) != crate::app::WheelOutcome::None {
-                        self.sync_renders();
+                    let mut pt = windows::Win32::Foundation::POINT {
+                        x: (lparam.0 & 0xFFFF) as i16 as i32,
+                        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                    };
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+                    let s = self.dpi_scale();
+                    let over_panel = self.app.doc().map_or(false, |d| {
+                        d.overlay.is_some() && (pt.x as f32) < crate::overlay::PANEL_W * s
+                    });
+                    if over_panel {
+                        let panel_h = self.app.client.h as f32 / s;
+                        if let Some(ov) = self.app.doc_mut().and_then(|d| d.overlay.as_mut()) {
+                            ov.scroll_by(notches as f32 * 2.0 * crate::overlay::ROW_H, panel_h);
+                        }
                         self.invalidate();
+                    } else if notches != 0 {
+                        match self.app.wheel(notches) {
+                            crate::app::WheelOutcome::Flipped => {
+                                self.sync_renders();
+                                self.show_badge();
+                                self.invalidate();
+                            }
+                            crate::app::WheelOutcome::Redraw => {
+                                self.sync_renders();
+                                self.invalidate();
+                            }
+                            crate::app::WheelOutcome::None => {}
+                        }
                     }
                     LRESULT(0)
+                }
+                WM_LBUTTONUP => {
+                    let p = self.mouse_point(lparam);
+                    self.on_click(p);
+                    LRESULT(0)
+                }
+                WM_SETCURSOR => {
+                    if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+                        let mut pt = windows::Win32::Foundation::POINT::default();
+                        let _ = GetCursorPos(&mut pt);
+                        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+                        let p = PointF { x: pt.x as f32, y: pt.y as f32 };
+                        let over_overlay = self.app.doc().map_or(false, |d| {
+                            d.overlay.is_some() && p.x < crate::overlay::PANEL_W * self.dpi_scale()
+                        });
+                        if !over_overlay && self.app.link_at(p).is_some() {
+                            if let Ok(hand) = LoadCursorW(None, IDC_HAND) {
+                                let _ = SetCursor(Some(hand));
+                            }
+                            return LRESULT(1);
+                        }
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
                 }
                 WM_TIMER if wparam.0 == TIMER_RESIZE => {
                     let _ = KillTimer(Some(self.hwnd), TIMER_RESIZE);
                     self.sync_renders();
+                    self.invalidate();
+                    LRESULT(0)
+                }
+                WM_TIMER if wparam.0 == TIMER_BADGE => {
+                    let done = match &mut self.badge {
+                        Some((_, ticks)) => {
+                            *ticks += 1;
+                            *ticks > BADGE_HOLD_TICKS + BADGE_FADE_TICKS
+                        }
+                        None => true,
+                    };
+                    if done {
+                        self.badge = None;
+                        let _ = KillTimer(Some(self.hwnd), TIMER_BADGE);
+                    }
                     self.invalidate();
                     LRESULT(0)
                 }
@@ -358,7 +427,7 @@ impl Ui {
                     let mut ps = PAINTSTRUCT::default();
                     let _ = BeginPaint(self.hwnd, &mut ps);
                     if let Some(mut r) = self.renderer.take() {
-                        let _ = r.draw(self.hwnd, &self.app, None);
+                        let _ = r.draw(self.hwnd, &self.app, self.badge_display());
                         self.renderer = Some(r);
                     }
                     let _ = EndPaint(self.hwnd, &ps);
@@ -410,17 +479,35 @@ impl Ui {
 
     /// Should this client-space point get normal mouse handling instead of
     /// dragging the window? Extended in Task 8 (links, overlay) and Task 9
-    /// (zoomed state). For now: no.
-    fn wants_client_mouse(&self, _p: PointF) -> bool {
+    /// (zoomed state).
+    fn wants_client_mouse(&self, p: PointF) -> bool {
+        if let Some(d) = self.app.doc() {
+            if d.overlay.is_some() && p.x < crate::overlay::PANEL_W * self.dpi_scale() {
+                return true;
+            }
+            if d.zoom > 1.0 + 1e-4 {
+                return true; // Task 9: dragging pans instead of moving the window
+            }
+            if self.app.link_at(p).is_some() {
+                return true;
+            }
+        }
         false
     }
 
     fn on_key(&mut self, vk: u16) {
+        if self.overlay_key(vk) {
+            return;
+        }
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            _ if vk == VK_TAB.0 => {
+                self.app.toggle_overlay();
+                self.invalidate();
+            }
             _ if vk == VK_NEXT.0 || vk == VK_RIGHT.0 => self.flip(1),
             _ if vk == VK_PRIOR.0 || vk == VK_LEFT.0 => self.flip(-1),
             _ if vk == VK_SPACE.0 => self.flip(if shift { -1 } else { 1 }),
@@ -428,6 +515,7 @@ impl Ui {
                 let changed = self.app.goto(0);
                 if changed {
                     self.sync_renders();
+                    self.show_badge();
                     self.invalidate();
                 }
             }
@@ -435,11 +523,41 @@ impl Ui {
                 let last = self.app.doc().map(|d| d.pages.saturating_sub(1)).unwrap_or(0);
                 if self.app.goto(last) {
                     self.sync_renders();
+                    self.show_badge();
                     self.invalidate();
                 }
             }
             _ => {}
         }
+    }
+
+    /// Handle a key inside the open overlay. Returns true if consumed.
+    fn overlay_key(&mut self, vk: u16) -> bool {
+        let s = self.dpi_scale();
+        let panel_h = self.app.client.h as f32 / s;
+        let Some(d) = self.app.doc_mut() else { return false };
+        let Some(ov) = d.overlay.as_mut() else { return false };
+        match vk {
+            _ if vk == VK_DOWN.0 => ov.move_selection(1, panel_h),
+            _ if vk == VK_UP.0 => ov.move_selection(-1, panel_h),
+            _ if vk == VK_RIGHT.0 => ov.expand_selected(),
+            _ if vk == VK_LEFT.0 => ov.collapse_selected(),
+            _ if vk == VK_RETURN.0 => {
+                let page = ov.activate();
+                d.overlay = None;
+                if let Some(page) = page {
+                    if self.app.goto(page) {
+                        self.sync_renders();
+                        self.show_badge();
+                    }
+                }
+            }
+            _ if vk == VK_ESCAPE.0 => d.overlay = None,
+            _ if vk == VK_TAB.0 => d.overlay = None,
+            _ => return false, // PgUp/PgDn etc. still page the document
+        }
+        self.invalidate();
+        true
     }
 
     fn quit(&self) {
@@ -471,8 +589,97 @@ impl Ui {
                 let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
             },
             CMD_CLOSE => self.quit(),
-            // CMD_OPEN (Task 10), CMD_TOC (Task 8), CMD_FIT (Task 9)
+            CMD_TOC => {
+                self.app.toggle_overlay();
+                self.invalidate();
+            }
+            // CMD_OPEN (Task 10), CMD_FIT (Task 9)
             _ => {}
+        }
+    }
+
+    fn follow_link(&mut self, target: LinkTarget) {
+        match target {
+            LinkTarget::Page(p) => {
+                if self.app.goto(p) {
+                    self.sync_renders();
+                    self.show_badge();
+                    self.invalidate();
+                }
+            }
+            LinkTarget::Uri(uri) => {
+                // Spec: default browser for web links; other schemes ignored.
+                if uri.starts_with("http://") || uri.starts_with("https://") {
+                    unsafe {
+                        let _ = ShellExecuteW(
+                            None,
+                            w!("open"),
+                            &HSTRING::from(uri.as_str()),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn mouse_point(&self, lparam: LPARAM) -> PointF {
+        PointF {
+            x: (lparam.0 & 0xFFFF) as i16 as f32,
+            y: ((lparam.0 >> 16) & 0xFFFF) as i16 as f32,
+        }
+    }
+
+    /// Dispatch a left click: the overlay panel first (it covers the page),
+    /// then page links.
+    fn on_click(&mut self, p: PointF) {
+        let s = self.dpi_scale();
+        // 1) Overlay panel
+        let overlay_hit = self.app.doc().and_then(|d| d.overlay.as_ref()).and_then(|ov| {
+            if p.x < crate::overlay::PANEL_W * s {
+                let local = PointF { x: p.x / s, y: p.y / s };
+                let panel_h = self.app.client.h as f32 / s;
+                Some(match ov.hit_test(local, panel_h) {
+                    crate::overlay::OverlayHit::Chevron(i) => (true, i),
+                    crate::overlay::OverlayHit::Title(i) => (false, i),
+                    crate::overlay::OverlayHit::None => return None,
+                })
+            } else {
+                None
+            }
+        });
+        if let Some((is_chevron, idx)) = overlay_hit {
+            let d = self.app.doc_mut().unwrap();
+            let ov = d.overlay.as_mut().unwrap();
+            if is_chevron {
+                ov.toggle(idx);
+            } else {
+                ov.select(idx);
+                let page = ov.activate();
+                d.overlay = None; // jump closes the panel
+                if let Some(page) = page {
+                    if self.app.goto(page) {
+                        self.sync_renders();
+                        self.show_badge();
+                    }
+                }
+            }
+            self.invalidate();
+            return;
+        }
+        // Don't treat page clicks as links while the overlay covers that spot.
+        let overlay_open_here = self
+            .app
+            .doc()
+            .map_or(false, |d| d.overlay.is_some() && p.x < crate::overlay::PANEL_W * s);
+        if overlay_open_here {
+            return;
+        }
+        // 2) Page links
+        if let Some(target) = self.app.link_at(p) {
+            self.follow_link(target);
         }
     }
 }
@@ -504,11 +711,32 @@ impl Ui {
         }
     }
 
+    fn show_badge(&mut self) {
+        if let Some(d) = self.app.doc() {
+            self.badge = Some((format!("{} / {}", d.current + 1, d.pages), 0));
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
+            }
+            self.invalidate();
+        }
+    }
+
+    fn badge_display(&self) -> Option<(&str, f32)> {
+        self.badge.as_ref().map(|(text, ticks)| {
+            let alpha = if *ticks <= BADGE_HOLD_TICKS {
+                1.0
+            } else {
+                1.0 - (*ticks - BADGE_HOLD_TICKS) as f32 / BADGE_FADE_TICKS as f32
+            };
+            (text.as_str(), alpha.clamp(0.0, 1.0))
+        })
+    }
+
     /// Render one frame directly (outside WM_PAINT). Used once before the
     /// window is shown so the surface holds real content from the first frame.
     pub fn paint_now(&mut self) {
         if let Some(mut r) = self.renderer.take() {
-            let _ = r.draw(self.hwnd, &self.app, None);
+            let _ = r.draw(self.hwnd, &self.app, self.badge_display());
             self.renderer = Some(r);
         }
     }
@@ -526,6 +754,7 @@ impl Ui {
                     if let Some(r) = &mut self.renderer {
                         r.clear_page_cache();
                     }
+                    self.show_badge();
                     page_changed = true;
                 }
                 PdfReply::Rendered { page, px, bgra, links } => {
@@ -554,8 +783,8 @@ impl Ui {
     fn flip(&mut self, delta: i32) {
         if self.app.flip(delta) {
             self.sync_renders();
+            self.show_badge();
             self.invalidate();
-            // Task 8 shows the page badge here.
         }
     }
 }
