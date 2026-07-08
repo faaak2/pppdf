@@ -13,7 +13,8 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    if let Err(e) = window::run(App::new()) {
+    let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
+    if let Err(e) = window::run(App::new(), initial) {
         // No console in windows subsystem — surface startup failures visibly.
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};

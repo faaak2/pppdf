@@ -1,7 +1,11 @@
 //! The borderless Win32 window: class, WndProc, chromeless tricks, input.
 
 use crate::app::App;
+use crate::d2d::Renderer;
 use crate::layout::{hit_zone, PointF, SizeU, Zone};
+use crate::types::{PdfCmd, PdfReply};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
@@ -9,13 +13,16 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_DONOTROUND, DWM_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
-    MonitorFromWindow, HBRUSH, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromWindow, HBRUSH, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT, VK_SPACE,
+};
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, SHAppBarMessage, ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE,
     APPBARDATA,
@@ -33,12 +40,19 @@ pub const CMD_CLOSE: usize = 5;
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
 
+pub const TIMER_RESIZE: usize = 1;
+pub const TIMER_BADGE: usize = 2;
+
 pub struct Ui {
     pub hwnd: HWND,
     pub app: App,
+    pub renderer: Option<Renderer>,
+    pub pdf_tx: Option<Sender<PdfCmd>>,
+    pub reply_rx: Option<Receiver<PdfReply>>,
+    pub initial_pdf: Option<PathBuf>,
 }
 
-pub fn run(app: App) -> Result<()> {
+pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class_name = w!("pppdf_window");
@@ -58,7 +72,14 @@ pub fn run(app: App) -> Result<()> {
         let atom = RegisterClassExW(&wc);
         debug_assert!(atom != 0);
 
-        let mut ui = Box::new(Ui { hwnd: HWND::default(), app });
+        let mut ui = Box::new(Ui {
+            hwnd: HWND::default(),
+            app,
+            renderer: None,
+            pdf_tx: None,
+            reply_rx: None,
+            initial_pdf,
+        });
 
         // Every flag here is load-bearing for native snap/animations; the
         // caption never shows because WM_NCCALCSIZE claims the whole rect.
@@ -214,12 +235,81 @@ impl Ui {
                 WM_CONTEXTMENU => LRESULT(0), // we run our own menu above
 
                 // === lifecycle / painting ===
-                WM_SIZE => {
+                WM_CREATE => {
+                    let hwnd_raw = self.hwnd.0 as isize;
+                    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                    let wake = move || {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut core::ffi::c_void)),
+                            WM_APP_PDF_REPLY,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    };
+                    self.pdf_tx = Some(crate::pdf::spawn(reply_tx, wake));
+                    self.reply_rx = Some(reply_rx);
+                    self.renderer = Renderer::new().ok();
                     self.app.set_client(self.client_size());
+                    self.app.dpi = GetDpiForWindow(self.hwnd);
+                    // CRITICAL: forward the window's actual DPI to the renderer NOW.
+                    // WM_DPICHANGED never fires on a single monitor, and without this the
+                    // overlay/text draw at 96-DPI scale while hit-testing uses the real DPI
+                    // (misaligned clicks on every >100% display).
+                    if let Some(r) = &mut self.renderer {
+                        r.set_dpi(self.app.dpi);
+                    }
+                    if let Some(path) = self.initial_pdf.take() {
+                        self.open_document(path);
+                    }
+                    LRESULT(0)
+                }
+                WM_APP_PDF_REPLY => {
+                    self.pump_pdf_replies();
+                    LRESULT(0)
+                }
+                WM_MOUSEWHEEL => {
+                    let notches = -(((wparam.0 >> 16) & 0xFFFF) as i16 as i32) / 120; // wheel down = +1
+                    if notches != 0 && self.app.wheel(notches) != crate::app::WheelOutcome::None {
+                        self.sync_renders();
+                        self.invalidate();
+                    }
+                    LRESULT(0)
+                }
+                WM_TIMER if wparam.0 == TIMER_RESIZE => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RESIZE);
+                    self.sync_renders();
+                    self.invalidate();
+                    LRESULT(0)
+                }
+                WM_EXITSIZEMOVE => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RESIZE);
+                    self.sync_renders();
+                    self.invalidate();
+                    LRESULT(0)
+                }
+                WM_SIZE => {
+                    let size = self.client_size();
+                    self.app.set_client(size);
+                    // Re-clamp a zoomed pan against the new client size, or the page draws
+                    // off-center with a blank band until the next wheel/drag.
+                    if let Some(px) = self.app.current_px() {
+                        let client = self.app.client;
+                        if let Some(d) = self.app.doc_mut() {
+                            d.scroll = crate::layout::clamp_scroll(px, client, d.scroll);
+                        }
+                    }
+                    if let Some(r) = &mut self.renderer {
+                        r.resize(size.w, size.h);
+                    }
+                    SetTimer(Some(self.hwnd), TIMER_RESIZE, 150, None);
+                    self.invalidate();
                     LRESULT(0)
                 }
                 WM_DPICHANGED => {
                     self.app.dpi = (wparam.0 & 0xFFFF) as u32;
+                    if let Some(r) = &mut self.renderer {
+                        r.set_dpi((wparam.0 & 0xFFFF) as u32);
+                    }
                     let suggested = &*(lparam.0 as *const RECT);
                     let _ = SetWindowPos(
                         self.hwnd,
@@ -234,12 +324,12 @@ impl Ui {
                 }
                 WM_ERASEBKGND => LRESULT(1),
                 WM_PAINT => {
-                    // Temporary GDI fill; Task 7 replaces this with Direct2D.
                     let mut ps = PAINTSTRUCT::default();
-                    let hdc = BeginPaint(self.hwnd, &mut ps);
-                    let brush = CreateSolidBrush(COLORREF(0x001A1A1A));
-                    FillRect(hdc, &ps.rcPaint, brush);
-                    let _ = DeleteObject(brush.into());
+                    let _ = BeginPaint(self.hwnd, &mut ps);
+                    if let Some(mut r) = self.renderer.take() {
+                        let _ = r.draw(self.hwnd, &self.app, None);
+                        self.renderer = Some(r);
+                    }
                     let _ = EndPaint(self.hwnd, &ps);
                     LRESULT(0)
                 }
@@ -296,9 +386,27 @@ impl Ui {
 
     fn on_key(&mut self, vk: u16) {
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            _ if vk == VK_NEXT.0 || vk == VK_RIGHT.0 => self.flip(1),
+            _ if vk == VK_PRIOR.0 || vk == VK_LEFT.0 => self.flip(-1),
+            _ if vk == VK_SPACE.0 => self.flip(if shift { -1 } else { 1 }),
+            _ if vk == VK_HOME.0 => {
+                let changed = self.app.goto(0);
+                if changed {
+                    self.sync_renders();
+                    self.invalidate();
+                }
+            }
+            _ if vk == VK_END.0 => {
+                let last = self.app.doc().map(|d| d.pages.saturating_sub(1)).unwrap_or(0);
+                if self.app.goto(last) {
+                    self.sync_renders();
+                    self.invalidate();
+                }
+            }
             _ => {}
         }
     }
@@ -334,6 +442,80 @@ impl Ui {
             CMD_CLOSE => self.quit(),
             // CMD_OPEN (Task 10), CMD_TOC (Task 8), CMD_FIT (Task 9)
             _ => {}
+        }
+    }
+}
+
+impl Ui {
+    pub fn open_document(&mut self, path: PathBuf) {
+        self.app.mode = crate::app::Mode::Loading { path: path.clone() };
+        self.send_pdf(PdfCmd::Load { path, password: None });
+        self.invalidate();
+    }
+
+    fn send_pdf(&self, cmd: PdfCmd) {
+        if let Some(tx) = &self.pdf_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// Ask the PDF thread for whatever the current state needs rendered.
+    pub fn sync_renders(&mut self) {
+        for req in self.app.wanted_renders() {
+            self.app.mark_pending(&req);
+            self.send_pdf(PdfCmd::Render { page: req.page, px: req.px, visible: req.visible });
+        }
+    }
+
+    fn invalidate(&self) {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn pump_pdf_replies(&mut self) {
+        let Some(rx) = self.reply_rx.take() else { return };
+        let mut page_changed = false;
+        while let Ok(reply) = rx.try_recv() {
+            match reply {
+                PdfReply::Loaded { path, pages, page_sizes, outline } => {
+                    self.app.doc_loaded(path, pages, page_sizes, outline);
+                    // The renderer memoizes a device bitmap keyed (page, px);
+                    // a new same-sized document would otherwise show the OLD
+                    // document's page. Drop the memo with the document.
+                    if let Some(r) = &mut self.renderer {
+                        r.clear_page_cache();
+                    }
+                    page_changed = true;
+                }
+                PdfReply::Rendered { page, px, bgra, links } => {
+                    self.app.rendered(crate::app::CachedPage { page, px, bgra, links });
+                }
+                PdfReply::RenderFailed { page, reason } => {
+                    self.app.render_failed(page, reason == "superseded");
+                }
+                PdfReply::NeedsPassword { path } => {
+                    // Task 10 shows the in-window password prompt.
+                    let _ = path;
+                }
+                PdfReply::LoadFailed { path, reason } => {
+                    // Task 10 shows the error box; until then keep the state sane.
+                    let _ = (path, reason);
+                    self.app.mode = crate::app::Mode::Empty;
+                }
+            }
+        }
+        self.reply_rx = Some(rx);
+        let _ = page_changed;
+        self.sync_renders();
+        self.invalidate();
+    }
+
+    fn flip(&mut self, delta: i32) {
+        if self.app.flip(delta) {
+            self.sync_renders();
+            self.invalidate();
+            // Task 8 shows the page badge here.
         }
     }
 }
