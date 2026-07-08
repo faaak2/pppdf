@@ -1035,7 +1035,8 @@ Create `tests/common/mod.rs`. This builds a complete, valid 3-page PDF **in memo
 
 ```rust
 //! Builds a small fixture PDF entirely in memory: 3 US-Letter pages, each
-//! with a filled black rectangle; page 1 has a GoTo link and a URI link;
+//! with a filled pure-red rectangle (red proves BGRA channel order, which
+//! black cannot); page 1 has a GoTo link and a URI link;
 //! outline: "Chapter One" -> p2, "Chapter Two" -> p3 with child "Section 2.1".
 //! Object numbers are fixed; byte offsets for the xref are computed, never
 //! hand-counted.
@@ -1056,9 +1057,9 @@ pub fn build_fixture_pdf() -> Vec<u8> {
         ),
         (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R >>".into()),
         (5, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R >>".into()),
-        (6, stream_obj("0 0 0 rg 100 600 200 100 re f")),
-        (7, stream_obj("0 0 0 rg 100 500 300 150 re f")),
-        (8, stream_obj("0 0 0 rg 200 300 150 300 re f")),
+        (6, stream_obj("1 0 0 rg 100 600 200 100 re f")),
+        (7, stream_obj("1 0 0 rg 100 500 300 150 re f")),
+        (8, stream_obj("1 0 0 rg 200 300 150 300 re f")),
         (9, "<< /Type /Outlines /First 10 0 R /Last 11 0 R /Count 3 >>".into()),
         (
             10,
@@ -1177,9 +1178,10 @@ fn load_render_outline_links() {
     assert_eq!(rpage, 0);
     assert_eq!(rpx, px);
     assert_eq!(bgra.len(), (px.w * px.h * 4) as usize);
-    // The content stream fills a black rect: some pixel must be dark.
-    let dark = bgra.chunks_exact(4).any(|p| p[0] < 60 && p[1] < 60 && p[2] < 60);
-    assert!(dark, "rendered page has no dark pixels — rendering failed?");
+    // The content stream fills a pure-red rect; in BGRA byte order that is
+    // [B~0, G~0, R~255, ...] — asserting BOTH rendering and channel order.
+    let red_bgra = bgra.chunks_exact(4).any(|p| p[0] < 60 && p[1] < 60 && p[2] > 200);
+    assert!(red_bgra, "no red-in-BGRA pixels - rendering or byte order wrong");
 
     // --- links on page 1 ---
     assert_eq!(links.len(), 2);
@@ -1354,6 +1356,21 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 PdfCmd::Render { page, px, visible: false } => prefetch.push((page, px)),
             }
         }
+        // Dedup prefetches per page (keep the newest) and drop ones that
+        // duplicate the visible page. Dropping silently is safe here only
+        // because the surviving same-page request's reply clears the UI's
+        // pending set by page.
+        let visible_page = visible.map(|(p, _)| p);
+        let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        let mut kept: Vec<(u16, SizeU)> = Vec::new();
+        for &(page, px) in prefetch.iter().rev() {
+            if Some(page) != visible_page && seen.insert(page) {
+                kept.push((page, px));
+            }
+        }
+        kept.reverse();
+        let prefetch = kept;
+
         for page in superseded {
             let _ = reply_tx.send(PdfReply::RenderFailed { page, reason: "superseded".into() });
         }
@@ -1381,7 +1398,13 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let work: Vec<(u16, SizeU)> = visible.into_iter().chain(prefetch).collect();
         let mut dropped_after: Option<usize> = None;
         for (i, (page, px)) in work.iter().enumerate() {
-            let Some(d) = &doc else { break };
+            let Some(d) = &doc else {
+                // No document (e.g. the first-ever load failed): every
+                // remaining request still needs a reply or the UI's
+                // pending set would be stranded forever.
+                dropped_after = Some(i);
+                break;
+            };
             let _ = reply_tx.send(render_page(d, *page, *px));
             wake();
             // Preempt: if new commands arrived mid-batch (e.g. a rapid page
@@ -3366,7 +3389,7 @@ cargo run -- $env:TEMP\pppdf_fixture.pdf
 ```
 
 Verify manually:
-1. The fixture opens: page 1 shows a black rectangle on white, aspect-fitted, letterboxed with `#1a1a1a`.
+1. The fixture opens: page 1 shows a red rectangle on white, aspect-fitted, letterboxed with `#1a1a1a`. (RED, not blue — blue would mean the BGRA byte order is swapped.)
 2. PgDn/→/Space/wheel-down flip to pages 2 and 3 and stop at the end; PgUp/←/Shift+Space/wheel-up go back; Home/End jump. Flips between cached pages are instant.
 3. Resizing the window live: page follows (slightly soft while dragging), snaps crisp ~150 ms after you stop.
 4. Also open a real rulebook PDF (any large one) and confirm smooth flipping and that input stays responsive while heavy pages render.
