@@ -191,18 +191,26 @@ impl Renderer {
         }
     }
 
-    /// Draw the whole scene. On device loss, drops device resources and
-    /// returns Ok — the next WM_PAINT recreates everything.
-    pub fn draw(&mut self, hwnd: HWND, app: &App, badge: Option<(&str, f32)>) -> Result<()> {
+    /// Draw the whole scene. Returns `Ok(false)` on a normal frame.
+    ///
+    /// On device loss (`D2DERR_RECREATE_TARGET`, e.g. a driver reset or GPU
+    /// contention from other apps) it drops the device resources and returns
+    /// `Ok(true)` — a signal that the caller MUST schedule another paint so the
+    /// render target is recreated. Without that, a state that never invalidates
+    /// on its own (Empty/Password mode, or a Doc with no pending render reply)
+    /// would keep the now-dropped target and leave the window permanently
+    /// stale/white after a single transient loss.
+    pub fn draw(&mut self, hwnd: HWND, app: &App, badge: Option<(&str, f32)>) -> Result<bool> {
         let rt = self.ensure_rt(hwnd)?;
         let result = self.draw_inner(&rt, app, badge);
         match result {
             Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
                 self.rt = None;
                 self.page_bitmap = None;
-                Ok(())
+                Ok(true)
             }
-            other => other,
+            Ok(()) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 

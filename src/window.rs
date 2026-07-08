@@ -47,6 +47,9 @@ const MIN_SIZE_DIP: i32 = 200;
 
 pub const TIMER_RESIZE: usize = 1;
 pub const TIMER_BADGE: usize = 2;
+/// One-shot retry after a Direct2D device loss: throttles the
+/// recreate-and-repaint so a sustained loss can't spin WM_PAINT at 100% CPU.
+pub const TIMER_RECREATE: usize = 3;
 
 /// In-progress left-button drag-pan: origin point, scroll at drag start, and
 /// whether the pointer has moved past the OS drag threshold (click vs. pan).
@@ -484,6 +487,14 @@ impl Ui {
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
                 }
+                WM_TIMER if wparam.0 == TIMER_RECREATE => {
+                    // Retry the paint after a device loss: ensure_rt recreates the
+                    // target. If the device recovered, the next frame draws normally;
+                    // if it's still lost, WM_PAINT re-arms this timer (self-healing).
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RECREATE);
+                    self.invalidate();
+                    LRESULT(0)
+                }
                 WM_TIMER if wparam.0 == TIMER_RESIZE => {
                     let _ = KillTimer(Some(self.hwnd), TIMER_RESIZE);
                     self.sync_renders();
@@ -550,11 +561,21 @@ impl Ui {
                 WM_PAINT => {
                     let mut ps = PAINTSTRUCT::default();
                     let _ = BeginPaint(self.hwnd, &mut ps);
+                    let mut lost = false;
                     if let Some(mut r) = self.renderer.take() {
-                        let _ = r.draw(self.hwnd, &self.app, self.badge_display());
+                        lost = r.draw(self.hwnd, &self.app, self.badge_display()).unwrap_or(false);
                         self.renderer = Some(r);
                     }
                     let _ = EndPaint(self.hwnd, &ps);
+                    // Direct2D reported device loss and dropped its target. Nothing
+                    // else may invalidate the window (Empty/Password mode, or a Doc
+                    // between render replies), so schedule a repaint ourselves to
+                    // recreate the target — otherwise one transient loss under GPU
+                    // contention would leave the window permanently white. The timer
+                    // throttles the retry so a sustained loss can't busy-loop.
+                    if lost {
+                        SetTimer(Some(self.hwnd), TIMER_RECREATE, 100, None);
+                    }
                     LRESULT(0)
                 }
                 WM_KEYDOWN => {
