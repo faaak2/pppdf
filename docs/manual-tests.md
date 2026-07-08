@@ -24,3 +24,4 @@ Document:
 - [ ] Errors: bogus file (doc survives), missing pdfium.dll (clean exit), password prompt loop
 - [ ] Double-click directly on a hyperlink: exactly ONE navigation (no spurious second jump)
 - [ ] Open a new PDF (drop/menu) while the password prompt is showing: previously open doc keeps working
+- [ ] With a GPU-heavy app running (video playback + a hardware-accelerated browser session): launch and confirm content renders; if the window ever goes white, it must self-heal within ~1 s (device-loss recovery)
