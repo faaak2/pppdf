@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Windows 10/11 x64 only. Shell for all commands: PowerShell 7 (`pwsh`).
-- Dependencies: exactly two runtime crates — `windows` and `pdfium-render`. No logging, config, UI, or async crates. Anything else is rejected by default.
+- Dependencies: exactly two significant DIRECT runtime crates — `windows` and `pdfium-render` (plus `windows-numerics`; `embed-manifest` as build-dep). No additional direct logging, config, UI, or async crates; transitive dependencies of the mandated crates are acceptable. Anything else is rejected by default.
 - Zero pixels of window chrome, ever. No title bar, no visible border, no toolbars.
 - Pages always render at exact physical pixel size (bitmap-scaling only as a transient preview during live resize/zoom).
 - Single page at a time; snap navigation; fit-to-window is the default and reset state.
