@@ -3895,7 +3895,7 @@ git commit -m "feat: clickable links, TOC overlay with tree navigation, page bad
 
 **Interfaces:**
 - Consumes: `app::{zoom_by, reset_zoom, wheel}` (Task 5), `layout::PointF`
-- Produces: `Ui` gains `drag: Option<Drag>` where `struct Drag { start: PointF, start_scroll: PointF, moved: bool }`
+- Produces: `Ui` gains `drag: Option<Drag>` where `struct Drag { start: PointF, start_scroll: PointF, moved: bool }`, and `suppress_click: bool` (a dblclk is followed by a second WM_LBUTTONUP with no matching BUTTONDOWN — the flag stops that UP from firing a spurious `on_click` against the just-reset page geometry)
 - Behavior contract (spec): Ctrl+wheel zooms at the cursor (fit…500%); dragging pans while zoomed (clamped); Ctrl+drag moves the window while zoomed; double-click or `0` resets to fit; page flips already reset zoom (Task 5). At fit, dragging the page still moves the window (unchanged from Task 6).
 
 - [ ] **Step 1: Drag state**
@@ -4005,6 +4005,10 @@ WM_LBUTTONDBLCLK => {
         self.sync_renders();
         self.invalidate();
     }
+    // A dblclk is followed by a second WM_LBUTTONUP with no matching
+    // BUTTONDOWN; without this flag that UP would fire on_click() again
+    // against the just-reset page geometry (spurious link navigation).
+    self.suppress_click = true;
     LRESULT(0)
 }
 ```
@@ -4013,6 +4017,7 @@ Replace the `WM_LBUTTONUP` arm from Task 8 with the drag-aware version:
 
 ```rust
 WM_LBUTTONUP => {
+    let suppress = std::mem::take(&mut self.suppress_click);
     // ORDER MATTERS: take the drag state BEFORE ReleaseCapture().
     // ReleaseCapture delivers WM_CAPTURECHANGED synchronously (reentering
     // this WndProc), and that arm clears self.drag — taking it afterwards
@@ -4021,7 +4026,7 @@ WM_LBUTTONUP => {
     unsafe {
         let _ = ReleaseCapture();
     }
-    if !was_pan {
+    if !was_pan && !suppress {
         let p = self.mouse_point(lparam);
         self.on_click(p);
     }
