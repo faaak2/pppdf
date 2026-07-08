@@ -2514,7 +2514,9 @@ impl Ui {
             length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
             ..Default::default()
         };
-        unsafe { GetWindowPlacement(self.hwnd, &mut wp).is_ok() }
+        // Parens required: a bare `unsafe { .. } && ..` at statement position
+        // parses the unsafe block as a statement and rejects the `&&`.
+        (unsafe { GetWindowPlacement(self.hwnd, &mut wp).is_ok() })
             && wp.showCmd == SW_SHOWMAXIMIZED.0 as u32
     }
 
@@ -2522,12 +2524,17 @@ impl Ui {
         unsafe {
             match msg {
                 // === chromeless core ===
-                WM_NCCALCSIZE if wparam.0 != 0 => {
+                WM_NCCALCSIZE => {
                     // Claim the whole window rect as client area (zero chrome).
+                    // Handle BOTH wparam values: the FIRST WM_NCCALCSIZE of a
+                    // window's life arrives with wparam == FALSE, and letting
+                    // DefWindowProc answer it bakes a caption into the initial
+                    // frame (we never issue SWP_FRAMECHANGED to recompute it).
                     // When maximized, clamp to the work area so client pixels
                     // don't hang off-monitor, and leave 2px for an auto-hide
-                    // taskbar to fly out.
-                    if self.maximized() {
+                    // taskbar to fly out. (NCCALCSIZE_PARAMS is only valid
+                    // when wparam is TRUE — keep that guard.)
+                    if wparam.0 != 0 && self.maximized() {
                         let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
                         let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
                         let mut mi = MONITORINFO {
