@@ -1,0 +1,38 @@
+[package]
+name = "pppdf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Borderless native PDF viewer for tabletop RPG sessions"
+
+[dependencies]
+pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "thread_safe"] }
+windows-numerics = "0.3.1"
+
+[dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",                # HWND/WPARAM/LPARAM/LRESULT/RECT, D2DERR_RECREATE_TARGET
+    "Win32_System_LibraryLoader",      # GetModuleHandleW
+    "Win32_UI_WindowsAndMessaging",    # window class, message loop, menus, timers, cursors
+    "Win32_Graphics_Gdi",              # HBRUSH (WNDCLASSEXW), BeginPaint, MonitorFromWindow
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Dxgi_Common",      # DXGI_FORMAT_B8G8R8A8_UNORM
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",              # DwmSetWindowAttribute, corner preference
+    "Win32_UI_HiDpi",                  # SetProcessDpiAwarenessContext, GetDpiForWindow
+    "Win32_UI_Shell",                  # DragAcceptFiles/DragQueryFileW, ShellExecuteW
+    "Win32_UI_Controls_Dialogs",       # GetOpenFileNameW
+    "Win32_UI_Input_KeyboardAndMouse", # VK_*, GetKeyState
+    "Win32_System_SystemServices",     # MK_CONTROL (mouse-message modifier flags)
+]
+
+[build-dependencies]
+embed-manifest = "1.5.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
