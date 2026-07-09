@@ -9,17 +9,19 @@ rulebook next to your VTT and it looks like a page lying on the desktop.
 - Clickable in-document links; table of contents from the PDF outline
 - Single page, always crisp, fit-to-window; Ctrl+wheel zoom for maps
 - One window per book — run several instances side by side
-- Two files, ~8 MB total, no installation, nothing persisted
+- A single self-contained ~8 MB exe, no installation, nothing persisted
+  (PDFium is bundled inside and unpacked to `%LOCALAPPDATA%\pppdf` on first run)
 
 ## Build
 
 1. Install Rust (stable, 1.82+): https://rustup.rs
-2. `.\fetch-pdfium.ps1` (downloads pdfium.dll into the target dirs)
+2. `.\fetch-pdfium.ps1` (downloads pdfium.dll into `target\` and `assets\`,
+   where the release build embeds it into the exe)
 3. `cargo build --release`
 
-"Install": copy `target\release\pppdf.exe` and `target\release\pdfium.dll`
-into any folder together. Optionally right-click a PDF → Open with →
-choose pppdf.exe.
+"Install": copy `target\release\pppdf.exe` anywhere and run it — PDFium is
+baked in, so there is nothing else to keep alongside it. Optionally
+right-click a PDF → Open with → choose pppdf.exe.
 
 ## Use
 

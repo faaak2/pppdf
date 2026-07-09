@@ -1,2 +1,5 @@
 /target
 /.superpowers
+# Fetched by fetch-pdfium.ps1 and embedded into the exe via include_bytes!;
+# a prebuilt binary, not source — keep it out of git.
+/assets/pdfium.dll

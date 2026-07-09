@@ -16,9 +16,26 @@ pub fn spawn(reply_tx: Sender<PdfReply>, wake: impl Fn() + Send + 'static) -> Se
     cmd_tx
 }
 
-/// Locate pdfium.dll: the exe's directory first, then up to two ancestors
-/// (covers `cargo test`, where the test exe is in target\debug\deps but the
-/// dll sits in target\debug), then the system search path.
+/// pdfium.dll compiled into the exe, so a shipped `pppdf.exe` is a single
+/// self-contained file. `fetch-pdfium.ps1` drops the dll at assets/pdfium.dll
+/// for this include; rustc re-runs pdf.rs when those bytes change.
+const PDFIUM_DLL: &[u8] = include_bytes!("../assets/pdfium.dll");
+
+/// Tags each temp file uniquely within this process, so even two threads
+/// extracting at once (they never do today — pdfium binds once per process —
+/// but the guarantee is cheap) can't collide on the same temp path.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Locate pdfium and bind to it, in priority order:
+///   1. pdfium.dll beside the exe, or up to two ancestors up — covers dev
+///      runs (`cargo run` / `cargo test`, where the dll sits in target\debug
+///      but the test exe is under target\debug\deps) and lets a user drop a
+///      newer dll next to the exe to override the bundled one. A dll that is
+///      present but won't load (wrong architecture, truncated, locked) does
+///      NOT abort startup — we fall through to the embedded copy.
+///   2. the copy embedded in this exe, unpacked once to %LOCALAPPDATA%\pppdf
+///      — this is the path a shipped single-file pppdf.exe takes.
+///   3. any pdfium already on the system search path.
 fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(Path::to_path_buf);
@@ -26,12 +43,82 @@ fn bind_pdfium() -> Result<Pdfium, PdfiumError> {
             let Some(d) = dir else { break };
             let candidate = Pdfium::pdfium_platform_library_name_at_path(&d);
             if candidate.exists() {
-                return Ok(Pdfium::new(Pdfium::bind_to_library(&candidate)?));
+                if let Ok(bindings) = Pdfium::bind_to_library(&candidate) {
+                    return Ok(Pdfium::new(bindings));
+                }
+                break; // found one, but it won't load — try the embedded copy
             }
             dir = d.parent().map(Path::to_path_buf);
         }
     }
+    if let Some(pdfium) = bind_embedded() {
+        return Ok(pdfium);
+    }
     Ok(Pdfium::new(Pdfium::bind_to_system_library()?))
+}
+
+/// Unpack the embedded pdfium.dll to a per-user, per-version file and bind to
+/// it. If binding a copy that was already on disk fails (e.g. it was corrupted
+/// at rest without changing length), force a fresh extraction and try once
+/// more so a damaged cache self-heals instead of wedging every launch. Returns
+/// None if nothing binds, leaving the caller to try the system library.
+fn bind_embedded() -> Option<Pdfium> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("pppdf");
+    let name = format!("pdfium-{}.dll", env!("CARGO_PKG_VERSION"));
+    for force in [false, true] {
+        if let Ok(path) = extract_pdfium_to(&dir, PDFIUM_DLL, &name, force) {
+            if let Ok(bindings) = Pdfium::bind_to_library(&path) {
+                return Some(Pdfium::new(bindings));
+            }
+        }
+    }
+    None
+}
+
+/// Write `bytes` to `dir\name` and return that path. Unless `force`, an
+/// existing copy of the right length is reused as-is (the version-stamped name
+/// makes matching length imply matching content). The write goes to a unique
+/// temp file that is renamed into place, so a concurrent process never sees a
+/// half-written dll. Antivirus tends to open a freshly written executable to
+/// scan it, briefly locking it so the rename fails with a sharing violation;
+/// we retry a few times before giving up.
+fn extract_pdfium_to(dir: &Path, bytes: &[u8], name: &str, force: bool) -> std::io::Result<PathBuf> {
+    let final_path = dir.join(name);
+    if !force {
+        if let Ok(meta) = std::fs::metadata(&final_path) {
+            if meta.len() == bytes.len() as u64 {
+                return Ok(final_path);
+            }
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{name}.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    let mut last_err = None;
+    for attempt in 0..5u64 {
+        match std::fs::rename(&tmp, &final_path) {
+            Ok(()) => return Ok(final_path),
+            // Another process already placed a good copy there (its copy may be
+            // loaded and locked, which blocks our replace) — accept it, unless
+            // we were explicitly asked to overwrite a known-bad file.
+            Err(_) if !force && final_path.exists() => {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(final_path);
+            }
+            // Likely a transient AV/indexer lock on the temp file; back off and
+            // retry rather than failing the only bind path a shipped exe has.
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&tmp);
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("rename failed")))
 }
 
 /// Process-wide binding. pdfium-render 0.9.x bindings are a global singleton
@@ -312,4 +399,68 @@ fn extract_links(page: &PdfPage) -> Vec<PageLink> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_pdfium_to;
+    use std::sync::Arc;
+
+    #[test]
+    fn extract_writes_reuses_forces_and_replaces_bad_copy() {
+        let dir = std::env::temp_dir().join(format!("pppdf-extract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bytes = b"pretend-this-is-a-dll";
+        let name = "pdfium-test.dll";
+
+        // First call creates the file with exactly the given bytes.
+        let p1 = extract_pdfium_to(&dir, bytes, name, false).unwrap();
+        assert!(p1.exists());
+        assert_eq!(std::fs::read(&p1).unwrap(), bytes);
+
+        // Reuse fast-path must NOT rewrite: plant same-length *different*
+        // content, then confirm a non-forced call returns it untouched.
+        let sentinel = vec![b'X'; bytes.len()];
+        std::fs::write(&p1, &sentinel).unwrap();
+        let p2 = extract_pdfium_to(&dir, bytes, name, false).unwrap();
+        assert_eq!(p2, p1);
+        assert_eq!(std::fs::read(&p2).unwrap(), sentinel, "reuse must skip the write");
+
+        // force = true overwrites even a same-length existing file (self-heal).
+        let p3 = extract_pdfium_to(&dir, bytes, name, true).unwrap();
+        assert_eq!(std::fs::read(&p3).unwrap(), bytes);
+
+        // A wrong-length leftover is always replaced, even without force.
+        std::fs::write(&p1, b"short").unwrap();
+        let p4 = extract_pdfium_to(&dir, bytes, name, false).unwrap();
+        assert_eq!(std::fs::read(&p4).unwrap(), bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_writers_never_yield_a_torn_file() {
+        let dir = Arc::new(std::env::temp_dir().join(format!("pppdf-race-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&*dir);
+        // A payload large enough that a half-written copy would be observable.
+        let bytes: Arc<Vec<u8>> = Arc::new((0..64 * 1024).map(|i| (i % 251) as u8).collect());
+        let name = "pdfium-race.dll";
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = Arc::clone(&dir);
+                let bytes = Arc::clone(&bytes);
+                std::thread::spawn(move || {
+                    let p = extract_pdfium_to(&dir, &bytes, name, false).unwrap();
+                    // Whichever copy won the race, every reader sees the whole
+                    // payload via the atomic rename — never a partial file.
+                    assert_eq!(std::fs::read(&p).unwrap(), *bytes);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&*dir);
+    }
 }
