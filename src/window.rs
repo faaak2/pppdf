@@ -1201,8 +1201,8 @@ impl Ui {
         let Some(rx) = self.reply_rx.take() else { return };
         while let Ok(reply) = rx.try_recv() {
             match reply {
-                PdfReply::Loaded { path, pages, page_sizes, outline } => {
-                    self.app.doc_loaded(path, pages, page_sizes, outline);
+                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms } => {
+                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms);
                     // The renderer memoizes a device bitmap keyed (page, px);
                     // a new same-sized document would otherwise show the OLD
                     // document's page. Drop the memo with the document.
@@ -1211,8 +1211,8 @@ impl Ui {
                     }
                     self.show_badge();
                 }
-                PdfReply::Rendered { page, px, rot, bgra, links } => {
-                    self.app.rendered(crate::app::CachedPage { page, px, rot, bgra, links });
+                PdfReply::Rendered { page, px, rot, bgra, links, fields } => {
+                    self.app.rendered(crate::app::CachedPage { page, px, rot, bgra, links, fields });
                 }
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");

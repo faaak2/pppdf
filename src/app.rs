@@ -5,7 +5,7 @@ use crate::layout::{
     zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
-use crate::types::{LinkTarget, OutlineItem, PageLink};
+use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -21,6 +21,7 @@ pub struct CachedPage {
     pub rot: u8,
     pub bgra: Vec<u8>,
     pub links: Vec<PageLink>,
+    pub fields: Vec<FormField>,
 }
 
 /// How far (px per axis) a cached size may differ from a requested size and
@@ -130,6 +131,7 @@ pub struct DocState {
     pub pages: u16,
     pub page_sizes: Vec<(f32, f32)>,
     pub outline: Vec<OutlineItem>,
+    pub has_forms: bool,
     pub current: u16,
     /// 1.0 = fit-to-window.
     pub zoom: f32,
@@ -249,6 +251,7 @@ impl App {
         pages: u16,
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
+        has_forms: bool,
     ) {
         self.cache.clear();
         self.pending.clear();
@@ -258,6 +261,7 @@ impl App {
             pages,
             page_sizes,
             outline,
+            has_forms,
             current: 0,
             zoom: 1.0,
             scroll: PointF::default(),
@@ -446,12 +450,14 @@ impl App {
         }
     }
 
-    /// Link under a window-space point on the current page, if any. Link
-    /// rects live in unrotated page space, so the window point is first
-    /// carried back through the view rotation.
-    pub fn link_at(&self, p: PointF) -> Option<LinkTarget> {
+    /// Project a window-space point into the current page's unrotated bitmap
+    /// frame. Returns (point in unrotated bitmap px, px-per-pt scale, page
+    /// size in points). None when no doc/render or the point is off-page.
+    fn page_hit_frame(&self, p: PointF) -> Option<(PointF, f32, (f32, f32))> {
         let d = self.doc()?;
-        let entry = self.cache.get_any(d.current, d.rot)?;
+        // Cache presence gate kept from link_at: hit-testing against a page
+        // that has never rendered would use stale geometry.
+        self.cache.get_any(d.current, d.rot)?;
         let pr = self.current_page_rect()?;
         // Points outside the displayed page can't be on a link — and must be
         // rejected BEFORE unrotating: negating coordinates flips the half-open
@@ -477,13 +483,18 @@ impl App {
             x: q.x.min(page_pt.0 * px_per_pt - 1e-3),
             y: q.y.min(page_pt.1 * px_per_pt - 1e-3),
         };
-        // Links compared inside the unrotated bitmap's own frame (origin 0,0).
-        let unrot = RectF {
-            left: 0.0,
-            top: 0.0,
-            right: page_pt.0 * px_per_pt,
-            bottom: page_pt.1 * px_per_pt,
-        };
+        Some((q, px_per_pt, page_pt))
+    }
+
+    /// Link under a window-space point on the current page, if any. Link
+    /// rects live in unrotated page space, so the window point is first
+    /// carried back through the view rotation.
+    pub fn link_at(&self, p: PointF) -> Option<LinkTarget> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        let unrot =
+            RectF { left: 0.0, top: 0.0, right: page_pt.0 * px_per_pt, bottom: page_pt.1 * px_per_pt };
         for link in &entry.links {
             let wr = pdf_rect_to_window(link.rect_pt, page_pt.1, px_per_pt, unrot);
             if wr.contains(q) {
@@ -491,6 +502,34 @@ impl App {
             }
         }
         None
+    }
+
+    /// Form field under a window-space point: (index into the cache entry's
+    /// `fields`, kind). Same projection as link_at.
+    pub fn field_hit(&self, p: PointF) -> Option<(usize, FieldKind)> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        let unrot =
+            RectF { left: 0.0, top: 0.0, right: page_pt.0 * px_per_pt, bottom: page_pt.1 * px_per_pt };
+        for (i, f) in entry.fields.iter().enumerate() {
+            let wr = pdf_rect_to_window(f.rect_pt, page_pt.1, px_per_pt, unrot);
+            if wr.contains(q) {
+                return Some((i, f.kind));
+            }
+        }
+        None
+    }
+
+    pub fn field_at(&self, p: PointF) -> Option<FieldKind> {
+        self.field_hit(p).map(|(_, k)| k)
+    }
+
+    /// Window point -> PDF page coordinates (points, origin bottom-left,
+    /// y up) — the space FORM_On* events and field rects live in.
+    pub fn pdf_point_at(&self, p: PointF) -> Option<PointF> {
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        Some(PointF { x: q.x / px_per_pt, y: page_pt.1 - q.y / px_per_pt })
     }
 
     // --- go-to-page entry (G, digits, Enter — drawn as a small prompt) ---
@@ -594,12 +633,13 @@ mod tests {
             pages,
             vec![LETTER; pages as usize],
             vec![],
+            false,
         );
         a
     }
 
     fn cached(page: u16, px: SizeU) -> CachedPage {
-        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![] }
+        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![] }
     }
 
     // --- paging ---
@@ -647,7 +687,7 @@ mod tests {
     fn zero_page_doc_navigation_is_safe() {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
-        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![]);
+        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false);
         assert!(!a.flip(1));
         assert!(!a.flip(-1));
         assert!(!a.goto(5));
@@ -801,6 +841,7 @@ mod tests {
             rot: 0,
             bgra: vec![0; bytes],
             links: vec![],
+            fields: vec![],
         };
         c.put(big(0, 60), &[]);
         c.put(big(1, 60), &[]); // 120 > 100: page 0 evicted
@@ -854,6 +895,7 @@ mod tests {
                     rot: 0,
                     bgra: vec![0; 10],
                     links: vec![],
+                    fields: vec![],
                 },
                 &[1], // page 1 is protected — the crawl must still be bounded
             );
@@ -867,7 +909,7 @@ mod tests {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
         a.cache = PageCache::with_budget(6, 100);
-        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![]);
+        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![], false);
         a.flip(1); // current = 1; working set {0, 1, 2}
         let mut rounds = 0;
         loop {
@@ -886,6 +928,7 @@ mod tests {
                     rot: r.rot,
                     bgra: vec![0; bytes],
                     links: vec![],
+                    fields: vec![],
                 });
             }
         }
@@ -915,7 +958,7 @@ mod tests {
         a.render_failed(1, false); // genuine pdfium failure on the prefetch page
         assert!(a.wanted_renders().iter().all(|r| r.page != 1), "failed page must not hot-loop");
         // A fresh document clears the failed set.
-        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![]);
+        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false);
         assert!(a.wanted_renders().iter().any(|r| r.page == 1));
     }
 
@@ -930,7 +973,14 @@ mod tests {
             rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
             target: LinkTarget::Page(0),
         };
-        a.rendered(CachedPage { page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![link] });
+        a.rendered(CachedPage {
+            page: 0,
+            px: fit_px,
+            rot: 0,
+            bgra: vec![0; 4],
+            links: vec![link],
+            fields: vec![],
+        });
         let pr = a.current_page_rect().unwrap();
         // A window point just inside the page's top-left corner is on the link.
         let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
@@ -952,12 +1002,45 @@ mod tests {
         assert!(a.rotate_cw());
         let px = a.current_px().unwrap();
         assert!(px.w > px.h, "rotated portrait page must be landscape");
-        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link] });
+        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link], fields: vec![] });
         let pr = a.current_page_rect().unwrap();
         let top_right = PointF { x: pr.right - 5.0, y: pr.top + 5.0 };
         assert_eq!(a.link_at(top_right), Some(LinkTarget::Page(0)));
         let top_left = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
         assert_eq!(a.link_at(top_left), None, "unrotated hotspot must have moved");
+    }
+
+    #[test]
+    fn field_hit_transforms_like_links() {
+        let mut a = app_with_doc(1);
+        let fit_px = render_size(LETTER, a.client, 1.0);
+        let field = crate::types::FormField {
+            rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
+            kind: crate::types::FieldKind::Text,
+        };
+        a.rendered(CachedPage {
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![field],
+        });
+        let pr = a.current_page_rect().unwrap();
+        let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
+        assert_eq!(a.field_hit(p), Some((0, crate::types::FieldKind::Text)));
+        let q = PointF { x: pr.left + 5.0, y: pr.bottom - 5.0 };
+        assert_eq!(a.field_at(q), None);
+    }
+
+    #[test]
+    fn pdf_point_at_round_trips_pdf_space() {
+        let mut a = app_with_doc(1);
+        let fit_px = render_size(LETTER, a.client, 1.0);
+        a.rendered(CachedPage {
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![],
+        });
+        let pr = a.current_page_rect().unwrap();
+        // Window point 10% in from the page's top-left corner.
+        let p = PointF { x: pr.left + pr.width() * 0.1, y: pr.top + pr.height() * 0.1 };
+        let pt = a.pdf_point_at(p).unwrap();
+        assert!((pt.x - 61.2).abs() < 2.0, "x: {}", pt.x);
+        assert!((pt.y - (792.0 - 79.2)).abs() < 2.0, "y-up flip: {}", pt.y);
     }
 
     // --- rotation ---
@@ -997,7 +1080,7 @@ mod tests {
         // 180° where the pixel size is identical.
         a.rotate_cw(); // rot = 2: same px as upright
         let px180 = a.current_px().unwrap();
-        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![] });
+        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![] });
         assert!(
             a.wanted_renders().iter().any(|r| r.page == 0 && r.rot == 2),
             "180° must re-render despite identical px"

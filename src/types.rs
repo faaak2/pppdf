@@ -29,6 +29,21 @@ pub struct PageLink {
     pub target: LinkTarget,
 }
 
+/// Coarse widget classification: enough for cursor choice and hit behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    Text,
+    Other,
+}
+
+/// One form-widget annotation on a page. `rect_pt` uses the same convention
+/// as `PageLink::rect_pt` (PDF points, origin bottom-left, top > bottom).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormField {
+    pub rect_pt: RectF,
+    pub kind: FieldKind,
+}
+
 /// UI thread -> PDF thread.
 #[derive(Debug)]
 pub enum PdfCmd {
@@ -47,6 +62,7 @@ pub enum PdfReply {
         pages: u16,
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
+        has_forms: bool,
     },
     NeedsPassword {
         path: PathBuf,
@@ -62,6 +78,7 @@ pub enum PdfReply {
         rot: u8,
         bgra: Vec<u8>,
         links: Vec<PageLink>,
+        fields: Vec<FormField>,
     },
     RenderFailed {
         page: u16,

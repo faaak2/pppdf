@@ -1,7 +1,7 @@
 //! The PDF thread: owns ALL pdfium state; speaks PdfCmd in, PdfReply out.
 
 use crate::layout::{RectF, SizeU};
-use crate::types::{LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
+use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -220,7 +220,12 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         if let Some((path, password)) = load {
             // Keep the old document until the new one opens successfully, so a
             // failed open leaves the current book fully usable.
-            match pdfium.load_pdf_from_file(&path, password.as_deref()) {
+            // Load from bytes: pdfium then holds no file handle, so the
+            // original stays writable (in-place save) and un-locked on disk.
+            let loaded = std::fs::read(&path)
+                .map_err(PdfiumError::IoError)
+                .and_then(|bytes| pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()));
+            match loaded {
                 Ok(d) => {
                     if d.pages().len() <= 0 {
                         let _ = reply_tx.send(PdfReply::LoadFailed {
@@ -293,7 +298,13 @@ fn describe(doc: &PdfDocument, path: &Path) -> PdfReply {
         walk_bookmark(&b, 0, &mut outline);
         current = next;
     }
-    PdfReply::Loaded { path: path.to_path_buf(), pages, page_sizes, outline }
+    PdfReply::Loaded {
+        path: path.to_path_buf(),
+        pages,
+        page_sizes,
+        outline,
+        has_forms: doc.form().is_some(),
+    }
 }
 
 fn walk_bookmark(b: &PdfBookmark, depth: u8, out: &mut Vec<OutlineItem>) {
@@ -378,6 +389,7 @@ fn render_page(doc: &PdfDocument, page_idx: u16, px: SizeU, rot: u8) -> PdfReply
         rot,
         bgra,
         links: extract_links(&page),
+        fields: extract_form_fields(doc, &page),
     }
 }
 
@@ -411,6 +423,44 @@ fn extract_links(page: &PdfPage) -> Vec<PageLink> {
                 },
                 target,
             });
+        }
+    }
+    out
+}
+
+/// Stable PDFium ABI constants not re-exported by pdfium-render's prelude.
+const ANNOT_SUBTYPE_WIDGET: i32 = 20; // FPDF_ANNOT_WIDGET
+const FORMFIELD_TEXT: i32 = 6; // FPDF_FORMFIELD_TEXTFIELD
+
+/// Widget-annotation rects (PDF points, bottom-left origin) + coarse kind.
+/// Read-only and shared by both editions: the free build needs the rects for
+/// its "Pro feature" hint, the pro build for hit-testing and cursors.
+fn extract_form_fields(doc: &PdfDocument, page: &PdfPage) -> Vec<FormField> {
+    let Some(form) = doc.form() else { return Vec::new() };
+    let b = doc.bindings();
+    let (form_h, page_h) = (form.handle(), page.page_handle());
+    let mut out = Vec::new();
+    unsafe {
+        for i in 0..b.FPDFPage_GetAnnotCount(page_h) {
+            let annot = b.FPDFPage_GetAnnot(page_h, i);
+            if annot.is_null() {
+                continue;
+            }
+            if b.FPDFAnnot_GetSubtype(annot) == ANNOT_SUBTYPE_WIDGET {
+                let mut r = FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+                if b.FPDFAnnot_GetRect(annot, &mut r) != 0 {
+                    let kind = if b.FPDFAnnot_GetFormFieldType(form_h, annot) == FORMFIELD_TEXT {
+                        FieldKind::Text
+                    } else {
+                        FieldKind::Other
+                    };
+                    out.push(FormField {
+                        rect_pt: RectF { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+                        kind,
+                    });
+                }
+            }
+            b.FPDFPage_CloseAnnot(annot);
         }
     }
     out

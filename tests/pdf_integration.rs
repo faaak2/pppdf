@@ -130,6 +130,44 @@ fn rotated_render_size_is_exact_even_for_high_aspect_pages() {
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
 }
 
+/// The real form fixture must report has_forms and per-render field rects;
+/// the generated (form-free) fixture must not.
+#[test]
+fn form_fixture_reports_fields() {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/form.pdf");
+    cmd_tx.send(PdfCmd::Load { path: form_pdf, password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms, "form.pdf must set has_forms"),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => {
+            // 8 named fields plus one extra widget (a radio group contributes
+            // one widget per option); observed and pinned exactly.
+            assert_eq!(fields.len(), 9, "expected exactly 9 widgets, got {}", fields.len());
+            assert!(
+                fields.iter().filter(|f| f.kind == pppdf::types::FieldKind::Text).count() >= 3,
+                "FullName, ID, Notes must be Text kind"
+            );
+            for f in &fields {
+                assert!(f.rect_pt.right > f.rect_pt.left && f.rect_pt.top > f.rect_pt.bottom);
+            }
+        }
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+    // The link-test fixture has no form.
+    cmd_tx.send(PdfCmd::Load { path: common::fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(!has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let (reply_tx, reply_rx) = mpsc::channel();
