@@ -49,10 +49,13 @@ pub struct Renderer {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
     rt: Option<ID2D1HwndRenderTarget>,
-    /// Memo of the last uploaded page bitmap: (page, px, rot) -> device
+    /// Memo of the last uploaded page bitmap: (page, px, rot, gen) -> device
     /// bitmap. `rot` matters: a 180° render has the same px as the upright
     /// one, and without it the memo would keep serving the stale pixels.
-    page_bitmap: Option<(u16, SizeU, u8, ID2D1Bitmap)>,
+    /// `gen` matters for the same reason: form filling re-renders the SAME
+    /// (page, px, rot) with new pixels, and only the generation stamped by
+    /// App::rendered() tells the two apart.
+    page_bitmap: Option<(u16, SizeU, u8, u64, ID2D1Bitmap)>,
     dpi: u32,
     /// ((size_dip*10) as u32, centered) -> format; rebuilt when DPI changes.
     formats: Vec<((u32, bool), IDWriteTextFormat)>,
@@ -192,10 +195,11 @@ impl Renderer {
         page: u16,
         px: SizeU,
         rot: u8,
+        gen: u64,
         bgra: &[u8],
     ) -> Result<ID2D1Bitmap> {
-        if let Some((p, s, r, bmp)) = &self.page_bitmap {
-            if *p == page && *s == px && *r == rot {
+        if let Some((p, s, r, g, bmp)) = &self.page_bitmap {
+            if *p == page && *s == px && *r == rot && *g == gen {
                 return Ok(bmp.clone());
             }
         }
@@ -214,7 +218,7 @@ impl Renderer {
                 px.w * 4,
                 &props,
             )?;
-            self.page_bitmap = Some((page, px, rot, bmp.clone()));
+            self.page_bitmap = Some((page, px, rot, gen, bmp.clone()));
             Ok(bmp)
         }
     }
@@ -273,8 +277,9 @@ impl Renderer {
                 Mode::Doc(d) => {
                     if let (Some(px), Some(dest)) = (app.current_px(), app.current_page_rect()) {
                         if let Some(entry) = app.cache.get_best(d.current, d.rot, px) {
-                            let bmp =
-                                self.page_bitmap(rt, entry.page, entry.px, entry.rot, &entry.bgra)?;
+                            let bmp = self.page_bitmap(
+                                rt, entry.page, entry.px, entry.rot, entry.gen, &entry.bgra,
+                            )?;
                             let crisp = entry.px.w as f32 == dest.width().round()
                                 && entry.px.h as f32 == dest.height().round();
                             let mode = if crisp {

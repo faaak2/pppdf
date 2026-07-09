@@ -22,6 +22,11 @@ pub struct CachedPage {
     pub bgra: Vec<u8>,
     pub links: Vec<PageLink>,
     pub fields: Vec<FormField>,
+    /// Monotonic id stamped by `App::rendered()` — part of the renderer's
+    /// device-bitmap memo key. Form filling re-renders the SAME
+    /// (page, px, rot) with NEW pixels; without gen the memo would keep
+    /// serving the stale bitmap (same trap as the `rot` note above).
+    pub gen: u64,
 }
 
 /// How far (px per axis) a cached size may differ from a requested size and
@@ -207,6 +212,8 @@ pub struct App {
     /// F1 help overlay. Global (not per-document): available in every mode,
     /// so it lives here rather than on DocState like the TOC overlay.
     pub help_visible: bool,
+    /// Source of `CachedPage::gen`; bumped on every render reply.
+    render_gen: u64,
     /// Pro: a form field currently has keyboard focus (typing mode). The UI
     /// owns this state — it initiates every focus change (click, Tab, Esc).
     #[cfg(feature = "pro")]
@@ -230,6 +237,7 @@ impl App {
             client: SizeU { w: 0, h: 0 },
             dpi: 96,
             help_visible: false,
+            render_gen: 0,
             #[cfg(feature = "pro")]
             form_focus: false,
             #[cfg(feature = "pro")]
@@ -456,7 +464,11 @@ impl App {
 
     /// A render reply arrived: clear the page's pending entries (by page, not
     /// exact size — pdfium may round differently than layout::render_size).
-    pub fn rendered(&mut self, page: CachedPage) {
+    pub fn rendered(&mut self, mut page: CachedPage) {
+        // Every reply gets a fresh generation, even for an identical
+        // (page, px, rot) key — the pixels may differ (form filling).
+        self.render_gen += 1;
+        page.gen = self.render_gen;
         self.pending.retain(|k| k.0 != page.page);
         let protected: Vec<u16> = self
             .doc()
@@ -702,7 +714,7 @@ mod tests {
     }
 
     fn cached(page: u16, px: SizeU) -> CachedPage {
-        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![] }
+        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0 }
     }
 
     // --- paging ---
@@ -849,6 +861,21 @@ mod tests {
     // --- wanted_renders / pending / cache ---
 
     #[test]
+    fn refreshed_render_gets_a_new_generation() {
+        // Form filling re-renders the SAME (page, px, rot) key with new
+        // pixels; the d2d device-bitmap memo keys on gen to notice. Two
+        // same-key renders must never share a generation.
+        let mut a = app_with_doc(1);
+        let px = SizeU { w: 10, h: 10 };
+        a.rendered(cached(0, px));
+        let g1 = a.cache.get_any(0, 0).unwrap().gen;
+        a.rendered(cached(0, px));
+        let g2 = a.cache.get_any(0, 0).unwrap().gen;
+        assert!(g2 > g1, "refreshed pixels must bump gen: {g1} vs {g2}");
+        assert!(g1 > 0, "assigned gens start at 1 so a fresh memo can't collide");
+    }
+
+    #[test]
     fn wanted_renders_current_then_next_then_prev() {
         let mut a = app_with_doc(5);
         a.flip(2); // current = 2
@@ -905,6 +932,7 @@ mod tests {
             bgra: vec![0; bytes],
             links: vec![],
             fields: vec![],
+            gen: 0,
         };
         c.put(big(0, 60), &[]);
         c.put(big(1, 60), &[]); // 120 > 100: page 0 evicted
@@ -959,6 +987,7 @@ mod tests {
                     bgra: vec![0; 10],
                     links: vec![],
                     fields: vec![],
+                    gen: 0,
                 },
                 &[1], // page 1 is protected — the crawl must still be bounded
             );
@@ -991,7 +1020,7 @@ mod tests {
                     rot: r.rot,
                     bgra: vec![0; bytes],
                     links: vec![],
-                    fields: vec![],
+                    fields: vec![], gen: 0,
                 });
             }
         }
@@ -1042,7 +1071,7 @@ mod tests {
             rot: 0,
             bgra: vec![0; 4],
             links: vec![link],
-            fields: vec![],
+            fields: vec![], gen: 0,
         });
         let pr = a.current_page_rect().unwrap();
         // A window point just inside the page's top-left corner is on the link.
@@ -1065,7 +1094,7 @@ mod tests {
         assert!(a.rotate_cw());
         let px = a.current_px().unwrap();
         assert!(px.w > px.h, "rotated portrait page must be landscape");
-        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link], fields: vec![] });
+        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link], fields: vec![], gen: 0 });
         let pr = a.current_page_rect().unwrap();
         let top_right = PointF { x: pr.right - 5.0, y: pr.top + 5.0 };
         assert_eq!(a.link_at(top_right), Some(LinkTarget::Page(0)));
@@ -1082,7 +1111,7 @@ mod tests {
             kind: crate::types::FieldKind::Text,
         };
         a.rendered(CachedPage {
-            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![field],
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![field], gen: 0,
         });
         let pr = a.current_page_rect().unwrap();
         let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
@@ -1096,7 +1125,7 @@ mod tests {
         let mut a = app_with_doc(1);
         let fit_px = render_size(LETTER, a.client, 1.0);
         a.rendered(CachedPage {
-            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![],
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0,
         });
         let pr = a.current_page_rect().unwrap();
         // Window point 10% in from the page's top-left corner.
@@ -1143,7 +1172,7 @@ mod tests {
         // 180° where the pixel size is identical.
         a.rotate_cw(); // rot = 2: same px as upright
         let px180 = a.current_px().unwrap();
-        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![] });
+        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0 });
         assert!(
             a.wanted_renders().iter().any(|r| r.page == 0 && r.rot == 2),
             "180° must re-render despite identical px"
@@ -1283,6 +1312,7 @@ mod tests {
                 fields: vec![field(72.0, 500.0, 300.0, 520.0),   // middle
                              field(72.0, 700.0, 300.0, 720.0),   // top
                              field(72.0, 300.0, 300.0, 320.0)],  // bottom
+                gen: 0,
             });
             // From nothing selected, Tab goes to the TOP field (max top).
             let p1 = a.form_tab_target(false).unwrap();

@@ -1599,7 +1599,16 @@ impl Ui {
                     self.show_badge();
                 }
                 PdfReply::Rendered { page, px, rot, bgra, links, fields } => {
-                    self.app.rendered(crate::app::CachedPage { page, px, rot, bgra, links, fields });
+                    // gen is stamped by rendered() — 0 here is a placeholder.
+                    self.app.rendered(crate::app::CachedPage {
+                        page,
+                        px,
+                        rot,
+                        bgra,
+                        links,
+                        fields,
+                        gen: 0,
+                    });
                 }
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");
