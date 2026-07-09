@@ -13,3 +13,11 @@ the raw bindings; the handles it needs are `pub(crate)` upstream.
 
 All patched lines are commented `PATCH(pppdf)` where new code was added.
 When bumping the pdfium-render version, re-apply these five changes.
+
+## Known upstream warnings
+
+Vendoring as a path dependency disables Cargo's `--cap-lints allow`, so two
+pre-existing upstream dead-code warnings surface on full rebuilds
+(`BYTES_PER_GRAYSCALE_PIXEL`, `aligned_grayscale_to_unaligned`). They are
+NOT ours and are not silenced — the patch policy is "5 documented changes,
+nothing else". "Zero warnings" gates apply to pppdf's own code.
