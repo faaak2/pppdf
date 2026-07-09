@@ -53,6 +53,25 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
 
+## Make it a PDF handler (optional)
+
+pppdf can register itself in Windows' **Open with** menu and **Default apps**
+page — no installer, no admin:
+
+```
+pppdf.exe --register      # add pppdf as a PDF handler (for your user)
+pppdf.exe --unregister    # remove it again
+```
+
+`--register` points the association at wherever `pppdf.exe` currently sits, so
+put the exe in a permanent folder first (moved it later? just run `--register`
+again). A normal launch never touches the registry — registration only happens
+when you pass `--register`.
+
+Windows won't let any app silently *become* the default PDF viewer, so the last
+step is yours: right-click a PDF → **Open with → pppdf**, or set it in
+**Settings → Apps → Default apps**. Registering just makes pppdf show up there.
+
 ## Licenses
 
 pppdf's PDF rendering uses PDFium (BSD-3-Clause / Apache-2.0, © The PDFium

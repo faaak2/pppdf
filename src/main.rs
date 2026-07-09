@@ -24,12 +24,35 @@ fn main() {
         std::process::exit(1);
     }));
 
+    // File-association subcommands run without opening a window, then exit.
+    let args: Vec<String> = std::env::args().collect();
+    use pppdf::register::Cmd;
+    match pppdf::register::classify(args.get(1).map(String::as_str)) {
+        Cmd::Register => std::process::exit(pppdf::register::register()),
+        Cmd::Unregister => std::process::exit(pppdf::register::unregister()),
+        // Unrecognized flag or explicit --help: show usage and exit.
+        Cmd::Help | Cmd::Unknown => {
+            pppdf::register::show_usage();
+            return;
+        }
+        Cmd::None => {}
+    }
+
     // Belt and suspenders with the embedded manifest; must precede any HWND.
     // Access-denied here just means the manifest already set it.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    let initial = std::env::args().nth(1).map(std::path::PathBuf::from);
+    // argv[1] opens here; each extra path (a multi-select dropped on the exe)
+    // opens in its own window, matching the one-document-per-window model.
+    // Skip stray flags so a spawned child can't re-trigger a subcommand.
+    let mut paths = args.into_iter().skip(1).filter(|p| !p.starts_with(['-', '/']));
+    let initial = paths.next().map(std::path::PathBuf::from);
+    if let Ok(exe) = std::env::current_exe() {
+        for extra in paths {
+            let _ = std::process::Command::new(&exe).arg(extra).spawn();
+        }
+    }
     if let Err(e) = window::run(App::new(), initial) {
         // No console in windows subsystem — surface startup failures visibly.
         unsafe {

@@ -25,6 +25,9 @@ features = [
     "Win32_UI_Controls_Dialogs",       # GetOpenFileNameW
     "Win32_UI_Input_KeyboardAndMouse", # VK_*, GetKeyState
     "Win32_System_SystemServices",     # MK_CONTROL (mouse-message modifier flags)
+    "Win32_System_Registry",           # --register: HKCU file-association keys
+    "Win32_Security",                  # SECURITY_ATTRIBUTES in RegCreateKeyExW's signature
+    "Win32_System_Com",                # --register: IShellLinkW Start-menu shortcut
 ]
 
 [build-dependencies]
