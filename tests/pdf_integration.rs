@@ -168,6 +168,68 @@ fn form_fixture_reports_fields() {
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
 }
 
+/// Pro: toggling a checkbox and typing into a text field must mark the
+/// document dirty (FFI_OnChange -> FormDirty) and trigger an unsolicited
+/// re-render of the visible page (FFI_Invalidate -> Rendered).
+///
+/// Note on the checkbox: with real PDFium a text field commits its value —
+/// and so fires FFI_OnChange — only on focus-loss/Enter, not per keystroke,
+/// whereas a checkbox toggles (and notifies) on the click itself. So the
+/// dirty signal is driven by the checkbox (matching this test's own intent),
+/// and the caret blink from focusing the text field drives the unsolicited
+/// re-render.
+#[cfg(feature = "pro")]
+#[test]
+fn form_events_mark_dirty_and_rerender() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/form.pdf");
+    cmd_tx.send(PdfCmd::Load { path: form_pdf, password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    // Establish the visible-render memo + get field rects.
+    cmd_tx.send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true }).unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    let center = |f: &FormField| {
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0)
+    };
+    let text = fields.iter().find(|f| f.kind == FieldKind::Text).expect("a text field");
+    let checkbox = fields.iter().find(|f| f.kind == FieldKind::Other).expect("a checkbox widget");
+    let (cx, cy) = center(text);
+    let (bx, by) = center(checkbox);
+    // Toggle the checkbox: its value change fires FFI_OnChange -> FormDirty.
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: bx, y: by, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: bx, y: by, modifiers: 0 } }).unwrap();
+    // Click into the text field and type 'A': focusing it starts the caret
+    // blink, whose FFI_Invalidate drives an unsolicited visible re-render.
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'A' as u16, modifiers: 0 } }).unwrap();
+    // Expect FormDirty and at least one unsolicited Rendered within the batch replies.
+    let (mut dirty, mut rerendered) = (false, false);
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::time::Instant::now() < deadline && !(dirty && rerendered) {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::FormDirty) => dirty = true,
+            Ok(PdfReply::Rendered { .. }) => rerendered = true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(dirty, "form input must produce FormDirty");
+    assert!(rerendered, "form input must trigger an unsolicited visible re-render");
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let (reply_tx, reply_rx) = mpsc::channel();

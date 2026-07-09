@@ -2,6 +2,8 @@
 
 use crate::layout::{RectF, SizeU};
 use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
+#[cfg(feature = "pro")]
+use crate::types::FormEvent;
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -151,14 +153,35 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     let mut doc: Option<PdfDocument<'static>> = None;
     // A command consumed by the preemption check below, carried into the next iteration.
     let mut carry: Option<PdfCmd> = None;
+    // The last visible render request, re-issued when the form layer
+    // invalidates (pro). Kept only in the pro build — the free build never
+    // reads it, so gating it keeps that build's behavior byte-identical.
+    #[cfg(feature = "pro")]
+    let mut last_visible: Option<(u16, SizeU, u8)> = None;
+    #[cfg(feature = "pro")]
+    let mut current_path: Option<PathBuf> = None;
+    #[cfg(feature = "pro")]
+    let mut engine: Option<crate::pro::forms::FormEngine> = None;
 
     'outer: loop {
         let first = match carry.take() {
             Some(c) => c,
-            None => match cmd_rx.recv() {
-                Ok(c) => c,
-                Err(_) => break, // UI hung up
-            },
+            None => {
+                #[cfg(feature = "pro")]
+                {
+                    match wait_cmd(&cmd_rx, &mut engine, &doc, last_visible, &reply_tx, &wake) {
+                        Some(c) => c,
+                        None => break,
+                    }
+                }
+                #[cfg(not(feature = "pro"))]
+                {
+                    match cmd_rx.recv() {
+                        Ok(c) => c,
+                        Err(_) => break, // UI hung up
+                    }
+                }
+            }
         };
         let mut batch = vec![first];
         loop {
@@ -181,6 +204,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let mut visible: Option<(u16, SizeU, u8)> = None;
         let mut prefetch: Vec<(u16, SizeU, u8)> = Vec::new();
         let mut superseded: Vec<u16> = Vec::new();
+        #[cfg(feature = "pro")]
+        let mut form_events: Vec<(u16, FormEvent)> = Vec::new();
+        #[cfg(feature = "pro")]
+        let mut save_requested = false;
         for cmd in batch {
             match cmd {
                 PdfCmd::Shutdown => break 'outer,
@@ -197,6 +224,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     }
                 }
                 PdfCmd::Render { page, px, rot, visible: false } => prefetch.push((page, px, rot)),
+                #[cfg(feature = "pro")]
+                PdfCmd::Form { page, ev } => form_events.push((page, ev)),
+                #[cfg(feature = "pro")]
+                PdfCmd::SaveDoc => save_requested = true,
             }
         }
         // Dedup prefetches per page (keep the newest) and drop ones that
@@ -218,6 +249,16 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         }
 
         if let Some((path, password)) = load {
+            // Teardown the form engine on the OLD document before we drop or
+            // replace it — the engine holds a raw page handle into it.
+            #[cfg(feature = "pro")]
+            if let Some(mut eng) = engine.take() {
+                eng.teardown(pdfium.bindings());
+            }
+            #[cfg(feature = "pro")]
+            {
+                last_visible = None;
+            }
             // Keep the old document until the new one opens successfully, so a
             // failed open leaves the current book fully usable.
             // Load from bytes: pdfium then holds no file handle, so the
@@ -233,8 +274,19 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                             reason: "document has no pages".into(),
                         });
                     } else {
+                        // `describe` borrows `path`; send first, then keep it.
                         let _ = reply_tx.send(describe(&d, &path));
+                        #[cfg(feature = "pro")]
+                        {
+                            current_path = Some(path);
+                        }
                         doc = Some(d);
+                        #[cfg(feature = "pro")]
+                        {
+                            engine = doc
+                                .as_mut()
+                                .and_then(|d| crate::pro::forms::FormEngine::new(d, reply_tx.clone()));
+                        }
                     }
                 }
                 Err(PdfiumError::PdfiumLibraryInternalError(
@@ -247,6 +299,45 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 }
             }
             wake();
+        }
+
+        // Remember the visible request so the form layer can re-issue it when
+        // its widgets invalidate. `visible` is Copy, so this read is cheap and
+        // leaves it available for the render loop below.
+        #[cfg(feature = "pro")]
+        if let Some(v) = visible {
+            last_visible = Some(v);
+        }
+
+        #[cfg(feature = "pro")]
+        {
+            if !form_events.is_empty() || save_requested {
+                if let Some(eng) = engine.as_mut() {
+                    for (page, ev) in form_events.drain(..) {
+                        eng.handle_event(pdfium.bindings(), page, ev);
+                    }
+                    if save_requested {
+                        let result = match (&doc, &current_path) {
+                            (Some(d), Some(p)) => eng.save(pdfium.bindings(), d, p),
+                            _ => Err("no document open".into()),
+                        };
+                        let _ = reply_tx.send(PdfReply::Saved { result });
+                        wake();
+                    }
+                }
+            }
+            // Events (or fired timers) dirtied the widgets: refresh the
+            // visible page — unless this very batch already renders it.
+            if visible.is_none() {
+                if let Some(eng) = engine.as_mut() {
+                    if eng.take_invalidated() {
+                        if let (Some(d), Some((page, px, rot))) = (&doc, last_visible) {
+                            let _ = reply_tx.send(render_page(d, page, px, rot));
+                            wake();
+                        }
+                    }
+                }
+            }
         }
 
         let work: Vec<(u16, SizeU, u8)> = visible.into_iter().chain(prefetch).collect();
@@ -279,6 +370,49 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     .send(PdfReply::RenderFailed { page: *page, reason: "superseded".into() });
             }
             wake();
+        }
+    }
+
+    // Thread is exiting (Shutdown or the UI hung up): release the engine's raw
+    // page handle before its document drops.
+    #[cfg(feature = "pro")]
+    if let Some(mut eng) = engine.take() {
+        eng.teardown(pdfium.bindings());
+    }
+}
+
+/// Block for the next command; while form timers exist, wake at their
+/// deadlines to blink the caret (fire timers -> pdfium invalidates -> the
+/// visible page re-renders). Returns None when the UI hung up.
+#[cfg(feature = "pro")]
+fn wait_cmd(
+    cmd_rx: &Receiver<PdfCmd>,
+    engine: &mut Option<crate::pro::forms::FormEngine>,
+    doc: &Option<PdfDocument<'static>>,
+    last_visible: Option<(u16, SizeU, u8)>,
+    reply_tx: &Sender<PdfReply>,
+    wake: &impl Fn(),
+) -> Option<PdfCmd> {
+    loop {
+        let deadline = engine.as_ref().and_then(|e| e.next_deadline());
+        let Some(deadline) = deadline else {
+            return cmd_rx.recv().ok();
+        };
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        match cmd_rx.recv_timeout(timeout) {
+            Ok(c) => return Some(c),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(eng) = engine.as_mut() {
+                    eng.fire_due_timers();
+                    if eng.take_invalidated() {
+                        if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
+                            let _ = reply_tx.send(render_page(d, page, px, rot));
+                            wake();
+                        }
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         }
     }
 }

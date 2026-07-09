@@ -44,6 +44,19 @@ pub struct FormField {
     pub kind: FieldKind,
 }
 
+/// One interactive form input event, in PDF page coordinates (points,
+/// origin bottom-left — what App::pdf_point_at produces).
+#[cfg(feature = "pro")]
+#[derive(Clone, Copy, Debug)]
+pub enum FormEvent {
+    MouseDown { x: f32, y: f32, modifiers: i32 },
+    MouseUp { x: f32, y: f32, modifiers: i32 },
+    MouseMove { x: f32, y: f32, modifiers: i32 },
+    Char { c: u16, modifiers: i32 },
+    KeyDown { vk: u16, modifiers: i32 },
+    KillFocus,
+}
+
 /// UI thread -> PDF thread.
 #[derive(Debug)]
 pub enum PdfCmd {
@@ -51,6 +64,12 @@ pub enum PdfCmd {
     /// `px` is the desired OUTPUT size — already swapped for 90°/270°.
     /// `rot` = clockwise quarter-turns (0..=3) to render the page at.
     Render { page: u16, px: SizeU, rot: u8, visible: bool },
+    /// One interactive form event targeting `page`.
+    #[cfg(feature = "pro")]
+    Form { page: u16, ev: FormEvent },
+    /// Save the current document back to its source path.
+    #[cfg(feature = "pro")]
+    SaveDoc,
     Shutdown,
 }
 
@@ -83,5 +102,14 @@ pub enum PdfReply {
     RenderFailed {
         page: u16,
         reason: String,
+    },
+    /// A form field's value changed (FFI_OnChange) — the open document now
+    /// differs from what is on disk.
+    #[cfg(feature = "pro")]
+    FormDirty,
+    /// Result of a `SaveDoc` request.
+    #[cfg(feature = "pro")]
+    Saved {
+        result: Result<(), String>,
     },
 }

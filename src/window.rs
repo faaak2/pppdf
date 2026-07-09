@@ -1249,6 +1249,13 @@ impl Ui {
                         }
                     }
                 }
+                // Form-fill replies: the UI acts on these in later tasks
+                // (dirty-state tracking / save feedback). Accept them now so
+                // the pro build's reply match stays exhaustive.
+                #[cfg(feature = "pro")]
+                PdfReply::FormDirty => {}
+                #[cfg(feature = "pro")]
+                PdfReply::Saved { .. } => {}
             }
         }
         self.reply_rx = Some(rx);

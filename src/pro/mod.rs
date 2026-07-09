@@ -6,3 +6,5 @@
 //!
 //! Planned home for: form-fillable elements, user-created labels and
 //! input fields. (Scaffold only — features land here next.)
+
+pub mod forms;
