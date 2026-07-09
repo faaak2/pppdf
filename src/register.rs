@@ -228,14 +228,14 @@ unsafe fn notify_shell() {
 fn info(msg: &str) {
     let t = wide(msg);
     unsafe {
-        MessageBoxW(None, PCWSTR(t.as_ptr()), windows::core::w!("pppdf"), MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(None, PCWSTR(t.as_ptr()), crate::edition::NAME_W, MB_OK | MB_ICONINFORMATION);
     }
 }
 
 fn fail(msg: &str) -> i32 {
     let t = wide(msg);
     unsafe {
-        MessageBoxW(None, PCWSTR(t.as_ptr()), windows::core::w!("pppdf"), MB_OK | MB_ICONERROR);
+        MessageBoxW(None, PCWSTR(t.as_ptr()), crate::edition::NAME_W, MB_OK | MB_ICONERROR);
     }
     1
 }

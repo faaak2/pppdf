@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.82"
 description = "Borderless native PDF viewer for tabletop RPG sessions"
 
+[features]
+# Paid edition: form-fillable elements, user-created labels/inputs.
+# Free build:  cargo build --release
+# Pro build:   cargo build --release --features pro
+pro = []
+
 [dependencies]
 pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 
@@ -28,6 +34,8 @@ features = [
     "Win32_System_Registry",           # --register: HKCU file-association keys
     "Win32_Security",                  # SECURITY_ATTRIBUTES in RegCreateKeyExW's signature
     "Win32_System_Com",                # --register: IShellLinkW Start-menu shortcut
+    "Win32_System_DataExchange",       # Ctrl+V paste into form fields (pro)
+    "Win32_System_Memory",             # Ctrl+V paste into form fields (pro)
 ]
 
 [build-dependencies]
@@ -39,3 +47,8 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+# Vendored copy of the exact pinned version, carrying only the accessor
+# patches documented in vendor/PATCHES.md (form handles for Pro form filling).
+[patch.crates-io]
+pdfium-render = { path = "vendor/pdfium-render" }

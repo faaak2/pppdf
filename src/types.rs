@@ -29,6 +29,44 @@ pub struct PageLink {
     pub target: LinkTarget,
 }
 
+/// Coarse widget classification: enough for cursor choice and hit behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    Text,
+    Other,
+}
+
+/// One form-widget annotation on a page. `rect_pt` uses the same convention
+/// as `PageLink::rect_pt` (PDF points, origin bottom-left, top > bottom).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormField {
+    pub rect_pt: RectF,
+    pub kind: FieldKind,
+}
+
+/// One interactive form input event, in PDF page coordinates (points,
+/// origin bottom-left — what App::pdf_point_at produces).
+#[cfg(feature = "pro")]
+#[derive(Clone, Debug)]
+pub enum FormEvent {
+    MouseDown { x: f32, y: f32, modifiers: i32 },
+    MouseUp { x: f32, y: f32, modifiers: i32 },
+    MouseMove { x: f32, y: f32, modifiers: i32 },
+    /// Real double-click on a TEXT field (word selection). Button-like
+    /// widgets never receive this — PDFium's editor ignores DblClk on
+    /// them, so window.rs sends a plain MouseDown instead (rapid clicks
+    /// on a checkbox must toggle it every time).
+    MouseDblClk { x: f32, y: f32, modifiers: i32 },
+    Char { c: u16, modifiers: i32 },
+    KeyDown { vk: u16, modifiers: i32 },
+    /// Ctrl+V: replace the focused field's selection with clipboard text.
+    ReplaceSelection { text: String },
+    /// Move form focus to the annotation at a point WITHOUT button events —
+    /// Tab cycling must never click (and thus toggle) the widgets it passes.
+    Focus { x: f32, y: f32 },
+    KillFocus,
+}
+
 /// UI thread -> PDF thread.
 #[derive(Debug)]
 pub enum PdfCmd {
@@ -36,6 +74,12 @@ pub enum PdfCmd {
     /// `px` is the desired OUTPUT size — already swapped for 90°/270°.
     /// `rot` = clockwise quarter-turns (0..=3) to render the page at.
     Render { page: u16, px: SizeU, rot: u8, visible: bool },
+    /// One interactive form event targeting `page`.
+    #[cfg(feature = "pro")]
+    Form { page: u16, ev: FormEvent },
+    /// Save the current document back to its source path.
+    #[cfg(feature = "pro")]
+    SaveDoc,
     Shutdown,
 }
 
@@ -47,6 +91,7 @@ pub enum PdfReply {
         pages: u16,
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
+        has_forms: bool,
     },
     NeedsPassword {
         path: PathBuf,
@@ -62,9 +107,19 @@ pub enum PdfReply {
         rot: u8,
         bgra: Vec<u8>,
         links: Vec<PageLink>,
+        fields: Vec<FormField>,
     },
     RenderFailed {
         page: u16,
         reason: String,
+    },
+    /// A form field's value changed (FFI_OnChange) — the open document now
+    /// differs from what is on disk.
+    #[cfg(feature = "pro")]
+    FormDirty,
+    /// Result of a `SaveDoc` request.
+    #[cfg(feature = "pro")]
+    Saved {
+        result: Result<(), String>,
     },
 }

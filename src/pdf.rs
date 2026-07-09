@@ -1,7 +1,9 @@
 //! The PDF thread: owns ALL pdfium state; speaks PdfCmd in, PdfReply out.
 
 use crate::layout::{RectF, SizeU};
-use crate::types::{LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
+use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
+#[cfg(feature = "pro")]
+use crate::types::FormEvent;
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
@@ -125,7 +127,7 @@ fn extract_pdfium_to(dir: &Path, bytes: &[u8], name: &str, force: bool) -> std::
 /// (a second bind returns PdfiumLibraryBindingsAlreadyInitialized), so bind
 /// exactly once and share the leaked instance — this also lets multiple test
 /// functions in one test process each spawn a PDF thread safely.
-fn pdfium() -> Result<&'static Pdfium, String> {
+pub(crate) fn pdfium() -> Result<&'static Pdfium, String> {
     static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
     PDFIUM
         .get_or_init(|| {
@@ -151,14 +153,50 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     let mut doc: Option<PdfDocument<'static>> = None;
     // A command consumed by the preemption check below, carried into the next iteration.
     let mut carry: Option<PdfCmd> = None;
+    // The last visible render request, re-issued when the form layer
+    // invalidates (pro). Kept only in the pro build — the free build never
+    // reads it, so gating it keeps that build's behavior byte-identical.
+    #[cfg(feature = "pro")]
+    let mut last_visible: Option<(u16, SizeU, u8)> = None;
+    // Throttle for unsolicited (timer/invalidate-driven) re-renders: see
+    // maybe_render_unsolicited. Investigated 2026-07-09
+    // (.superpowers/sdd/flood-investigation.md) — without this, a PDFium
+    // timer firing every ~1ms (see ffi_set_timer's floor clamp) drove a
+    // full-page render on every tick, pegging a CPU core.
+    #[cfg(feature = "pro")]
+    let mut last_unsolicited: Option<std::time::Instant> = None;
+    #[cfg(feature = "pro")]
+    let mut current_path: Option<PathBuf> = None;
+    #[cfg(feature = "pro")]
+    let mut engine: Option<crate::pro::forms::FormEngine> = None;
 
     'outer: loop {
         let first = match carry.take() {
             Some(c) => c,
-            None => match cmd_rx.recv() {
-                Ok(c) => c,
-                Err(_) => break, // UI hung up
-            },
+            None => {
+                #[cfg(feature = "pro")]
+                {
+                    match wait_cmd(
+                        &cmd_rx,
+                        &mut engine,
+                        &doc,
+                        last_visible,
+                        &mut last_unsolicited,
+                        &reply_tx,
+                        &wake,
+                    ) {
+                        Some(c) => c,
+                        None => break,
+                    }
+                }
+                #[cfg(not(feature = "pro"))]
+                {
+                    match cmd_rx.recv() {
+                        Ok(c) => c,
+                        Err(_) => break, // UI hung up
+                    }
+                }
+            }
         };
         let mut batch = vec![first];
         loop {
@@ -181,6 +219,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let mut visible: Option<(u16, SizeU, u8)> = None;
         let mut prefetch: Vec<(u16, SizeU, u8)> = Vec::new();
         let mut superseded: Vec<u16> = Vec::new();
+        #[cfg(feature = "pro")]
+        let mut form_events: Vec<(u16, FormEvent)> = Vec::new();
+        #[cfg(feature = "pro")]
+        let mut save_requested = false;
         for cmd in batch {
             match cmd {
                 PdfCmd::Shutdown => break 'outer,
@@ -197,6 +239,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     }
                 }
                 PdfCmd::Render { page, px, rot, visible: false } => prefetch.push((page, px, rot)),
+                #[cfg(feature = "pro")]
+                PdfCmd::Form { page, ev } => form_events.push((page, ev)),
+                #[cfg(feature = "pro")]
+                PdfCmd::SaveDoc => save_requested = true,
             }
         }
         // Dedup prefetches per page (keep the newest) and drop ones that
@@ -218,9 +264,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         }
 
         if let Some((path, password)) = load {
-            // Keep the old document until the new one opens successfully, so a
-            // failed open leaves the current book fully usable.
-            match pdfium.load_pdf_from_file(&path, password.as_deref()) {
+            // Keep the old document (and its form engine) until the new one
+            // opens successfully, so a failed open leaves the current book
+            // fully usable.
+            // Load from bytes: pdfium then holds no file handle, so the
+            // original stays writable (in-place save) and un-locked on disk.
+            let loaded = std::fs::read(&path)
+                .map_err(PdfiumError::IoError)
+                .and_then(|bytes| pdfium.load_pdf_from_byte_vec(bytes, password.as_deref()));
+            match loaded {
                 Ok(d) => {
                     if d.pages().len() <= 0 {
                         let _ = reply_tx.send(PdfReply::LoadFailed {
@@ -228,8 +280,32 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                             reason: "document has no pages".into(),
                         });
                     } else {
+                        // Teardown the form engine on the OLD document before
+                        // we drop or replace it — the engine holds a raw page
+                        // handle into it. Only reached once the new document
+                        // is known-good, so a failed open never tears down
+                        // the still-current document's engine.
+                        #[cfg(feature = "pro")]
+                        if let Some(mut eng) = engine.take() {
+                            eng.teardown(pdfium.bindings());
+                        }
+                        #[cfg(feature = "pro")]
+                        {
+                            last_visible = None;
+                        }
+                        // `describe` borrows `path`; send first, then keep it.
                         let _ = reply_tx.send(describe(&d, &path));
+                        #[cfg(feature = "pro")]
+                        {
+                            current_path = Some(path);
+                        }
                         doc = Some(d);
+                        #[cfg(feature = "pro")]
+                        {
+                            engine = doc
+                                .as_mut()
+                                .and_then(|d| crate::pro::forms::FormEngine::new(d, reply_tx.clone()));
+                        }
                     }
                 }
                 Err(PdfiumError::PdfiumLibraryInternalError(
@@ -244,6 +320,67 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             wake();
         }
 
+        // Remember the visible request so the form layer can re-issue it when
+        // its widgets invalidate. `visible` is Copy, so this read is cheap and
+        // leaves it available for the render loop below.
+        #[cfg(feature = "pro")]
+        if let Some(v) = visible {
+            last_visible = Some(v);
+        }
+
+        #[cfg(feature = "pro")]
+        {
+            if !form_events.is_empty() || save_requested || visible.is_some() {
+                crate::dlog!(
+                    "pdf: batch form_events={} visible={visible:?} save={save_requested} engine={}",
+                    form_events.len(),
+                    engine.is_some()
+                );
+            }
+            if let Some(eng) = engine.as_mut() {
+                for (page, ev) in form_events.drain(..) {
+                    eng.handle_event(pdfium.bindings(), page, ev);
+                }
+            }
+            // SaveDoc must ALWAYS get exactly one Saved reply, even with no
+            // engine/document/path — otherwise a UI waiting on the reply
+            // would hang forever.
+            if save_requested {
+                let result = match (engine.as_mut(), &doc, &current_path) {
+                    (Some(eng), Some(d), Some(p)) => eng.save(pdfium.bindings(), d, p),
+                    _ => Err("no document open".into()),
+                };
+                let _ = reply_tx.send(PdfReply::Saved { result });
+                wake();
+            }
+            // Events (or fired timers) dirtied the widgets. If this batch
+            // already has a visible-page render queued below, that render
+            // covers the current state — consume the flag now. This upholds
+            // the take-only-at-render invariant: the visible render below
+            // is unconditional when a document exists, and `engine` being
+            // Some implies `doc` is Some (the engine is created only
+            // alongside a successfully opened document and torn down with
+            // it). Otherwise this would be an UNSOLICITED render (nothing
+            // else in this batch is about to repaint the page), so it goes
+            // through the same throttle as wait_cmd's timer-driven renders;
+            // maybe_render_unsolicited leaves the flag SET when it cannot
+            // or may not render yet, so a later pass still catches up.
+            if let Some(eng) = engine.as_mut() {
+                if visible.is_some() {
+                    eng.take_invalidated();
+                } else {
+                    maybe_render_unsolicited(
+                        eng,
+                        &doc,
+                        last_visible,
+                        &mut last_unsolicited,
+                        &reply_tx,
+                        &wake,
+                    );
+                }
+            }
+        }
+
         let work: Vec<(u16, SizeU, u8)> = visible.into_iter().chain(prefetch).collect();
         let mut dropped_after: Option<usize> = None;
         for (i, (page, px, rot)) in work.iter().enumerate() {
@@ -254,6 +391,9 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 dropped_after = Some(i);
                 break;
             };
+            #[cfg(feature = "pro")]
+            let _ = reply_tx.send(render_page_pro(d, engine.as_ref(), *page, *px, *rot));
+            #[cfg(not(feature = "pro"))]
             let _ = reply_tx.send(render_page(d, *page, *px, *rot));
             wake();
             // Preempt: if new commands arrived mid-batch (e.g. a rapid page
@@ -276,6 +416,121 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             wake();
         }
     }
+
+    // Thread is exiting (Shutdown or the UI hung up): release the engine's raw
+    // page handle before its document drops.
+    #[cfg(feature = "pro")]
+    if let Some(mut eng) = engine.take() {
+        eng.teardown(pdfium.bindings());
+    }
+}
+
+/// Block for the next command; while form timers exist, wake at their
+/// deadlines to blink the caret (fire timers -> pdfium invalidates -> the
+/// visible page re-renders, throttled — see maybe_render_unsolicited).
+/// Returns None when the UI hung up.
+#[cfg(feature = "pro")]
+fn wait_cmd(
+    cmd_rx: &Receiver<PdfCmd>,
+    engine: &mut Option<crate::pro::forms::FormEngine>,
+    doc: &Option<PdfDocument<'static>>,
+    last_visible: Option<(u16, SizeU, u8)>,
+    last_unsolicited: &mut Option<std::time::Instant>,
+    reply_tx: &Sender<PdfReply>,
+    wake: &impl Fn(),
+) -> Option<PdfCmd> {
+    loop {
+        let deadline = engine.as_ref().and_then(|e| e.next_deadline());
+        let timeout = match deadline {
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()),
+            None => {
+                // No timers left — but a throttled unsolicited render may
+                // have left the invalidated flag set with nothing to wake
+                // us (e.g. a SaveDoc landed inside the 33ms window: save()
+                // force-kills focus, which kills the caret timer, and sets
+                // the flag; the main-loop repaint got throttled). An
+                // untimed recv() here would strand that deferred repaint
+                // (stale focus-ring/caret pixels) until some unrelated
+                // command arrived. Bounded-wait instead so the flush is
+                // always due — but ONLY when a repaint is actually
+                // possible: without a doc/last_visible the flag can only
+                // ever be serviced once a Render command arrives, and that
+                // wakes recv() anyway (a bounded wait would just spin idle).
+                let repaint_pending = engine.as_ref().is_some_and(|e| e.peek_invalidated())
+                    && doc.is_some()
+                    && last_visible.is_some();
+                if !repaint_pending {
+                    return cmd_rx.recv().ok();
+                }
+                MIN_UNSOLICITED_RENDER_INTERVAL
+            }
+        };
+        match cmd_rx.recv_timeout(timeout) {
+            Ok(c) => return Some(c),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(eng) = engine.as_mut() {
+                    eng.fire_due_timers();
+                    maybe_render_unsolicited(eng, doc, last_visible, last_unsolicited, reply_tx, wake);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Minimum spacing between UNSOLICITED (timer/invalidate-driven, not
+/// directly requested by the UI) page re-renders. 33ms = ~30fps — plenty
+/// for a caret blink (PDFium's own cadence is ~500ms) while bounding the
+/// worst case: a pathological PDFium timer requesting a near-0ms interval
+/// (investigated 2026-07-09, .superpowers/sdd/flood-investigation.md) would
+/// otherwise drive a full-page render on every tick and peg a CPU core
+/// (454 renders/s measured pre-fix).
+#[cfg(feature = "pro")]
+const MIN_UNSOLICITED_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// Render the visible page if the form layer's widgets were invalidated
+/// AND the unsolicited-render throttle allows it now. Shared by wait_cmd's
+/// timer-fire path and the main loop's post-event invalidate check — both
+/// render in response to PDFium state changes that the UI never explicitly
+/// requested, so both must be throttled the same way.
+///
+/// CRITICAL: when the throttle suppresses a render, the invalidated flag is
+/// left SET (never taken) — the caller must not otherwise consume it in
+/// that case. A later pass (the next timer wake, at least
+/// MIN_UNSOLICITED_RENDER_INTERVAL away, or the next command batch) will
+/// see it still set and repaint the final state. The flag is only consumed
+/// (via take_invalidated) when a render actually happens here.
+#[cfg(feature = "pro")]
+fn maybe_render_unsolicited(
+    eng: &mut crate::pro::forms::FormEngine,
+    doc: &Option<PdfDocument<'static>>,
+    last_visible: Option<(u16, SizeU, u8)>,
+    last_unsolicited: &mut Option<std::time::Instant>,
+    reply_tx: &Sender<PdfReply>,
+    wake: &impl Fn(),
+) {
+    let now = std::time::Instant::now();
+    let due = last_unsolicited
+        .map(|last| now.duration_since(last) >= MIN_UNSOLICITED_RENDER_INTERVAL)
+        .unwrap_or(true);
+    if !due {
+        crate::dlog!("pdf: unsolicited throttled (flag={})", eng.peek_invalidated());
+        return; // Throttled: leave the invalidated flag set for a later pass.
+    }
+    if !eng.peek_invalidated() {
+        return; // Nothing to repaint; don't touch the throttle clock.
+    }
+    crate::dlog!("pdf: unsolicited render dispatch last_visible={last_visible:?}");
+    if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
+        // Consume the flag only here, at the moment the render is actually
+        // dispatched. With no doc or no visible-render memo the flag must
+        // survive for the pass that CAN repaint (the eventual visible
+        // Render command's batch consumes it).
+        eng.take_invalidated();
+        let _ = reply_tx.send(render_page_pro(d, Some(&*eng), page, px, rot));
+        wake();
+        *last_unsolicited = Some(now);
+    }
 }
 
 /// Page count, all page sizes in points, and the outline flattened pre-order.
@@ -293,7 +548,13 @@ fn describe(doc: &PdfDocument, path: &Path) -> PdfReply {
         walk_bookmark(&b, 0, &mut outline);
         current = next;
     }
-    PdfReply::Loaded { path: path.to_path_buf(), pages, page_sizes, outline }
+    PdfReply::Loaded {
+        path: path.to_path_buf(),
+        pages,
+        page_sizes,
+        outline,
+        has_forms: doc.form().is_some(),
+    }
 }
 
 fn walk_bookmark(b: &PdfBookmark, depth: u8, out: &mut Vec<OutlineItem>) {
@@ -378,6 +639,7 @@ fn render_page(doc: &PdfDocument, page_idx: u16, px: SizeU, rot: u8) -> PdfReply
         rot,
         bgra,
         links: extract_links(&page),
+        fields: extract_form_fields(doc, &page),
     }
 }
 
@@ -411,6 +673,118 @@ fn extract_links(page: &PdfPage) -> Vec<PageLink> {
                 },
                 target,
             });
+        }
+    }
+    out
+}
+
+/// Stable PDFium ABI constants not re-exported by pdfium-render's prelude.
+const ANNOT_SUBTYPE_WIDGET: i32 = 20; // FPDF_ANNOT_WIDGET
+const FORMFIELD_TEXT: i32 = 6; // FPDF_FORMFIELD_TEXTFIELD
+#[cfg(feature = "pro")]
+const RENDER_FLAG_ANNOT: i32 = 1; // FPDF_ANNOT (render annotations)
+#[cfg(feature = "pro")]
+const BITMAP_FORMAT_BGRA: i32 = 4; // FPDFBitmap_BGRA
+
+/// Render like `render_page`, but when the form engine is live on THIS
+/// page, raster + form overlay go through the ENGINE's page handle via raw
+/// bindings. FPDF_LoadPage returns a DISTINCT page object per call, and
+/// FPDF_FFLDraw draws the live editor overlay (focus ring, caret, the
+/// focused widget's in-edit text, open combo popups) only into the page
+/// view attached to the handle it is given — pdfium-render's render path
+/// loads a private page handle, so the focused widget's live state never
+/// reached the pixels: typed text stayed invisible until its value
+/// committed on focus-loss (the 2026-07-09 "cannot type" bug, part 2).
+#[cfg(feature = "pro")]
+fn render_page_pro(
+    doc: &PdfDocument,
+    engine: Option<&crate::pro::forms::FormEngine>,
+    page_idx: u16,
+    px: SizeU,
+    rot: u8,
+) -> PdfReply {
+    let Some((form_h, page_h)) = engine.and_then(|e| e.render_handles(page_idx)) else {
+        return render_page(doc, page_idx, px, rot);
+    };
+    let b = doc.bindings();
+    let (w, h) = (px.w as i32, px.h as i32);
+    if w <= 0 || h <= 0 {
+        return PdfReply::RenderFailed { page: page_idx, reason: "empty bitmap".into() };
+    }
+    let bgra = unsafe {
+        let bmp = b.FPDFBitmap_CreateEx(w, h, BITMAP_FORMAT_BGRA, std::ptr::null_mut(), 0);
+        if bmp.is_null() {
+            return PdfReply::RenderFailed {
+                page: page_idx,
+                reason: "FPDFBitmap_CreateEx failed".into(),
+            };
+        }
+        let _ = b.FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFF_FFFF); // opaque white
+        // Same call pair + flags pdfium-render's form-aware path uses
+        // (FPDF_ANNOT on both is PDFium's canonical embedder sequence);
+        // `rot` is quarter-turns CW == FPDF's rotate arg, and px is already
+        // the output (rotation-swapped) size per PdfCmd::Render's contract.
+        b.FPDF_RenderPageBitmap(bmp, page_h, 0, 0, w, h, rot as i32, RENDER_FLAG_ANNOT);
+        b.FPDF_FFLDraw(form_h, bmp, page_h, 0, 0, w, h, rot as i32, RENDER_FLAG_ANNOT);
+        let stride = b.FPDFBitmap_GetStride(bmp) as usize;
+        let buf = b.FPDFBitmap_GetBuffer(bmp) as *const u8;
+        if buf.is_null() {
+            b.FPDFBitmap_Destroy(bmp);
+            return PdfReply::RenderFailed { page: page_idx, reason: "no bitmap buffer".into() };
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let mut tight = Vec::with_capacity(wu * hu * 4);
+        for row in 0..hu {
+            tight.extend_from_slice(std::slice::from_raw_parts(buf.add(row * stride), wu * 4));
+        }
+        b.FPDFBitmap_Destroy(bmp);
+        tight
+    };
+    // Links/fields come off a separate high-level page, exactly like the
+    // normal path — read-only walks, indifferent to which page object.
+    let page = match doc.pages().get(page_idx as PdfPageIndex) {
+        Ok(p) => p,
+        Err(e) => return PdfReply::RenderFailed { page: page_idx, reason: format!("{e:?}") },
+    };
+    PdfReply::Rendered {
+        page: page_idx,
+        px,
+        rot,
+        bgra,
+        links: extract_links(&page),
+        fields: extract_form_fields(doc, &page),
+    }
+}
+
+/// Widget-annotation rects (PDF points, bottom-left origin) + coarse kind.
+/// Read-only and shared by both editions: the free build needs the rects for
+/// its "Pro feature" hint, the pro build for hit-testing and cursors.
+fn extract_form_fields(doc: &PdfDocument, page: &PdfPage) -> Vec<FormField> {
+    let Some(form) = doc.form() else { return Vec::new() };
+    let b = doc.bindings();
+    let (form_h, page_h) = (form.handle(), page.page_handle());
+    let mut out = Vec::new();
+    unsafe {
+        for i in 0..b.FPDFPage_GetAnnotCount(page_h) {
+            let annot = b.FPDFPage_GetAnnot(page_h, i);
+            if annot.is_null() {
+                continue;
+            }
+            if b.FPDFAnnot_GetSubtype(annot) == ANNOT_SUBTYPE_WIDGET {
+                let mut r = FS_RECTF { left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 };
+                if b.FPDFAnnot_GetRect(annot, &mut r) != 0 {
+                    let kind = if b.FPDFAnnot_GetFormFieldType(form_h, annot) == FORMFIELD_TEXT {
+                        FieldKind::Text
+                    } else {
+                        FieldKind::Other
+                    };
+                    out.push(FormField {
+                        rect_pt: RectF { left: r.left, top: r.top, right: r.right, bottom: r.bottom },
+                        kind,
+                    });
+                }
+            }
+            b.FPDFPage_CloseAnnot(annot);
         }
     }
     out

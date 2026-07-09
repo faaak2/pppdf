@@ -19,6 +19,27 @@ rulebook next to your VTT and it looks like a page lying on the desktop.
    where the release build embeds it into the exe)
 3. `cargo build --release`
 
+### Pro edition
+
+The paid edition adds interactive form filling — click a field, type,
+toggle checkboxes/radios, pick from dropdowns, press Ctrl+S to save the
+filled PDF in place, with an unsaved-changes dot and a close prompt
+(Save/Discard/Cancel) protecting anything unsaved. Fillable fields are
+marked with a pale blue highlight; `F` cycles highlight → dotted frames
+→ off. (User-created
+labels/inputs are planned for a future release.) It's the same codebase
+behind a Cargo feature; its code lives in `src/pro/` and is not compiled
+into the free exe:
+
+```
+cargo build --release --features pro   # pppdf Pro
+cargo build --release                  # free edition
+```
+
+Both land as `target\release\pppdf.exe` — build them one at a time and copy
+the exe aside. CI/tests should run both: `cargo test` and
+`cargo test --features pro`.
+
 "Install": copy `target\release\pppdf.exe` anywhere and run it — PDFium is
 baked in, so there is nothing else to keep alongside it. Optionally
 right-click a PDF → Open with → choose pppdf.exe.
@@ -52,6 +73,9 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | F11 | Fill the screen (work area) / restore |
 | F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
+| Click a form field | Fill it · Tab/Shift+Tab next/previous · Esc leaves (Pro) |
+| F | Mark form fields: highlight / frames / off (Pro) |
+| Ctrl+S | Save filled form in place (Pro) |
 
 ## Make it a PDF handler (optional)
 

@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 use pppdf::app::App;
+use pppdf::edition;
 use pppdf::window;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -11,13 +12,14 @@ fn main() {
     // Any thread's panic (incl. the PDF thread) surfaces visibly, then exits —
     // no zombie chromeless window.
     std::panic::set_hook(Box::new(|info| {
-        let text: Vec<u16> = format!("pppdf crashed:\n{info}\0").encode_utf16().collect();
+        let text: Vec<u16> =
+            format!("{} crashed:\n{info}\0", edition::NAME).encode_utf16().collect();
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
             MessageBoxW(
                 None,
                 windows::core::PCWSTR(text.as_ptr()),
-                windows::core::w!("pppdf"),
+                edition::NAME_W,
                 MB_OK | MB_ICONERROR,
             );
         }
@@ -58,11 +60,11 @@ fn main() {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
             let text: Vec<u16> =
-                format!("pppdf failed to start:\n{e}\0").encode_utf16().collect();
+                format!("{} failed to start:\n{e}\0", edition::NAME).encode_utf16().collect();
             MessageBoxW(
                 None,
                 windows::core::PCWSTR(text.as_ptr()),
-                windows::core::w!("pppdf"),
+                edition::NAME_W,
                 MB_OK | MB_ICONERROR,
             );
         }

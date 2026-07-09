@@ -11,6 +11,13 @@ fn main() {
         // with the embed-manifest call above (two manifests = linker error).
         let mut res = winresource::WindowsResource::new();
         res.set_icon_with_id("assets/icon.ico", "1");
+        // Edition name in the exe's version info (Explorer → Properties →
+        // Details). Must mirror src/edition.rs NAME — build scripts can't
+        // see the crate, so the literal is repeated here.
+        let name =
+            if std::env::var_os("CARGO_FEATURE_PRO").is_some() { "pppdf Pro" } else { "pppdf" };
+        res.set("ProductName", name);
+        res.set("FileDescription", name);
         res.compile().expect("embed icon resource");
         println!("cargo:rerun-if-changed=assets/icon.ico");
     }

@@ -5,7 +5,7 @@ use crate::layout::{
     zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
-use crate::types::{LinkTarget, OutlineItem, PageLink};
+use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -21,6 +21,12 @@ pub struct CachedPage {
     pub rot: u8,
     pub bgra: Vec<u8>,
     pub links: Vec<PageLink>,
+    pub fields: Vec<FormField>,
+    /// Monotonic id stamped by `App::rendered()` — part of the renderer's
+    /// device-bitmap memo key. Form filling re-renders the SAME
+    /// (page, px, rot) with NEW pixels; without gen the memo would keep
+    /// serving the stale bitmap (same trap as the `rot` note above).
+    pub gen: u64,
 }
 
 /// How far (px per axis) a cached size may differ from a requested size and
@@ -130,6 +136,7 @@ pub struct DocState {
     pub pages: u16,
     pub page_sizes: Vec<(f32, f32)>,
     pub outline: Vec<OutlineItem>,
+    pub has_forms: bool,
     pub current: u16,
     /// 1.0 = fit-to-window.
     pub zoom: f32,
@@ -205,6 +212,37 @@ pub struct App {
     /// F1 help overlay. Global (not per-document): available in every mode,
     /// so it lives here rather than on DocState like the TOC overlay.
     pub help_visible: bool,
+    /// Source of `CachedPage::gen`; bumped on every render reply.
+    render_gen: u64,
+    /// Pro: a form field currently has keyboard focus (typing mode). The UI
+    /// owns this state — it initiates every focus change (click, Tab, Esc).
+    #[cfg(feature = "pro")]
+    pub form_focus: bool,
+    /// Pro: index (into the current cache entry's fields) last focused via
+    /// click or Tab — the anchor for Tab cycling.
+    #[cfg(feature = "pro")]
+    pub form_tab_idx: Option<usize>,
+    /// Pro: unsaved form changes exist (dirty dot + close-prompt gate).
+    #[cfg(feature = "pro")]
+    pub form_dirty: bool,
+    /// Pro: how form widgets are marked on the page ('F' cycles it).
+    /// Sticky for the window's lifetime — a viewer preference like
+    /// `help_visible`, so `doc_loaded` intentionally leaves it alone.
+    #[cfg(feature = "pro")]
+    pub field_indication: FieldIndication,
+}
+
+/// Pro: visual marking of form widgets, cycled by 'F'. Drawn client-side by
+/// d2d over the cached page bitmap — never baked into rendered pixels, so
+/// toggling repaints instantly without touching the render cache.
+#[cfg(feature = "pro")]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FieldIndication {
+    /// Translucent blue wash over each widget (the Chromium look). Default.
+    Highlight,
+    /// Dotted outline around each widget.
+    Frame,
+    Off,
 }
 
 impl App {
@@ -217,12 +255,44 @@ impl App {
             client: SizeU { w: 0, h: 0 },
             dpi: 96,
             help_visible: false,
+            render_gen: 0,
+            #[cfg(feature = "pro")]
+            form_focus: false,
+            #[cfg(feature = "pro")]
+            form_tab_idx: None,
+            #[cfg(feature = "pro")]
+            form_dirty: false,
+            #[cfg(feature = "pro")]
+            field_indication: FieldIndication::Highlight,
         }
+    }
+
+    /// Advance the field-indication mode and return the new one (toast text).
+    #[cfg(feature = "pro")]
+    pub fn cycle_field_indication(&mut self) -> FieldIndication {
+        self.field_indication = match self.field_indication {
+            FieldIndication::Highlight => FieldIndication::Frame,
+            FieldIndication::Frame => FieldIndication::Off,
+            FieldIndication::Off => FieldIndication::Highlight,
+        };
+        self.field_indication
     }
 
     /// Flip the F1 help overlay. Available in every mode.
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
+    }
+
+    /// Unsaved form changes exist (always false in the free edition).
+    pub fn dirty_dot_visible(&self) -> bool {
+        #[cfg(feature = "pro")]
+        {
+            self.form_dirty
+        }
+        #[cfg(not(feature = "pro"))]
+        {
+            false
+        }
     }
 
     pub fn doc(&self) -> Option<&DocState> {
@@ -249,15 +319,26 @@ impl App {
         pages: u16,
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
+        has_forms: bool,
     ) {
         self.cache.clear();
         self.pending.clear();
         self.failed.clear();
+        #[cfg(feature = "pro")]
+        {
+            self.form_focus = false;
+            self.form_tab_idx = None;
+            self.form_dirty = false;
+            // field_indication deliberately NOT reset: it's a viewer
+            // preference (like help_visible), not document state — turning
+            // the marks off must survive opening the next form.
+        }
         self.mode = Mode::Doc(DocState {
             path,
             pages,
             page_sizes,
             outline,
+            has_forms,
             current: 0,
             zoom: 1.0,
             scroll: PointF::default(),
@@ -417,7 +498,20 @@ impl App {
 
     /// A render reply arrived: clear the page's pending entries (by page, not
     /// exact size — pdfium may round differently than layout::render_size).
-    pub fn rendered(&mut self, page: CachedPage) {
+    pub fn rendered(&mut self, mut page: CachedPage) {
+        // Every reply gets a fresh generation, even for an identical
+        // (page, px, rot) key — the pixels may differ (form filling).
+        self.render_gen += 1;
+        page.gen = self.render_gen;
+        crate::dlog!(
+            "app: rendered page={} px={}x{} rot={} gen={} fields={}",
+            page.page,
+            page.px.w,
+            page.px.h,
+            page.rot,
+            page.gen,
+            page.fields.len()
+        );
         self.pending.retain(|k| k.0 != page.page);
         let protected: Vec<u16> = self
             .doc()
@@ -446,12 +540,14 @@ impl App {
         }
     }
 
-    /// Link under a window-space point on the current page, if any. Link
-    /// rects live in unrotated page space, so the window point is first
-    /// carried back through the view rotation.
-    pub fn link_at(&self, p: PointF) -> Option<LinkTarget> {
+    /// Project a window-space point into the current page's unrotated bitmap
+    /// frame. Returns (point in unrotated bitmap px, px-per-pt scale, page
+    /// size in points). None when no doc/render or the point is off-page.
+    fn page_hit_frame(&self, p: PointF) -> Option<(PointF, f32, (f32, f32))> {
         let d = self.doc()?;
-        let entry = self.cache.get_any(d.current, d.rot)?;
+        // Cache presence gate kept from link_at: hit-testing against a page
+        // that has never rendered would use stale geometry.
+        self.cache.get_any(d.current, d.rot)?;
         let pr = self.current_page_rect()?;
         // Points outside the displayed page can't be on a link — and must be
         // rejected BEFORE unrotating: negating coordinates flips the half-open
@@ -477,13 +573,18 @@ impl App {
             x: q.x.min(page_pt.0 * px_per_pt - 1e-3),
             y: q.y.min(page_pt.1 * px_per_pt - 1e-3),
         };
-        // Links compared inside the unrotated bitmap's own frame (origin 0,0).
-        let unrot = RectF {
-            left: 0.0,
-            top: 0.0,
-            right: page_pt.0 * px_per_pt,
-            bottom: page_pt.1 * px_per_pt,
-        };
+        Some((q, px_per_pt, page_pt))
+    }
+
+    /// Link under a window-space point on the current page, if any. Link
+    /// rects live in unrotated page space, so the window point is first
+    /// carried back through the view rotation.
+    pub fn link_at(&self, p: PointF) -> Option<LinkTarget> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        let unrot =
+            RectF { left: 0.0, top: 0.0, right: page_pt.0 * px_per_pt, bottom: page_pt.1 * px_per_pt };
         for link in &entry.links {
             let wr = pdf_rect_to_window(link.rect_pt, page_pt.1, px_per_pt, unrot);
             if wr.contains(q) {
@@ -491,6 +592,98 @@ impl App {
             }
         }
         None
+    }
+
+    /// Form field under a window-space point: (index into the cache entry's
+    /// `fields`, kind). Same projection as link_at.
+    pub fn field_hit(&self, p: PointF) -> Option<(usize, FieldKind)> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        let unrot =
+            RectF { left: 0.0, top: 0.0, right: page_pt.0 * px_per_pt, bottom: page_pt.1 * px_per_pt };
+        for (i, f) in entry.fields.iter().enumerate() {
+            let wr = pdf_rect_to_window(f.rect_pt, page_pt.1, px_per_pt, unrot);
+            if wr.contains(q) {
+                return Some((i, f.kind));
+            }
+        }
+        None
+    }
+
+    pub fn field_at(&self, p: PointF) -> Option<FieldKind> {
+        self.field_hit(p).map(|(_, k)| k)
+    }
+
+    /// Window-space rects of the current page's form widgets under the
+    /// current layout (zoom, scroll, rotation) — the drawing-side complement
+    /// of `field_hit`: that one unrotates the probe POINT, this rotates the
+    /// RECTS into the displayed frame.
+    #[cfg(feature = "pro")]
+    pub fn field_rects_window(&self) -> Vec<RectF> {
+        let Some(d) = self.doc() else { return Vec::new() };
+        let Some(entry) = self.cache.get_any(d.current, d.rot) else { return Vec::new() };
+        let Some(pr) = self.current_page_rect() else { return Vec::new() };
+        let page_pt = d.page_pt();
+        let px_per_pt = fit_scale(d.page_pt_rot(), self.client) * d.zoom;
+        // Unrotated-bitmap frame, origin (0,0) — same frame field_hit tests
+        // in; the page offset is applied AFTER rotation, because pr is where
+        // the ROTATED bitmap sits.
+        let unrot = RectF {
+            left: 0.0,
+            top: 0.0,
+            right: page_pt.0 * px_per_pt,
+            bottom: page_pt.1 * px_per_pt,
+        };
+        entry
+            .fields
+            .iter()
+            .map(|f| {
+                let r = pdf_rect_to_window(f.rect_pt, page_pt.1, px_per_pt, unrot);
+                let rr = crate::layout::rotate_rect(r, unrot.right, unrot.bottom, d.rot);
+                RectF {
+                    left: pr.left + rr.left,
+                    top: pr.top + rr.top,
+                    right: pr.left + rr.right,
+                    bottom: pr.top + rr.bottom,
+                }
+            })
+            .collect()
+    }
+
+    /// Window point -> PDF page coordinates (points, origin bottom-left,
+    /// y up) — the space FORM_On* events and field rects live in.
+    pub fn pdf_point_at(&self, p: PointF) -> Option<PointF> {
+        let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
+        Some(PointF { x: q.x / px_per_pt, y: page_pt.1 - q.y / px_per_pt })
+    }
+
+    /// Advance Tab focus through the current page's fields in reading order
+    /// (top-to-bottom, then left-to-right; PDF y is up, so top DESCENDING).
+    /// Returns the next field's center in PDF points for a synthesized click.
+    #[cfg(feature = "pro")]
+    pub fn form_tab_target(&mut self, backwards: bool) -> Option<PointF> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        if entry.fields.is_empty() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..entry.fields.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (ra, rb) = (&entry.fields[a].rect_pt, &entry.fields[b].rect_pt);
+            rb.top.total_cmp(&ra.top).then(ra.left.total_cmp(&rb.left))
+        });
+        let pos = self.form_tab_idx.and_then(|cur| order.iter().position(|&i| i == cur));
+        let next_pos = match (pos, backwards) {
+            (Some(p), false) => (p + 1) % order.len(),
+            (Some(p), true) => (p + order.len() - 1) % order.len(),
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+        };
+        let idx = order[next_pos];
+        self.form_tab_idx = Some(idx);
+        let r = entry.fields[idx].rect_pt;
+        Some(PointF { x: (r.left + r.right) / 2.0, y: (r.top + r.bottom) / 2.0 })
     }
 
     // --- go-to-page entry (G, digits, Enter — drawn as a small prompt) ---
@@ -594,12 +787,13 @@ mod tests {
             pages,
             vec![LETTER; pages as usize],
             vec![],
+            false,
         );
         a
     }
 
     fn cached(page: u16, px: SizeU) -> CachedPage {
-        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![] }
+        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0 }
     }
 
     // --- paging ---
@@ -647,7 +841,7 @@ mod tests {
     fn zero_page_doc_navigation_is_safe() {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
-        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![]);
+        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false);
         assert!(!a.flip(1));
         assert!(!a.flip(-1));
         assert!(!a.goto(5));
@@ -746,6 +940,21 @@ mod tests {
     // --- wanted_renders / pending / cache ---
 
     #[test]
+    fn refreshed_render_gets_a_new_generation() {
+        // Form filling re-renders the SAME (page, px, rot) key with new
+        // pixels; the d2d device-bitmap memo keys on gen to notice. Two
+        // same-key renders must never share a generation.
+        let mut a = app_with_doc(1);
+        let px = SizeU { w: 10, h: 10 };
+        a.rendered(cached(0, px));
+        let g1 = a.cache.get_any(0, 0).unwrap().gen;
+        a.rendered(cached(0, px));
+        let g2 = a.cache.get_any(0, 0).unwrap().gen;
+        assert!(g2 > g1, "refreshed pixels must bump gen: {g1} vs {g2}");
+        assert!(g1 > 0, "assigned gens start at 1 so a fresh memo can't collide");
+    }
+
+    #[test]
     fn wanted_renders_current_then_next_then_prev() {
         let mut a = app_with_doc(5);
         a.flip(2); // current = 2
@@ -801,6 +1010,8 @@ mod tests {
             rot: 0,
             bgra: vec![0; bytes],
             links: vec![],
+            fields: vec![],
+            gen: 0,
         };
         c.put(big(0, 60), &[]);
         c.put(big(1, 60), &[]); // 120 > 100: page 0 evicted
@@ -854,6 +1065,8 @@ mod tests {
                     rot: 0,
                     bgra: vec![0; 10],
                     links: vec![],
+                    fields: vec![],
+                    gen: 0,
                 },
                 &[1], // page 1 is protected — the crawl must still be bounded
             );
@@ -867,7 +1080,7 @@ mod tests {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
         a.cache = PageCache::with_budget(6, 100);
-        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![]);
+        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![], false);
         a.flip(1); // current = 1; working set {0, 1, 2}
         let mut rounds = 0;
         loop {
@@ -886,6 +1099,7 @@ mod tests {
                     rot: r.rot,
                     bgra: vec![0; bytes],
                     links: vec![],
+                    fields: vec![], gen: 0,
                 });
             }
         }
@@ -915,7 +1129,7 @@ mod tests {
         a.render_failed(1, false); // genuine pdfium failure on the prefetch page
         assert!(a.wanted_renders().iter().all(|r| r.page != 1), "failed page must not hot-loop");
         // A fresh document clears the failed set.
-        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![]);
+        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false);
         assert!(a.wanted_renders().iter().any(|r| r.page == 1));
     }
 
@@ -930,7 +1144,14 @@ mod tests {
             rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
             target: LinkTarget::Page(0),
         };
-        a.rendered(CachedPage { page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![link] });
+        a.rendered(CachedPage {
+            page: 0,
+            px: fit_px,
+            rot: 0,
+            bgra: vec![0; 4],
+            links: vec![link],
+            fields: vec![], gen: 0,
+        });
         let pr = a.current_page_rect().unwrap();
         // A window point just inside the page's top-left corner is on the link.
         let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
@@ -952,12 +1173,45 @@ mod tests {
         assert!(a.rotate_cw());
         let px = a.current_px().unwrap();
         assert!(px.w > px.h, "rotated portrait page must be landscape");
-        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link] });
+        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link], fields: vec![], gen: 0 });
         let pr = a.current_page_rect().unwrap();
         let top_right = PointF { x: pr.right - 5.0, y: pr.top + 5.0 };
         assert_eq!(a.link_at(top_right), Some(LinkTarget::Page(0)));
         let top_left = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
         assert_eq!(a.link_at(top_left), None, "unrotated hotspot must have moved");
+    }
+
+    #[test]
+    fn field_hit_transforms_like_links() {
+        let mut a = app_with_doc(1);
+        let fit_px = render_size(LETTER, a.client, 1.0);
+        let field = crate::types::FormField {
+            rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
+            kind: crate::types::FieldKind::Text,
+        };
+        a.rendered(CachedPage {
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![field], gen: 0,
+        });
+        let pr = a.current_page_rect().unwrap();
+        let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
+        assert_eq!(a.field_hit(p), Some((0, crate::types::FieldKind::Text)));
+        let q = PointF { x: pr.left + 5.0, y: pr.bottom - 5.0 };
+        assert_eq!(a.field_at(q), None);
+    }
+
+    #[test]
+    fn pdf_point_at_round_trips_pdf_space() {
+        let mut a = app_with_doc(1);
+        let fit_px = render_size(LETTER, a.client, 1.0);
+        a.rendered(CachedPage {
+            page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0,
+        });
+        let pr = a.current_page_rect().unwrap();
+        // Window point 10% in from the page's top-left corner.
+        let p = PointF { x: pr.left + pr.width() * 0.1, y: pr.top + pr.height() * 0.1 };
+        let pt = a.pdf_point_at(p).unwrap();
+        assert!((pt.x - 61.2).abs() < 2.0, "x: {}", pt.x);
+        assert!((pt.y - (792.0 - 79.2)).abs() < 2.0, "y-up flip: {}", pt.y);
     }
 
     // --- rotation ---
@@ -997,7 +1251,7 @@ mod tests {
         // 180° where the pixel size is identical.
         a.rotate_cw(); // rot = 2: same px as upright
         let px180 = a.current_px().unwrap();
-        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![] });
+        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![], fields: vec![], gen: 0 });
         assert!(
             a.wanted_renders().iter().any(|r| r.page == 0 && r.rot == 2),
             "180° must re-render despite identical px"
@@ -1094,5 +1348,105 @@ mod tests {
         b.mode = Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev: None };
         b.password_cancel();
         assert!(matches!(b.mode, Mode::Empty));
+    }
+
+    #[cfg(feature = "pro")]
+    mod pro_tests {
+        use super::*;
+        use crate::types::{FieldKind, FormField};
+
+        fn field(l: f32, b: f32, r: f32, t: f32) -> FormField {
+            FormField { rect_pt: RectF { left: l, top: t, right: r, bottom: b }, kind: FieldKind::Text }
+        }
+
+        #[test]
+        fn field_indication_cycles_highlight_frame_off() {
+            let mut a = App::new();
+            assert_eq!(a.field_indication, FieldIndication::Highlight, "default is highlight");
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Frame);
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Off);
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Highlight);
+        }
+
+        /// The drawn indication and the click hit-test must agree: the center
+        /// of every drawn rect must field_hit() back to that field, at every
+        /// rotation (rects live in unrotated PDF space; drawing rotates them,
+        /// hit-testing unrotates the point — the two must be exact inverses).
+        #[test]
+        fn field_rects_window_inverts_field_hit_across_rotations() {
+            let mut a = app_with_doc(1);
+            let f = field(100.0, 650.0, 300.0, 700.0);
+            for _ in 0..4 {
+                let req = a.wanted_renders()[0];
+                a.rendered(CachedPage {
+                    page: 0,
+                    px: req.px,
+                    rot: req.rot,
+                    bgra: vec![0; 4],
+                    links: vec![],
+                    fields: vec![f.clone()],
+                    gen: 0,
+                });
+                let rects = a.field_rects_window();
+                assert_eq!(rects.len(), 1, "rot {}", req.rot);
+                let r = rects[0];
+                assert!(r.left < r.right && r.top < r.bottom, "rot {}: {r:?}", req.rot);
+                let c = PointF { x: (r.left + r.right) / 2.0, y: (r.top + r.bottom) / 2.0 };
+                assert_eq!(
+                    a.field_hit(c),
+                    Some((0, FieldKind::Text)),
+                    "rot {}: center {c:?} of drawn rect {r:?} must hit the field",
+                    req.rot
+                );
+                a.rotate_cw();
+            }
+        }
+
+        #[test]
+        fn dirty_flag_lifecycle() {
+            let mut a = app_with_doc(1);
+            assert!(!a.dirty_dot_visible());
+            a.form_dirty = true;
+            assert!(a.dirty_dot_visible());
+            // Stashing the doc behind a password prompt (opening a second,
+            // locked PDF) must NOT clear the flag — the edits still exist in
+            // the stashed doc. The renderer hides the dot outside Doc mode;
+            // this accessor keeps reporting the truth.
+            let prev = match std::mem::replace(&mut a.mode, Mode::Empty) {
+                Mode::Doc(d) => Some(Box::new(d)),
+                _ => None,
+            };
+            a.mode =
+                Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
+            assert!(a.dirty_dot_visible(), "mode changes alone never clear dirty");
+            // A fresh document clears it.
+            a.doc_loaded(PathBuf::from("y.pdf"), 1, vec![LETTER], vec![], false);
+            assert!(!a.dirty_dot_visible());
+        }
+
+        #[test]
+        fn tab_cycles_fields_in_reading_order_and_wraps() {
+            let mut a = app_with_doc(1);
+            let fit_px = render_size(LETTER, a.client, 1.0);
+            // Three fields: top (y 700..720), middle (500..520), bottom (300..320).
+            a.rendered(CachedPage {
+                page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![],
+                fields: vec![field(72.0, 500.0, 300.0, 520.0),   // middle
+                             field(72.0, 700.0, 300.0, 720.0),   // top
+                             field(72.0, 300.0, 300.0, 320.0)],  // bottom
+                gen: 0,
+            });
+            // From nothing selected, Tab goes to the TOP field (max top).
+            let p1 = a.form_tab_target(false).unwrap();
+            assert!((p1.y - 710.0).abs() < 1.0, "first tab -> top field, got y {}", p1.y);
+            let p2 = a.form_tab_target(false).unwrap();
+            assert!((p2.y - 510.0).abs() < 1.0, "then middle");
+            let p3 = a.form_tab_target(false).unwrap();
+            assert!((p3.y - 310.0).abs() < 1.0, "then bottom");
+            let p4 = a.form_tab_target(false).unwrap();
+            assert!((p4.y - 710.0).abs() < 1.0, "wraps to top");
+            let p5 = a.form_tab_target(true).unwrap();
+            assert!((p5.y - 310.0).abs() < 1.0, "shift-tab goes back (wraps to bottom)");
+        }
     }
 }

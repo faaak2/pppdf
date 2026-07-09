@@ -28,6 +28,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_F1, VK_F11, VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
     VK_SPACE, VK_TAB, VK_UP,
 };
+// Pro-only VKs: typing mode forwards these to the form. Free build never
+// references them, so gate the import to keep it warning-free.
+#[cfg(feature = "pro")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_MENU};
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, SHAppBarMessage, ShellExecuteW, HDROP,
     ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA,
@@ -84,6 +88,33 @@ pub struct Ui {
     /// Whether the window is pinned above others (WS_EX_TOPMOST). Toggled from
     /// the context menu; not persisted (the app keeps no config).
     pub always_on_top: bool,
+    /// Pro: left button went down inside a form field; route move/up to the
+    /// form until release.
+    #[cfg(feature = "pro")]
+    pub form_mouse: bool,
+    /// Pro: a Save/Discard/Cancel prompt chose "Save" while closing — the
+    /// window should destroy itself once the pending SaveDoc completes,
+    /// instead of showing the "Saved" toast. Mutually exclusive with
+    /// pending_open (last user intent wins).
+    #[cfg(feature = "pro")]
+    pub pending_close: bool,
+    /// Pro: a Save/Discard/Cancel prompt chose "Save" (or a save was already
+    /// in flight) while an Open was requested — replace the document with this
+    /// path once the pending SaveDoc resolves, instead of silently discarding
+    /// the unsaved edits. Mutually exclusive with pending_close.
+    #[cfg(feature = "pro")]
+    pub pending_open: Option<std::path::PathBuf>,
+    /// Pro: number of dispatched SaveDoc commands whose Saved reply hasn't
+    /// arrived. A counter, not a bool: overlapping saves (a 2nd Ctrl+S while
+    /// the 1st is still in flight) must both be accounted for, or the first
+    /// Saved(Ok) would clear the latch while another write is still running.
+    /// quit() and the open gate defer while > 0 — destroying the window exits
+    /// the process and would kill the detached PDF thread possibly mid-write.
+    #[cfg(feature = "pro")]
+    pub saves_inflight: u32,
+    /// Free: the one-per-run "Pro feature" hint has been shown.
+    #[cfg(not(feature = "pro"))]
+    pub hint_shown: bool,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -128,6 +159,16 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             saved_rect: None,
             wheel_residual: 0,
             always_on_top: false,
+            #[cfg(feature = "pro")]
+            form_mouse: false,
+            #[cfg(feature = "pro")]
+            pending_close: false,
+            #[cfg(feature = "pro")]
+            pending_open: None,
+            #[cfg(feature = "pro")]
+            saves_inflight: 0,
+            #[cfg(not(feature = "pro"))]
+            hint_shown: false,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -137,7 +178,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
-            w!("pppdf"),
+            crate::edition::NAME_W,
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -260,7 +301,32 @@ impl Ui {
                 WM_NCHITTEST => {
                     let sx = (lparam.0 & 0xFFFF) as i16 as i32; // screen coords
                     let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                    LRESULT(self.hit_test(sx, sy) as isize)
+                    let hit = self.hit_test(sx, sy);
+                    if crate::dbglog::enabled() {
+                        // Fires on every mouse move: log transitions only.
+                        thread_local! {
+                            static LAST: std::cell::Cell<u32> =
+                                const { std::cell::Cell::new(u32::MAX) };
+                        }
+                        if LAST.with(|l| l.replace(hit)) != hit {
+                            crate::dlog!("ui: nchittest screen=({sx},{sy}) -> {hit}");
+                        }
+                    }
+                    LRESULT(hit as isize)
+                }
+                WM_NCLBUTTONDOWN => {
+                    // Unzoomed page background hit-tests as HTCAPTION (that's
+                    // what makes the borderless window draggable), so a
+                    // click-off-field there never reaches WM_LBUTTONDOWN's
+                    // kill-focus path — typing mode would survive and keep
+                    // eating the app shortcuts (TOC, rotate...). Leave typing
+                    // mode first, then let DefWindowProc run the drag.
+                    #[cfg(feature = "pro")]
+                    if wparam.0 as u32 == HTCAPTION {
+                        crate::dlog!("ui: nclbuttondown caption -> kill form focus");
+                        self.form_kill_focus();
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
                 }
                 WM_NCLBUTTONDBLCLK => {
                     // DefWindowProc would toggle maximize on caption dbl-click.
@@ -329,7 +395,7 @@ impl Ui {
                             MessageBoxW(
                                 Some(self.hwnd),
                                 PCWSTR(msg.as_ptr()),
-                                w!("pppdf"),
+                                crate::edition::NAME_W,
                                 MB_OK | MB_ICONERROR,
                             );
                             None
@@ -354,6 +420,8 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEWHEEL => {
+                    #[cfg(feature = "pro")]
+                    self.form_kill_focus();
                     // Wheel navigation abandons a half-typed go-to-page entry —
                     // the prompt must not sit open while pages flip under it.
                     self.dismiss_goto_entry();
@@ -415,6 +483,78 @@ impl Ui {
                     }
                     // A click also abandons the go-to-page entry (then acts normally).
                     self.dismiss_goto_entry();
+                    // Form fields win over links and window dragging.
+                    #[cfg(feature = "pro")]
+                    {
+                        let p = self.mouse_point(lparam);
+                        crate::dlog!(
+                            "ui: lbuttondown p=({},{}) field_hit={:?} pdf_pt={:?} form_focus={}",
+                            p.x,
+                            p.y,
+                            self.app.field_hit(p),
+                            self.app.pdf_point_at(p).map(|q| (q.x, q.y)),
+                            self.app.form_focus
+                        );
+                        if let (Some((idx, kind)), Some(pt)) =
+                            (self.app.field_hit(p), self.app.pdf_point_at(p))
+                        {
+                            if kind == crate::types::FieldKind::Other {
+                                // A click on a non-text widget (checkbox,
+                                // radio, combo, push button) is almost always
+                                // a mutation, and the FormDirty reply
+                                // confirming it is ASYNC — a fast Alt+F4 could
+                                // close before it pumps. Text-field clicks are
+                                // focus-only; the keyboard-side marking covers
+                                // their edits. Over-marking is safe;
+                                // under-marking loses data.
+                                self.app.form_dirty = true;
+                            }
+                            self.app.form_tab_idx = Some(idx);
+                            self.app.form_focus = true;
+                            self.form_mouse = true;
+                            // Capture like the pan-drag path: without it, a
+                            // release outside the window never delivers
+                            // WM_LBUTTONUP, stranding form_mouse=true (the
+                            // NEXT click's mouse-up would be eaten), and
+                            // in-field selection drags die at the window edge.
+                            SetCapture(self.hwnd);
+                            let m = Self::form_modifiers();
+                            // PDFium builds a widget's interactive editor
+                            // (caret, per-keystroke invalidation) on
+                            // mouse-ENTER or a clean focus grab — but NOT on
+                            // a bare click that moves focus from another
+                            // widget: that click edited invisibly (typed
+                            // text never repainted; the 2026-07-09 "cannot
+                            // type" bug). Hover moves are forwarded too, but
+                            // a click must be self-sufficient — a touchpad
+                            // tap arrives with no prior client-space move.
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: m,
+                            });
+                            self.send_form(crate::types::FormEvent::MouseDown {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: m,
+                            });
+                            return LRESULT(0);
+                        }
+                        // Clicking off-field leaves typing mode (commit), then
+                        // the click acts normally (drag/pan/link).
+                        self.form_kill_focus();
+                    }
+                    #[cfg(not(feature = "pro"))]
+                    {
+                        let p = self.mouse_point(lparam);
+                        if self.app.field_at(p).is_some() {
+                            if !self.hint_shown {
+                                self.hint_shown = true;
+                                self.show_toast("Form filling is a pppdf Pro feature".into());
+                            }
+                            return LRESULT(0);
+                        }
+                    }
                     self.suppress_click = false;
                     let p = self.mouse_point(lparam);
                     let over_panel = self.app.doc().map_or(false, |d| {
@@ -440,6 +580,38 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEMOVE => {
+                    #[cfg(feature = "pro")]
+                    if self.form_mouse && (wparam.0 as u32 & 0x0001) != 0 {
+                        // MK_LBUTTON: drag inside a field = text selection.
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        return LRESULT(0);
+                    }
+                    // Buttonless hover over a form document: keep PDFium's
+                    // mouse-enter/leave state current (hover highlight, and
+                    // the lazily-created widget editor — see WM_LBUTTONDOWN).
+                    // Naturally sparse when unzoomed: client-space moves only
+                    // arrive where hit_test returns HTCLIENT (fields/links).
+                    #[cfg(feature = "pro")]
+                    if (wparam.0 as u32 & 0x0001) == 0
+                        && self.drag.is_none()
+                        && self.app.doc().is_some_and(|d| d.has_forms)
+                    {
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                    }
                     let p = self.mouse_point(lparam);
                     if let Some(drag) = &mut self.drag {
                         let (dx, dy) = (p.x - drag.start.x, p.y - drag.start.y);
@@ -466,9 +638,57 @@ impl Ui {
                 }
                 WM_CAPTURECHANGED => {
                     self.drag = None;
+                    // Capture lost mid-field-drag (Alt-Tab, another window
+                    // grabbing capture): drop the form-mouse latch so the next
+                    // click's WM_LBUTTONUP isn't consumed by the form branch.
+                    #[cfg(feature = "pro")]
+                    {
+                        self.form_mouse = false;
+                    }
                     LRESULT(0)
                 }
                 WM_LBUTTONDBLCLK => {
+                    crate::dlog!("ui: lbuttondblclk");
+                    // Over a field, a dblclk is form INPUT, not a zoom
+                    // gesture: the OS turns every second rapid click into
+                    // DBLCLK, and swallowing it made half the clicks on a
+                    // checkbox vanish. Text fields get the real double-click
+                    // (word selection); button-likes get a plain MouseDown
+                    // (their editor ignores DblClk — a click must toggle).
+                    #[cfg(feature = "pro")]
+                    {
+                        let p = self.mouse_point(lparam);
+                        if let (Some((idx, kind)), Some(pt)) =
+                            (self.app.field_hit(p), self.app.pdf_point_at(p))
+                        {
+                            if kind == crate::types::FieldKind::Other {
+                                // Same optimistic dirty-marking as a click.
+                                self.app.form_dirty = true;
+                            }
+                            self.app.form_tab_idx = Some(idx);
+                            self.app.form_focus = true;
+                            // The paired WM_LBUTTONUP must forward MouseUp.
+                            self.form_mouse = true;
+                            SetCapture(self.hwnd);
+                            let m = Self::form_modifiers();
+                            let ev = if kind == crate::types::FieldKind::Text {
+                                crate::types::FormEvent::MouseDblClk {
+                                    x: pt.x,
+                                    y: pt.y,
+                                    modifiers: m,
+                                }
+                            } else {
+                                crate::types::FormEvent::MouseDown {
+                                    x: pt.x,
+                                    y: pt.y,
+                                    modifiers: m,
+                                }
+                            };
+                            self.send_form(ev);
+                            return LRESULT(0);
+                        }
+                        self.form_kill_focus();
+                    }
                     self.dismiss_goto_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
@@ -483,6 +703,27 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
+                    #[cfg(feature = "pro")]
+                    crate::dlog!(
+                        "ui: lbuttonup form_mouse={} suppress={}",
+                        self.form_mouse,
+                        self.suppress_click
+                    );
+                    #[cfg(feature = "pro")]
+                    if std::mem::take(&mut self.form_mouse) {
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseUp {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        // form_mouse was already taken, so the synchronous
+                        // WM_CAPTURECHANGED this delivers is a no-op here.
+                        let _ = ReleaseCapture();
+                        return LRESULT(0);
+                    }
                     let suppress = std::mem::take(&mut self.suppress_click);
                     // ORDER MATTERS: take the drag state BEFORE ReleaseCapture().
                     // ReleaseCapture delivers WM_CAPTURECHANGED synchronously (reentering
@@ -510,6 +751,19 @@ impl Ui {
                                 let _ = SetCursor(Some(hand));
                             }
                             return LRESULT(1);
+                        }
+                        #[cfg(feature = "pro")]
+                        if !over_overlay {
+                            if let Some(kind) = self.app.field_at(p) {
+                                let cursor = match kind {
+                                    crate::types::FieldKind::Text => IDC_IBEAM,
+                                    crate::types::FieldKind::Other => IDC_HAND,
+                                };
+                                if let Ok(c) = LoadCursorW(None, cursor) {
+                                    let _ = SetCursor(Some(c));
+                                }
+                                return LRESULT(1);
+                            }
                         }
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
@@ -610,6 +864,36 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_CHAR => {
+                    #[cfg(feature = "pro")]
+                    crate::dlog!(
+                        "ui: wm_char c={:#x} form_focus={}",
+                        wparam.0 as u32,
+                        self.app.form_focus
+                    );
+                    #[cfg(feature = "pro")]
+                    if self.app.form_focus
+                        && !matches!(self.app.mode, crate::app::Mode::Password { .. })
+                    {
+                        let c = wparam.0 as u32;
+                        // Tab/Esc handled in WM_KEYDOWN; Ctrl chords (incl.
+                        // Ctrl+S=0x13, Ctrl+V=0x16) must not type control
+                        // bytes — \r (Enter) and \x08 (Backspace) pass.
+                        // (already inside handle()'s unsafe block)
+                        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                        if c != 0x09 && c != 0x1B && !ctrl {
+                            // PDFium only fires FFI_OnChange for a TEXT field
+                            // when its value COMMITS (focus leaves the field)
+                            // — not per keystroke. Mark dirty here so a typed
+                            // character isn't silently lost if the window
+                            // closes before the field ever loses focus.
+                            self.app.form_dirty = true;
+                            self.send_form(crate::types::FormEvent::Char {
+                                c: c as u16,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        return LRESULT(0);
+                    }
                     if matches!(self.app.mode, crate::app::Mode::Password { .. }) {
                         let c = char::from_u32(wparam.0 as u32).unwrap_or('\0');
                         match c {
@@ -636,6 +920,13 @@ impl Ui {
                             &buf[..n as usize],
                         )));
                     }
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    // Alt+F4 / external close (taskbar, Task Manager "Close
+                    // window") goes through the same save-prompt gate as Esc
+                    // and Ctrl+W.
+                    self.quit();
                     LRESULT(0)
                 }
                 WM_DESTROY => {
@@ -697,6 +988,9 @@ impl Ui {
             if self.app.link_at(p).is_some() {
                 return true;
             }
+            if self.app.field_at(p).is_some() {
+                return true; // form fields: pro types into them, free shows the hint
+            }
         }
         false
     }
@@ -743,6 +1037,50 @@ impl Ui {
             self.invalidate();
             return;
         }
+        // Typing mode: the focused field owns the keyboard. Only Esc
+        // (commit + leave) and F1 stay app shortcuts; Space/G/R/0 type text.
+        #[cfg(feature = "pro")]
+        if self.app.form_focus {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            match vk {
+                _ if vk == VK_ESCAPE.0 => self.form_kill_focus(),
+                _ if vk == VK_F1.0 => {
+                    self.app.toggle_help();
+                    self.invalidate();
+                }
+                _ if vk == VK_TAB.0 => self.form_tab(shift),
+                _ if vk == VK_LEFT.0
+                    || vk == VK_RIGHT.0
+                    || vk == VK_UP.0
+                    || vk == VK_DOWN.0
+                    || vk == VK_HOME.0
+                    || vk == VK_END.0 =>
+                {
+                    self.send_form(crate::types::FormEvent::KeyDown {
+                        vk,
+                        modifiers: Self::form_modifiers(),
+                    });
+                }
+                _ if vk == VK_DELETE.0 => {
+                    // PDFium only fires FFI_OnChange for a TEXT field when its
+                    // value COMMITS (focus leaves the field) — not per
+                    // keystroke. Delete can mutate the field's content right
+                    // now, so mark dirty optimistically rather than waiting
+                    // for a commit-time signal that may never arrive before
+                    // the window closes (would silently lose the edit).
+                    self.app.form_dirty = true;
+                    self.send_form(crate::types::FormEvent::KeyDown {
+                        vk,
+                        modifiers: Self::form_modifiers(),
+                    });
+                }
+                0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
+                0x53 if ctrl => self.save_doc(), // Ctrl+S
+                _ => {} // printable keys arrive via WM_CHAR
+            }
+            return;
+        }
         if vk == VK_F1.0 {
             self.app.toggle_help();
             self.invalidate();
@@ -756,6 +1094,8 @@ impl Ui {
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            #[cfg(feature = "pro")]
+            0x53 if ctrl => self.save_doc(), // Ctrl+S
             0x4E if ctrl => self.spawn_new_window(None), // Ctrl+N
             0x4F if ctrl && shift => {
                 // Ctrl+Shift+O — must precede the plain Ctrl+O arm
@@ -813,6 +1153,26 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            // 'F': cycle how form widgets are marked (highlight / dotted
+            // frames / off). Only meaningful on a form-bearing document —
+            // on anything else the key stays inert (no confusing toast).
+            // In typing mode 'f' never reaches here (the focused field owns
+            // printable keys via WM_CHAR).
+            #[cfg(feature = "pro")]
+            0x46 if !ctrl => {
+                if self.app.doc().is_some_and(|d| d.has_forms) {
+                    let mode = self.app.cycle_field_indication();
+                    self.show_toast(
+                        match mode {
+                            crate::app::FieldIndication::Highlight => "Fields: highlight",
+                            crate::app::FieldIndication::Frame => "Fields: frames",
+                            crate::app::FieldIndication::Off => "Fields: unmarked",
+                        }
+                        .into(),
+                    );
+                    self.invalidate();
+                }
+            }
             _ => {}
         }
     }
@@ -846,7 +1206,42 @@ impl Ui {
         true
     }
 
-    fn quit(&self) {
+    fn quit(&mut self) {
+        // A save is in flight: destroying the window now would exit the
+        // process, killing the detached PDF thread possibly mid-write. Defer
+        // the close until the save resolves — Saved(Ok)+pending_close
+        // destroys the window (or re-runs this gate if new edits landed
+        // meanwhile), Saved(Err)+pending_close clears it and stays open with
+        // the error box. Exactly the semantics wanted here.
+        #[cfg(feature = "pro")]
+        if self.saves_inflight > 0 {
+            self.pending_close = true;
+            self.pending_open = None; // last intent: the close supersedes any deferred open
+            return;
+        }
+        #[cfg(feature = "pro")]
+        if self.app.form_dirty && self.app.doc().is_some() {
+            let choice = unsafe {
+                MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Save changes to this PDF before closing?"),
+                    crate::edition::NAME_W,
+                    MB_YESNOCANCEL | MB_ICONWARNING,
+                )
+            };
+            match choice {
+                IDYES => {
+                    self.pending_close = true;
+                    self.pending_open = None; // close supersedes any deferred open
+                    self.save_doc();
+                }
+                IDNO => unsafe {
+                    let _ = DestroyWindow(self.hwnd);
+                },
+                _ => {} // IDCANCEL: stay open, keep edits
+            }
+            return;
+        }
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -1070,6 +1465,41 @@ impl Ui {
 
 impl Ui {
     pub fn open_document(&mut self, path: PathBuf) {
+        // Data-loss guard (Pro): replacing the document nukes any unsaved form
+        // edits, so gate the open the same way quit() gates the close — before
+        // any existing logic runs.
+        #[cfg(feature = "pro")]
+        {
+            if self.saves_inflight > 0 {
+                // A save is resolving. Defer the open until it lands: the save
+                // must finish before we drop the doc (like quit()'s deferral),
+                // and Saved(Ok) re-runs open_document so this gate re-evaluates.
+                self.pending_open = Some(path);
+                self.pending_close = false; // the open supersedes any deferred close
+                return;
+            }
+            if self.app.form_dirty && self.app.doc().is_some() {
+                let choice = unsafe {
+                    MessageBoxW(
+                        Some(self.hwnd),
+                        w!("Save changes to this PDF first?"),
+                        crate::edition::NAME_W,
+                        MB_YESNOCANCEL | MB_ICONWARNING,
+                    )
+                };
+                match choice {
+                    IDYES => {
+                        // Save first; the open runs when Saved(Ok) fires.
+                        self.pending_open = Some(path);
+                        self.pending_close = false; // the open supersedes any deferred close
+                        self.save_doc();
+                        return;
+                    }
+                    IDNO => {} // discard edits: fall through and open now
+                    _ => return, // IDCANCEL / dismissed: keep the current doc + edits
+                }
+            }
+        }
         // Opening a different file while a password prompt is up abandons
         // the prompt; restore the stashed doc first so it isn't silently
         // lost (password_cancel is a no-op outside Password mode).
@@ -1133,7 +1563,12 @@ impl Ui {
     fn error_box(&self, text: &str) {
         let wide: Vec<u16> = format!("{text}\0").encode_utf16().collect();
         unsafe {
-            MessageBoxW(Some(self.hwnd), PCWSTR(wide.as_ptr()), w!("pppdf"), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                Some(self.hwnd),
+                PCWSTR(wide.as_ptr()),
+                crate::edition::NAME_W,
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 
@@ -1141,6 +1576,95 @@ impl Ui {
         if let Some(tx) = &self.pdf_tx {
             let _ = tx.send(cmd);
         }
+    }
+
+    /// FWL_EVENTFLAG modifier bits for FORM_On* (fpdf_fwlevent.h: Shift=1,
+    /// Control=2, Alt=4).
+    #[cfg(feature = "pro")]
+    fn form_modifiers() -> i32 {
+        let mut m = 0;
+        unsafe {
+            if GetKeyState(VK_SHIFT.0 as i32) < 0 {
+                m |= 1;
+            }
+            if GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                m |= 2;
+            }
+            if GetKeyState(VK_MENU.0 as i32) < 0 {
+                m |= 4;
+            }
+        }
+        m
+    }
+
+    #[cfg(feature = "pro")]
+    fn send_form(&self, ev: crate::types::FormEvent) {
+        if let Some(d) = self.app.doc() {
+            let page = d.current;
+            crate::dlog!("ui: send_form page={page} ev={ev:?}");
+            self.send_pdf(PdfCmd::Form { page, ev });
+        }
+    }
+
+    /// Leave typing mode, committing the in-progress edit.
+    #[cfg(feature = "pro")]
+    fn form_kill_focus(&mut self) {
+        if self.app.form_focus {
+            self.app.form_focus = false;
+            self.send_form(crate::types::FormEvent::KillFocus);
+        }
+    }
+
+    /// Move focus to the next field's center (Tab cycling). Uses FORM_OnFocus
+    /// — focus WITHOUT button events — because a synthesized MouseDown/Up
+    /// pair is a real click: on a checkbox/radio it would TOGGLE the widget
+    /// as Tab passes over it. Focusing mutates nothing (no dirty-marking).
+    #[cfg(feature = "pro")]
+    fn form_tab(&mut self, backwards: bool) {
+        if let Some(pt) = self.app.form_tab_target(backwards) {
+            self.send_form(crate::types::FormEvent::Focus { x: pt.x, y: pt.y });
+            self.app.form_focus = true;
+        }
+    }
+
+    /// Ctrl+V: paste clipboard text into the focused field.
+    #[cfg(feature = "pro")]
+    fn form_paste(&mut self) {
+        if let Some(text) = clipboard_text(self.hwnd) {
+            // PDFium only fires FFI_OnChange for a TEXT field when its value
+            // COMMITS (focus leaves the field) — not per edit. Mark dirty
+            // here so a paste isn't silently lost if the window closes
+            // before the field ever loses focus.
+            self.app.form_dirty = true;
+            self.send_form(crate::types::FormEvent::ReplaceSelection { text });
+        }
+    }
+
+    /// Ctrl+S: save the (form-bearing) document in place.
+    #[cfg(feature = "pro")]
+    fn save_doc(&mut self) {
+        let has_forms = self.app.doc().map_or(false, |d| d.has_forms);
+        if !has_forms {
+            return;
+        }
+        // Nothing changed since the last save/open: a reflex Ctrl+S must not
+        // rewrite the file (needless disk write + mtime churn, and a spurious
+        // "Saved" toast). The quit()/open-gate callers only reach save_doc from
+        // behind their OWN form_dirty checks, so this never strands a
+        // pending_close/pending_open waiting on a save that was skipped.
+        if !self.app.form_dirty {
+            return;
+        }
+        self.app.form_focus = false; // the save commits + kills focus PDF-side
+        // Clear the dirty flag at DISPATCH, not on Saved(Ok): the save
+        // snapshots the document as of NOW, so edits made while it is in
+        // flight re-mark the flag and must survive. A completion-time clear
+        // would clobber exactly those edits (type -> Ctrl+S -> type a
+        // correction -> Saved(Ok) clears -> Alt+F4 closes silently, the
+        // correction lost). Saved(Err) restores the flag.
+        self.app.form_dirty = false;
+        self.saves_inflight += 1; // quit()/open defer until every Saved reply lands
+        self.send_pdf(PdfCmd::SaveDoc);
     }
 
     /// Ask the PDF thread for whatever the current state needs rendered.
@@ -1162,13 +1686,19 @@ impl Ui {
         }
     }
 
+    /// Transient bottom-right pill with arbitrary text (badge family).
+    fn show_toast(&mut self, text: String) {
+        self.badge = Some((text, 0));
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
+        }
+        self.invalidate();
+    }
+
     fn show_badge(&mut self) {
         if let Some(d) = self.app.doc() {
-            self.badge = Some((format!("{} / {}", d.current + 1, d.pages), 0));
-            unsafe {
-                SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
-            }
-            self.invalidate();
+            let text = format!("{} / {}", d.current + 1, d.pages);
+            self.show_toast(text);
         }
     }
 
@@ -1196,8 +1726,8 @@ impl Ui {
         let Some(rx) = self.reply_rx.take() else { return };
         while let Ok(reply) = rx.try_recv() {
             match reply {
-                PdfReply::Loaded { path, pages, page_sizes, outline } => {
-                    self.app.doc_loaded(path, pages, page_sizes, outline);
+                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms } => {
+                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms);
                     // The renderer memoizes a device bitmap keyed (page, px);
                     // a new same-sized document would otherwise show the OLD
                     // document's page. Drop the memo with the document.
@@ -1206,8 +1736,17 @@ impl Ui {
                     }
                     self.show_badge();
                 }
-                PdfReply::Rendered { page, px, rot, bgra, links } => {
-                    self.app.rendered(crate::app::CachedPage { page, px, rot, bgra, links });
+                PdfReply::Rendered { page, px, rot, bgra, links, fields } => {
+                    // gen is stamped by rendered() — 0 here is a placeholder.
+                    self.app.rendered(crate::app::CachedPage {
+                        page,
+                        px,
+                        rot,
+                        bgra,
+                        links,
+                        fields,
+                        gen: 0,
+                    });
                 }
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");
@@ -1244,6 +1783,86 @@ impl Ui {
                         }
                     }
                 }
+                #[cfg(feature = "pro")]
+                PdfReply::FormDirty => {
+                    crate::dlog!("ui: reply FormDirty");
+                    self.app.form_dirty = true;
+                }
+                #[cfg(feature = "pro")]
+                PdfReply::Saved { result } => match result {
+                    Ok(()) => {
+                        // Each dispatched save lands its own reply; decrement
+                        // per reply so the latch only clears once the LAST
+                        // overlapping save resolves.
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
+                        // A pending open was gated on this save. Re-run
+                        // open_document FIRST (before the pending_close/toast
+                        // logic) so its own gate re-evaluates now that this save
+                        // landed: if another save is still in flight it
+                        // re-defers; if the user re-dirtied mid-flight it
+                        // re-prompts; otherwise it proceeds cleanly. The open is
+                        // the acknowledgment — no "Saved" toast for this reply.
+                        if let Some(path) = self.pending_open.take() {
+                            self.open_document(path);
+                            // open_document may have loaded a new doc, dispatched
+                            // another save, or shown a modal — this reply is
+                            // fully handled either way. Put the receiver back and
+                            // stop (same early discipline the pending_close
+                            // branch uses); remaining replies re-pump via their
+                            // own WM_APP_PDF_REPLY wakes.
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        // An earlier overlapping Ctrl+S is still in flight: don't
+                        // act on pending_close or show a toast until every write
+                        // has resolved — tearing the window down now would kill
+                        // the PDF thread mid-write.
+                        if self.saves_inflight > 0 {
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        // form_dirty was cleared when the save was DISPATCHED
+                        // (save_doc) and must NOT be cleared here: if it is
+                        // set again, the user edited while the save was in
+                        // flight and those edits are NOT in the file just
+                        // written.
+                        if self.pending_close {
+                            self.pending_close = false;
+                            if self.app.form_dirty {
+                                // Deliberate edit after choosing "Yes" in the
+                                // close prompt: re-run the close gate —
+                                // prompting again is correct, the new edit is
+                                // unsaved.
+                                self.quit();
+                            } else {
+                                unsafe {
+                                    let _ = DestroyWindow(self.hwnd);
+                                }
+                            }
+                            // Either path may have destroyed the window: put
+                            // the receiver back and stop — don't keep draining
+                            // or run sync_renders/invalidate against a dead
+                            // hwnd. Remaining replies are re-pumped by their
+                            // own WM_APP_PDF_REPLY wakes.
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        self.show_toast("Saved".into());
+                    }
+                    Err(e) => {
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
+                        // Unsaved changes definitely exist — restore the flag
+                        // that save_doc cleared optimistically at dispatch.
+                        self.app.form_dirty = true;
+                        self.pending_close = false;
+                        // Abandon any deferred open too: the save just FAILED, so
+                        // the edits are still unsaved — proceeding with the open
+                        // would discard exactly the data the failed save proved
+                        // is at risk.
+                        self.pending_open = None;
+                        self.error_box(&format!("Could not save:\n{e}"));
+                    }
+                },
             }
         }
         self.reply_rx = Some(rx);
@@ -1252,11 +1871,40 @@ impl Ui {
     }
 
     fn flip(&mut self, delta: i32) {
+        #[cfg(feature = "pro")]
+        self.form_kill_focus();
         if self.app.flip(delta) {
             self.sync_renders();
             self.show_badge();
             self.invalidate();
         }
+    }
+}
+
+/// Plain-text clipboard contents (CF_UNICODETEXT), if any.
+#[cfg(feature = "pro")]
+fn clipboard_text(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    unsafe {
+        OpenClipboard(Some(hwnd)).ok()?;
+        let out = GetClipboardData(13 /* CF_UNICODETEXT */).ok().and_then(|h| {
+            let hg = HGLOBAL(h.0 as *mut core::ffi::c_void);
+            let ptr = GlobalLock(hg) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        });
+        let _ = CloseClipboard();
+        out
     }
 }
 

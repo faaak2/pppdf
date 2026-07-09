@@ -33,16 +33,17 @@ borderless zoomable DPI-scaled window, two write paths).
 
 ## Vendored dependency patch
 
-`PdfForm::handle()` is `pub(crate)` in pdfium-render 0.9.2, so the form
-handle is unreachable from outside the crate. Decision:
+`PdfForm::handle()` and related handles are `pub(crate)` in pdfium-render 0.9.2, so the form
+handles are unreachable from outside the crate. Decision:
 
 - Vendor pdfium-render 0.9.2 source into `vendor/pdfium-render/`.
 - Wire with `[patch.crates-io]` in Cargo.toml. Version stays exactly 0.9.2.
 - Patch (documented in `vendor/PATCHES.md`):
-  1. `PdfForm::handle()` → `pub`.
-  2. New `PdfForm::form_fill_info_mut()` → `&mut FPDF_FORMFILLINFO`, so the
-     pro module can install callbacks after init (PDFium reads callback
-     pointers at call time, so post-init installation is valid).
+  1. `src/pdf/document.rs` — `PdfDocument::handle()` pub(crate) → pub
+  2. `src/pdf/document.rs` — added `PdfDocument::form_mut()`
+  3. `src/pdf/document/form.rs` — `PdfForm::handle()` pub(crate) → pub
+  4. `src/pdf/document/form.rs` — added `PdfForm::form_fill_info_mut()` → `&mut FPDF_FORMFILLINFO`, so the pro module can install callbacks after init (PDFium reads callback pointers at call time, so post-init installation is valid)
+  5. `src/pdf/document/page.rs` — `PdfPage::page_handle()` pub(crate) → pub
 
 ## Module structure & gating
 
@@ -168,3 +169,64 @@ User-created labels/inputs (next iteration), signature fields, file-select
 fields, JavaScript form logic (no JS platform is provided to PDFium), XFA
 forms, dirty-rect render optimization, undo/redo inside fields beyond what
 PDFium provides natively.
+
+## Implementation notes (2026-07-09)
+
+Deliberate deviations from this design that emerged during implementation
+and review:
+
+1. `FormFocus` reply dropped. The UI owns typing-mode state outright — it
+   initiates every focus change itself (click, Tab, Esc, wheel, page flip),
+   so there's no PDFium-side focus fact left for the reply to sync.
+2. Tab cycling is app-side, in reading order, and focuses via PDFium's
+   `FORM_OnFocus` at the field's center — not synthesized clicks and not
+   PDFium's own `VK_TAB` handling. `FORM_OnFocus` moves focus without a
+   button event, so tabbing across a checkbox/radio never toggles it.
+3. Clipboard v1 is paste-only (`FORM_ReplaceSelection`). Copy/cut are
+   deferred — they need a synchronous selection read-back from the PDF
+   thread that v1 doesn't have.
+4. The vendored patch grew from 2 accessors to 5 changes (see
+   `vendor/PATCHES.md`). Vendoring as a path dependency also disables
+   Cargo's `--cap-lints allow`, surfacing 2 pre-existing upstream dead-code
+   warnings on full rebuilds; both are documented there and are not pppdf's
+   to fix.
+5. PDFium fires `FFI_OnChange` for text fields only at value commit (focus
+   leave), not per keystroke. The UI instead marks dirty optimistically at
+   input time (`Char`/paste/Delete forwarding, and clicks on non-text
+   widgets) and clears optimistically at save dispatch; a `Saved(Err)`
+   reply restores the dirty flag on failure. A `save_inflight` latch defers
+   window close until an in-flight save resolves, so a quit racing a save
+   can't drop the edit.
+6. Engine hardening beyond the spec: `FFI_SetTimer` intervals are floored
+   at 100ms, and unsolicited (timer/invalidate-driven) re-renders are
+   throttled to one per 33ms. Both defend against a PDFium ~0ms-timer
+   request observed during focus transitions, which otherwise drove a
+   full-page render on every tick (454 renders/s measured pre-fix).
+   Suppressed repaints aren't lost — a bounded wait in the command loop
+   guarantees the deferred flush still happens.
+7. The fixture (`tests/fixtures/form.pdf`) has 9 widgets, all on page 0 —
+   this doc originally said "8 on page 1": the Gender radio group
+   contributes one widget per radio button (2, not 1), and page numbering
+   here was 1-based where the implementation is 0-based throughout.
+8. Free edition: form fields also return `true` from the window's
+   client-mouse hit test, not just links/zoom/overlay — otherwise a click
+   on a field would drag the window instead of reaching the app, and the
+   free-edition hint toast could never fire.
+9. Two post-checklist PDFium facts (2026-07-09, "nothing works" reports;
+   see the `typing_repaints_only_with_mouse_enter_before_click` and
+   `focused_text_edit_pixels_are_rendered` tests):
+   - PDFium builds a widget's interactive editor (caret, per-keystroke
+     `FFI_Invalidate`) on mouse-ENTER or a clean focus grab — but NOT on a
+     bare down/up that transfers focus from another widget. The UI
+     forwards buttonless hover moves and sends a `MouseMove` immediately
+     before every `MouseDown`; a double-click over a field is forwarded as
+     form input (text: real DblClk for word-select; button-likes: a plain
+     down, so rapid checkbox clicks all register) instead of being
+     swallowed by the zoom-reset gesture.
+   - `FPDF_LoadPage` returns a DISTINCT page object per call, and
+     `FPDF_FFLDraw` draws the live editor overlay only into the page view
+     attached to the handle it is given. Renders of the engine's active
+     page therefore raster + `FFLDraw` through the ENGINE's page handle
+     via raw bindings (`pdf.rs::render_page_pro`); rendering through
+     pdfium-render's own per-render page handle silently dropped the
+     focused widget's caret, in-edit text, and popups.
