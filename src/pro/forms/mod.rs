@@ -175,7 +175,12 @@ impl FormEngine {
         let bytes = doc.save_to_bytes().map_err(|e| format!("{e:?}"))?;
         let dir = path.parent().ok_or("path has no parent directory")?;
         let tmp = dir.join(format!(".pppdf-save-{}.tmp", std::process::id()));
-        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            // Don't leave a partial temp file behind (disk full etc.) —
+            // mirrors the retry-exhaustion cleanup below.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
         let mut last = None;
         for attempt in 0..5u64 {
             match std::fs::rename(&tmp, path) {
