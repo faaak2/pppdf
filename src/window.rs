@@ -443,9 +443,20 @@ impl Ui {
                     #[cfg(feature = "pro")]
                     {
                         let p = self.mouse_point(lparam);
-                        if let (Some((idx, _)), Some(pt)) =
+                        if let (Some((idx, kind)), Some(pt)) =
                             (self.app.field_hit(p), self.app.pdf_point_at(p))
                         {
+                            if kind == crate::types::FieldKind::Other {
+                                // A click on a non-text widget (checkbox,
+                                // radio, combo, push button) is almost always
+                                // a mutation, and the FormDirty reply
+                                // confirming it is ASYNC — a fast Alt+F4 could
+                                // close before it pumps. Text-field clicks are
+                                // focus-only; the keyboard-side marking covers
+                                // their edits. Over-marking is safe;
+                                // under-marking loses data.
+                                self.app.form_dirty = true;
+                            }
                             self.app.form_tab_idx = Some(idx);
                             self.app.form_focus = true;
                             self.form_mouse = true;
@@ -1431,6 +1442,13 @@ impl Ui {
             return;
         }
         self.app.form_focus = false; // the save commits + kills focus PDF-side
+        // Clear the dirty flag at DISPATCH, not on Saved(Ok): the save
+        // snapshots the document as of NOW, so edits made while it is in
+        // flight re-mark the flag and must survive. A completion-time clear
+        // would clobber exactly those edits (type -> Ctrl+S -> type a
+        // correction -> Saved(Ok) clears -> Alt+F4 closes silently, the
+        // correction lost). Saved(Err) restores the flag.
+        self.app.form_dirty = false;
         self.send_pdf(PdfCmd::SaveDoc);
     }
 
@@ -1548,16 +1566,38 @@ impl Ui {
                 #[cfg(feature = "pro")]
                 PdfReply::Saved { result } => match result {
                     Ok(()) => {
-                        self.app.form_dirty = false;
+                        // form_dirty was cleared when the save was DISPATCHED
+                        // (save_doc) and must NOT be cleared here: if it is
+                        // set again, the user edited while the save was in
+                        // flight and those edits are NOT in the file just
+                        // written.
                         if self.pending_close {
-                            unsafe {
-                                let _ = DestroyWindow(self.hwnd);
+                            self.pending_close = false;
+                            if self.app.form_dirty {
+                                // Deliberate edit after choosing "Yes" in the
+                                // close prompt: re-run the close gate —
+                                // prompting again is correct, the new edit is
+                                // unsaved.
+                                self.quit();
+                            } else {
+                                unsafe {
+                                    let _ = DestroyWindow(self.hwnd);
+                                }
                             }
-                        } else {
-                            self.show_toast("Saved".into());
+                            // Either path may have destroyed the window: put
+                            // the receiver back and stop — don't keep draining
+                            // or run sync_renders/invalidate against a dead
+                            // hwnd. Remaining replies are re-pumped by their
+                            // own WM_APP_PDF_REPLY wakes.
+                            self.reply_rx = Some(rx);
+                            return;
                         }
+                        self.show_toast("Saved".into());
                     }
                     Err(e) => {
+                        // Unsaved changes definitely exist — restore the flag
+                        // that save_doc cleared optimistically at dispatch.
+                        self.app.form_dirty = true;
                         self.pending_close = false;
                         self.error_box(&format!("Could not save:\n{e}"));
                     }

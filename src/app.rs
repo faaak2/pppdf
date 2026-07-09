@@ -1257,6 +1257,17 @@ mod tests {
             assert!(!a.dirty_dot_visible());
             a.form_dirty = true;
             assert!(a.dirty_dot_visible());
+            // Stashing the doc behind a password prompt (opening a second,
+            // locked PDF) must NOT clear the flag — the edits still exist in
+            // the stashed doc. The renderer hides the dot outside Doc mode;
+            // this accessor keeps reporting the truth.
+            let prev = match std::mem::replace(&mut a.mode, Mode::Empty) {
+                Mode::Doc(d) => Some(Box::new(d)),
+                _ => None,
+            };
+            a.mode =
+                Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
+            assert!(a.dirty_dot_visible(), "mode changes alone never clear dirty");
             // A fresh document clears it.
             a.doc_loaded(PathBuf::from("y.pdf"), 1, vec![LETTER], vec![], false);
             assert!(!a.dirty_dot_visible());

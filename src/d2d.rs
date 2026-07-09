@@ -297,10 +297,13 @@ impl Renderer {
                 }
             }
             // Unsaved-changes dot (pro): small, top-right, deliberately quiet.
+            // Doc mode only — the flag can survive into the Password screen
+            // (opening a second locked PDF over a dirty doc), where the dot
+            // would be noise over a prompt that isn't about that document.
             // D2D1_ELLIPSE.point is windows_numerics::Vector2 in this windows-rs
             // version (not D2D_POINT_2F) — set via Default + field access so we
             // don't need windows-numerics as a direct dependency just to name it.
-            if app.dirty_dot_visible() {
+            if app.dirty_dot_visible() && matches!(app.mode, Mode::Doc(_)) {
                 let s = self.scale();
                 let (radius, m) = (4.0 * s, 10.0 * s);
                 let mut ell = D2D1_ELLIPSE { radiusX: radius, radiusY: radius, ..Default::default() };
