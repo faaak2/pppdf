@@ -211,6 +211,15 @@ impl FormEngine {
         CB.with(|s| std::mem::take(&mut s.borrow_mut().invalidated))
     }
 
+    /// Read the invalidated flag WITHOUT consuming it. Lets the render
+    /// throttle (pdf.rs::maybe_render_unsolicited) and wait_cmd's
+    /// deferred-repaint wake-up decide whether a repaint is pending while
+    /// preserving the invariant that the flag is only cleared at the
+    /// moment a render is actually dispatched.
+    pub fn peek_invalidated(&self) -> bool {
+        CB.with(|s| s.borrow().invalidated)
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         CB.with(|s| s.borrow().timers.values().map(|t| t.next_fire).min())
     }

@@ -11,8 +11,38 @@ use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(20);
 
+/// PDFium is NOT thread-safe, and pdfium-render 0.9's `thread_safe` feature
+/// only makes the bindings accessor Send+Sync — it does not serialize the
+/// underlying FFI calls (no lock exists in its dynamic bindings). The
+/// shipped app drives PDFium from exactly one PDF thread, but this harness
+/// runs test functions in parallel, each spawning its own PDF thread
+/// against the shared process-wide binding: interleaved PDFium calls
+/// intermittently crash (STATUS_ACCESS_VIOLATION, observed in 3 of 8
+/// parallel runs at commit 79cd316 — i.e. pre-existing, long before the
+/// flood fix) or corrupt an in-flight save (FormatError on reload). Every
+/// test that spawns a PDF thread takes this lock for its whole body so the
+/// tests match the app's single-thread reality.
+static PDFIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn pdfium_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A panicked (failed) test poisons the lock; that says nothing about
+    // PDFium's state for the next test, so keep going.
+    PDFIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Block until the PDF thread has fully exited. Shutdown is asynchronous:
+/// the thread still tears down its form engine and drops its document
+/// (FPDF_CloseDocument and friends) after replying. Its reply Sender is a
+/// function parameter, dropped only after those locals — so channel
+/// disconnection proves all of its PDFium calls are done, and only then may
+/// the caller release PDFIUM_TEST_LOCK for the next test.
+fn join_pdf_thread(reply_rx: &mpsc::Receiver<PdfReply>) {
+    while reply_rx.recv().is_ok() {}
+}
+
 #[test]
 fn load_render_outline_links() {
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
 
@@ -95,6 +125,7 @@ fn load_render_outline_links() {
 
     // --- shutdown is clean ---
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
 }
 
 /// Anti-livelock invariant: whatever output size the UI requests — including
@@ -105,6 +136,7 @@ fn load_render_outline_links() {
 /// the UI re-requested the identical render forever.
 #[test]
 fn rotated_render_size_is_exact_even_for_high_aspect_pages() {
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
     cmd_tx.send(PdfCmd::Load { path: common::tall_fixture_path(), password: None }).unwrap();
@@ -128,12 +160,14 @@ fn rotated_render_size_is_exact_even_for_high_aspect_pages() {
         }
     }
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
 }
 
 /// The real form fixture must report has_forms and per-render field rects;
 /// the generated (form-free) fixture must not.
 #[test]
 fn form_fixture_reports_fields() {
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
     let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -166,6 +200,7 @@ fn form_fixture_reports_fields() {
         other => panic!("expected Loaded, got {other:?}"),
     }
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
 }
 
 /// Pro: toggling a checkbox and typing into a text field must mark the
@@ -183,6 +218,7 @@ fn form_fixture_reports_fields() {
 fn form_events_mark_dirty_and_rerender() {
     use pppdf::types::{FieldKind, FormEvent, FormField};
 
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
     let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -228,6 +264,7 @@ fn form_events_mark_dirty_and_rerender() {
     assert!(rerendered, "form input must trigger an unsolicited visible re-render");
     cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
 }
 
 /// The full pro loop: click + type into FullName, toggle the Married
@@ -245,6 +282,7 @@ fn form_events_mark_dirty_and_rerender() {
 fn fill_save_reload_roundtrip() {
     use pppdf::types::{FieldKind, FormEvent, FormField};
 
+    let _pdfium = pdfium_lock();
     // Work on a copy — the test saves in place.
     let src =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/form.pdf");
@@ -356,6 +394,10 @@ fn fill_save_reload_roundtrip() {
     }
     assert!(saved, "no Saved reply");
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    // Wait for the PDF thread's teardown before read_field_values touches
+    // pdfium from THIS thread — the process-wide binding is not re-entrant
+    // across threads.
+    join_pdf_thread(&reply_rx);
 
     let values = pppdf::pro::forms::read_field_values(&work).unwrap();
     assert_eq!(values.get("FullName"), Some(&Some("Ab".to_string())));
@@ -384,6 +426,7 @@ fn fill_save_reload_roundtrip() {
 fn focus_transition_without_killfocus_does_not_flood_renders() {
     use pppdf::types::{FieldKind, FormEvent, FormField};
 
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
     let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -470,10 +513,147 @@ fn focus_transition_without_killfocus_does_not_flood_renders() {
 
     cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+/// Regression (flood-fix review round 1): a THROTTLED unsolicited render
+/// must still flush once no form timers remain to wake wait_cmd.
+///
+/// Failure trace on the pre-fix code: an unsolicited render arms the 33ms
+/// throttle; a SaveDoc lands inside that window — save() force-kills focus
+/// (which kills any live caret timer) and sets the invalidated flag; the
+/// main-loop repaint attempt is throttled (flag correctly kept); wait_cmd
+/// then sees next_deadline() == None and fell into an UNTIMED recv(),
+/// stranding the deferred repaint (stale focus-ring/caret pixels) until
+/// some unrelated command arrived. Post-fix, wait_cmd bounded-waits while
+/// a repaint is pending, so a Rendered reply must arrive shortly after
+/// Saved even though no further commands are sent.
+///
+/// Determinism note: the RED-ness of this test (pre-fix failure) depends
+/// on SaveDoc reaching the PDF thread within the 33ms throttle window —
+/// normally the case because the test sends it the instant the unsolicited
+/// Rendered arrives. Post-fix the test is deterministic in BOTH outcomes
+/// of that race: throttled -> the bounded wait flushes the deferred
+/// repaint; not throttled -> the render happens immediately in the SaveDoc
+/// batch. Either way at least one Rendered follows Saved.
+#[cfg(feature = "pro")]
+#[test]
+fn throttled_invalidate_flushes_after_save_kills_timers() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    let _pdfium = pdfium_lock();
+    // Work on a copy — SaveDoc writes in place. In its OWN subdirectory:
+    // save() names its atomic-write temp file ".pppdf-save-{pid}.tmp"
+    // inside the document's directory, so two tests of this process saving
+    // concurrently into the same directory (fill_save_reload_roundtrip
+    // also saves under temp_dir) would race on the identical tmp path and
+    // tear each other's files. Test-only hazard: the shipped app has a
+    // single PDF thread, so saves never overlap within a process.
+    let src =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/form.pdf");
+    let work_dir = std::env::temp_dir().join(format!("pppdf-deferred-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let work = work_dir.join("form.pdf");
+    std::fs::copy(&src, &work).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+
+    // The unpaired near-square Other widget = the Married checkbox (same
+    // heuristic as fill_save_reload_roundtrip; never blanket-click Others —
+    // the fixture's ResetButton wipes the form). A checkbox is the right
+    // widget here: its toggle invalidates (arming the throttle via the
+    // unsolicited render) without depending on a caret.
+    let others: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Other).collect();
+    let squares: Vec<&FormField> = others
+        .iter()
+        .filter(|f| {
+            let w = f.rect_pt.right - f.rect_pt.left;
+            let h = f.rect_pt.top - f.rect_pt.bottom;
+            h > 0.0 && w > 0.0 && (w / h) >= 0.5 && (w / h) <= 2.0
+        })
+        .copied()
+        .collect();
+    let checkbox = squares
+        .iter()
+        .find(|f| squares.iter().filter(|g| (g.rect_pt.top - f.rect_pt.top).abs() < 1.0).count() == 1)
+        .copied()
+        .expect("unpaired near-square Other widget (Married) not found");
+    let cx = (checkbox.rect_pt.left + checkbox.rect_pt.right) / 2.0;
+    let cy = (checkbox.rect_pt.top + checkbox.rect_pt.bottom) / 2.0;
+
+    // Toggle the checkbox: FFI_Invalidate -> an unsolicited render that
+    // arms the 33ms throttle window.
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut rendered = false;
+    while std::time::Instant::now() < deadline && !rendered {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Rendered { .. }) => rendered = true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(rendered, "checkbox toggle must produce an unsolicited Rendered");
+
+    // SaveDoc IMMEDIATELY (inside the throttle window): save() kills focus
+    // (and with it any live form timer) and sets the invalidated flag; the
+    // main loop's immediate repaint attempt is throttled.
+    cmd_tx.send(PdfCmd::SaveDoc).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saved = false;
+    while std::time::Instant::now() < deadline && !saved {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Saved { result }) => {
+                result.expect("save must succeed");
+                saved = true;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(saved, "no Saved reply");
+
+    // The deferred repaint must flush WITHOUT any further command: pre-fix
+    // wait_cmd blocked in an untimed recv() here and no Rendered ever came.
+    // 2s is generous — post-fix the flush is due within ~2x the 33ms
+    // throttle interval.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut flushed = false;
+    while std::time::Instant::now() < deadline && !flushed {
+        match reply_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(PdfReply::Rendered { .. }) => flushed = true,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        flushed,
+        "invalidated flag left set by the throttle was never repainted: \
+         wait_cmd must bounded-wait (not block untimed) while a repaint is pending"
+    );
+
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+    std::fs::remove_dir_all(&work_dir).ok();
 }
 
 #[test]
 fn load_failure_reports_reason() {
+    let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
     let cmd_tx = pdf::spawn(reply_tx, || {});
     let bogus = std::env::temp_dir().join("pppdf_not_a_pdf.pdf");
@@ -484,4 +664,5 @@ fn load_failure_reports_reason() {
         other => panic!("expected LoadFailed, got {other:?}"),
     }
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
 }

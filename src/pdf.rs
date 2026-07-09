@@ -348,12 +348,16 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             }
             // Events (or fired timers) dirtied the widgets. If this batch
             // already has a visible-page render queued below, that render
-            // covers the current state — consume the flag so it doesn't
-            // linger stale. Otherwise this would be an UNSOLICITED render
-            // (nothing else in this batch is about to repaint the page), so
-            // it goes through the same throttle as wait_cmd's timer-driven
-            // renders; maybe_render_unsolicited leaves the flag SET when
-            // throttled, so a later pass still catches up.
+            // covers the current state — consume the flag now. This upholds
+            // the take-only-at-render invariant: the visible render below
+            // is unconditional when a document exists, and `engine` being
+            // Some implies `doc` is Some (the engine is created only
+            // alongside a successfully opened document and torn down with
+            // it). Otherwise this would be an UNSOLICITED render (nothing
+            // else in this batch is about to repaint the page), so it goes
+            // through the same throttle as wait_cmd's timer-driven renders;
+            // maybe_render_unsolicited leaves the flag SET when it cannot
+            // or may not render yet, so a later pass still catches up.
             if let Some(eng) = engine.as_mut() {
                 if visible.is_some() {
                     eng.take_invalidated();
@@ -427,10 +431,30 @@ fn wait_cmd(
 ) -> Option<PdfCmd> {
     loop {
         let deadline = engine.as_ref().and_then(|e| e.next_deadline());
-        let Some(deadline) = deadline else {
-            return cmd_rx.recv().ok();
+        let timeout = match deadline {
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()),
+            None => {
+                // No timers left — but a throttled unsolicited render may
+                // have left the invalidated flag set with nothing to wake
+                // us (e.g. a SaveDoc landed inside the 33ms window: save()
+                // force-kills focus, which kills the caret timer, and sets
+                // the flag; the main-loop repaint got throttled). An
+                // untimed recv() here would strand that deferred repaint
+                // (stale focus-ring/caret pixels) until some unrelated
+                // command arrived. Bounded-wait instead so the flush is
+                // always due — but ONLY when a repaint is actually
+                // possible: without a doc/last_visible the flag can only
+                // ever be serviced once a Render command arrives, and that
+                // wakes recv() anyway (a bounded wait would just spin idle).
+                let repaint_pending = engine.as_ref().is_some_and(|e| e.peek_invalidated())
+                    && doc.is_some()
+                    && last_visible.is_some();
+                if !repaint_pending {
+                    return cmd_rx.recv().ok();
+                }
+                MIN_UNSOLICITED_RENDER_INTERVAL
+            }
         };
-        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
         match cmd_rx.recv_timeout(timeout) {
             Ok(c) => return Some(c),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -482,10 +506,15 @@ fn maybe_render_unsolicited(
     if !due {
         return; // Throttled: leave the invalidated flag set for a later pass.
     }
-    if !eng.take_invalidated() {
+    if !eng.peek_invalidated() {
         return; // Nothing to repaint; don't touch the throttle clock.
     }
     if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
+        // Consume the flag only here, at the moment the render is actually
+        // dispatched. With no doc or no visible-render memo the flag must
+        // survive for the pass that CAN repaint (the eventual visible
+        // Render command's batch consumes it).
+        eng.take_invalidated();
         let _ = reply_tx.send(render_page(d, page, px, rot));
         wake();
         *last_unsolicited = Some(now);
