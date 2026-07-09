@@ -44,6 +44,7 @@ pub const CMD_CLOSE: usize = 5;
 pub const CMD_NEW_WINDOW: usize = 6;
 pub const CMD_OPEN_NEW_WINDOW: usize = 7;
 pub const CMD_HELP: usize = 8;
+pub const CMD_ALWAYS_ON_TOP: usize = 9;
 
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
@@ -80,6 +81,9 @@ pub struct Ui {
     /// small deltas instead of whole 120-unit notches); accumulated across
     /// events so they aren't truncated to zero forever.
     pub wheel_residual: i32,
+    /// Whether the window is pinned above others (WS_EX_TOPMOST). Toggled from
+    /// the context menu; not persisted (the app keeps no config).
+    pub always_on_top: bool,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -123,6 +127,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             suppress_click: false,
             saved_rect: None,
             wheel_residual: 0,
+            always_on_top: false,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -838,6 +843,25 @@ impl Ui {
         }
     }
 
+    /// Pin the window above (or release it from) all non-topmost windows.
+    /// SWP_NOMOVE|SWP_NOSIZE keep geometry; the F11-fill and DPI-change paths
+    /// both pass SWP_NOZORDER, so this pin survives them.
+    fn toggle_always_on_top(&mut self) {
+        self.always_on_top = !self.always_on_top;
+        let after = if self.always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
     fn show_menu(&mut self, sx: i32, sy: i32) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
@@ -851,6 +875,8 @@ impl Ui {
             let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_WINDOW, w!("New Window\tCtrl+N"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOC, w!("Table of Contents\tTab"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_FIT, w!("Fit to Window\t0"));
+            let aot = MF_STRING | if self.always_on_top { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(menu, aot, CMD_ALWAYS_ON_TOP, w!("Always on Top"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_HELP, w!("Help\tF1"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_MINIMIZE, w!("Minimize"));
@@ -879,6 +905,7 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            CMD_ALWAYS_ON_TOP => self.toggle_always_on_top(),
             CMD_OPEN => self.open_dialog(),
             CMD_HELP => {
                 self.app.help_visible = true;
