@@ -38,10 +38,12 @@ unsafe extern "C" fn ffi_invalidate(
     _r: f64,
     _b: f64,
 ) {
+    crate::dlog!("form: ffi_invalidate");
     CB.with(|s| s.borrow_mut().invalidated = true);
 }
 
 unsafe extern "C" fn ffi_on_change(_this: *mut FPDF_FORMFILLINFO) {
+    crate::dlog!("form: ffi_on_change");
     CB.with(|s| {
         let mut s = s.borrow_mut();
         s.invalidated = true; // a change always needs fresh pixels
@@ -74,12 +76,14 @@ unsafe extern "C" fn ffi_set_timer(
         let mut s = s.borrow_mut();
         s.next_timer_id += 1;
         let id = s.next_timer_id;
+        crate::dlog!("form: set_timer id={id} req={elapse_ms}ms -> {interval:?}");
         s.timers.insert(id, Timer { interval, next_fire: Instant::now() + interval, func });
         id
     })
 }
 
 unsafe extern "C" fn ffi_kill_timer(_this: *mut FPDF_FORMFILLINFO, id: c_int) {
+    crate::dlog!("form: kill_timer id={id}");
     CB.with(|s| {
         s.borrow_mut().timers.remove(&id);
     });
@@ -143,37 +147,66 @@ impl FormEngine {
         Some(h)
     }
 
+    /// Raw handles for rendering `idx` through the SAME page object the
+    /// form session lives on — None when the engine isn't on that page.
+    /// FPDF_LoadPage returns a DISTINCT page object per call, and
+    /// FPDF_FFLDraw draws the live editor overlay (focus ring, caret, the
+    /// focused widget's in-edit text, open combo popups) only into the
+    /// page view attached to the handle it is given. Rendering through a
+    /// freshly loaded handle silently drops all of that (pdf.rs).
+    pub fn render_handles(&self, idx: u16) -> Option<(FPDF_FORMHANDLE, FPDF_PAGE)> {
+        match self.page {
+            Some((cur, h)) if cur == idx => Some((self.form, h)),
+            _ => None,
+        }
+    }
+
     pub fn handle_event(&mut self, b: &dyn PdfiumLibraryBindings, page: u16, ev: FormEvent) {
-        let Some(h) = self.ensure_page(b, page) else { return };
+        let Some(h) = self.ensure_page(b, page) else {
+            crate::dlog!("form: ensure_page({page}) FAILED for {ev:?}");
+            return;
+        };
         unsafe {
             match ev {
                 FormEvent::MouseDown { x, y, modifiers } => {
-                    b.FORM_OnLButtonDown(self.form, h, modifiers, x as f64, y as f64);
+                    let r = b.FORM_OnLButtonDown(self.form, h, modifiers, x as f64, y as f64);
+                    crate::dlog!("form: LButtonDown ({x},{y}) mods={modifiers} -> {r}");
                 }
                 FormEvent::MouseUp { x, y, modifiers } => {
-                    b.FORM_OnLButtonUp(self.form, h, modifiers, x as f64, y as f64);
+                    let r = b.FORM_OnLButtonUp(self.form, h, modifiers, x as f64, y as f64);
+                    crate::dlog!("form: LButtonUp ({x},{y}) mods={modifiers} -> {r}");
                 }
                 FormEvent::MouseMove { x, y, modifiers } => {
                     b.FORM_OnMouseMove(self.form, h, modifiers, x as f64, y as f64);
                 }
+                FormEvent::MouseDblClk { x, y, modifiers } => {
+                    let r =
+                        b.FORM_OnLButtonDoubleClick(self.form, h, modifiers, x as f64, y as f64);
+                    crate::dlog!("form: LButtonDblClk ({x},{y}) mods={modifiers} -> {r}");
+                }
                 FormEvent::Char { c, modifiers } => {
-                    b.FORM_OnChar(self.form, h, c as c_int, modifiers);
+                    let r = b.FORM_OnChar(self.form, h, c as c_int, modifiers);
+                    crate::dlog!("form: Char {c:#x} mods={modifiers} -> {r}");
                 }
                 FormEvent::KeyDown { vk, modifiers } => {
-                    b.FORM_OnKeyDown(self.form, h, vk as c_int, modifiers);
+                    let r = b.FORM_OnKeyDown(self.form, h, vk as c_int, modifiers);
+                    crate::dlog!("form: KeyDown {vk:#x} mods={modifiers} -> {r}");
                 }
                 FormEvent::ReplaceSelection { ref text } => {
                     let mut wide: Vec<u16> = text.encode_utf16().collect();
                     wide.push(0);
                     b.FORM_ReplaceSelection(self.form, h, wide.as_ptr());
+                    crate::dlog!("form: ReplaceSelection len={}", text.len());
                 }
                 FormEvent::Focus { x, y } => {
                     // Focuses the annotation at the point WITHOUT button
                     // events — never toggles a checkbox/radio (Tab cycling).
-                    b.FORM_OnFocus(self.form, h, 0, x as f64, y as f64);
+                    let r = b.FORM_OnFocus(self.form, h, 0, x as f64, y as f64);
+                    crate::dlog!("form: Focus ({x},{y}) -> {r}");
                 }
                 FormEvent::KillFocus => {
-                    b.FORM_ForceToKillFocus(self.form);
+                    let r = b.FORM_ForceToKillFocus(self.form);
+                    crate::dlog!("form: KillFocus -> {r}");
                 }
             }
         }

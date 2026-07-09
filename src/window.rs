@@ -301,7 +301,18 @@ impl Ui {
                 WM_NCHITTEST => {
                     let sx = (lparam.0 & 0xFFFF) as i16 as i32; // screen coords
                     let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-                    LRESULT(self.hit_test(sx, sy) as isize)
+                    let hit = self.hit_test(sx, sy);
+                    if crate::dbglog::enabled() {
+                        // Fires on every mouse move: log transitions only.
+                        thread_local! {
+                            static LAST: std::cell::Cell<u32> =
+                                const { std::cell::Cell::new(u32::MAX) };
+                        }
+                        if LAST.with(|l| l.replace(hit)) != hit {
+                            crate::dlog!("ui: nchittest screen=({sx},{sy}) -> {hit}");
+                        }
+                    }
+                    LRESULT(hit as isize)
                 }
                 WM_NCLBUTTONDBLCLK => {
                     // DefWindowProc would toggle maximize on caption dbl-click.
@@ -462,6 +473,14 @@ impl Ui {
                     #[cfg(feature = "pro")]
                     {
                         let p = self.mouse_point(lparam);
+                        crate::dlog!(
+                            "ui: lbuttondown p=({},{}) field_hit={:?} pdf_pt={:?} form_focus={}",
+                            p.x,
+                            p.y,
+                            self.app.field_hit(p),
+                            self.app.pdf_point_at(p).map(|q| (q.x, q.y)),
+                            self.app.form_focus
+                        );
                         if let (Some((idx, kind)), Some(pt)) =
                             (self.app.field_hit(p), self.app.pdf_point_at(p))
                         {
@@ -486,6 +505,20 @@ impl Ui {
                             // in-field selection drags die at the window edge.
                             SetCapture(self.hwnd);
                             let m = Self::form_modifiers();
+                            // PDFium builds a widget's interactive editor
+                            // (caret, per-keystroke invalidation) on
+                            // mouse-ENTER or a clean focus grab — but NOT on
+                            // a bare click that moves focus from another
+                            // widget: that click edited invisibly (typed
+                            // text never repainted; the 2026-07-09 "cannot
+                            // type" bug). Hover moves are forwarded too, but
+                            // a click must be self-sufficient — a touchpad
+                            // tap arrives with no prior client-space move.
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: m,
+                            });
                             self.send_form(crate::types::FormEvent::MouseDown {
                                 x: pt.x,
                                 y: pt.y,
@@ -546,6 +579,25 @@ impl Ui {
                         }
                         return LRESULT(0);
                     }
+                    // Buttonless hover over a form document: keep PDFium's
+                    // mouse-enter/leave state current (hover highlight, and
+                    // the lazily-created widget editor — see WM_LBUTTONDOWN).
+                    // Naturally sparse when unzoomed: client-space moves only
+                    // arrive where hit_test returns HTCLIENT (fields/links).
+                    #[cfg(feature = "pro")]
+                    if (wparam.0 as u32 & 0x0001) == 0
+                        && self.drag.is_none()
+                        && self.app.doc().is_some_and(|d| d.has_forms)
+                    {
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                    }
                     let p = self.mouse_point(lparam);
                     if let Some(drag) = &mut self.drag {
                         let (dx, dy) = (p.x - drag.start.x, p.y - drag.start.y);
@@ -582,8 +634,47 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDBLCLK => {
+                    crate::dlog!("ui: lbuttondblclk");
+                    // Over a field, a dblclk is form INPUT, not a zoom
+                    // gesture: the OS turns every second rapid click into
+                    // DBLCLK, and swallowing it made half the clicks on a
+                    // checkbox vanish. Text fields get the real double-click
+                    // (word selection); button-likes get a plain MouseDown
+                    // (their editor ignores DblClk — a click must toggle).
                     #[cfg(feature = "pro")]
-                    self.form_kill_focus();
+                    {
+                        let p = self.mouse_point(lparam);
+                        if let (Some((idx, kind)), Some(pt)) =
+                            (self.app.field_hit(p), self.app.pdf_point_at(p))
+                        {
+                            if kind == crate::types::FieldKind::Other {
+                                // Same optimistic dirty-marking as a click.
+                                self.app.form_dirty = true;
+                            }
+                            self.app.form_tab_idx = Some(idx);
+                            self.app.form_focus = true;
+                            // The paired WM_LBUTTONUP must forward MouseUp.
+                            self.form_mouse = true;
+                            SetCapture(self.hwnd);
+                            let m = Self::form_modifiers();
+                            let ev = if kind == crate::types::FieldKind::Text {
+                                crate::types::FormEvent::MouseDblClk {
+                                    x: pt.x,
+                                    y: pt.y,
+                                    modifiers: m,
+                                }
+                            } else {
+                                crate::types::FormEvent::MouseDown {
+                                    x: pt.x,
+                                    y: pt.y,
+                                    modifiers: m,
+                                }
+                            };
+                            self.send_form(ev);
+                            return LRESULT(0);
+                        }
+                        self.form_kill_focus();
+                    }
                     self.dismiss_goto_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
@@ -598,6 +689,12 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
+                    #[cfg(feature = "pro")]
+                    crate::dlog!(
+                        "ui: lbuttonup form_mouse={} suppress={}",
+                        self.form_mouse,
+                        self.suppress_click
+                    );
                     #[cfg(feature = "pro")]
                     if std::mem::take(&mut self.form_mouse) {
                         let p = self.mouse_point(lparam);
@@ -753,6 +850,12 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_CHAR => {
+                    #[cfg(feature = "pro")]
+                    crate::dlog!(
+                        "ui: wm_char c={:#x} form_focus={}",
+                        wparam.0 as u32,
+                        self.app.form_focus
+                    );
                     #[cfg(feature = "pro")]
                     if self.app.form_focus
                         && !matches!(self.app.mode, crate::app::Mode::Password { .. })
@@ -1464,6 +1567,7 @@ impl Ui {
     fn send_form(&self, ev: crate::types::FormEvent) {
         if let Some(d) = self.app.doc() {
             let page = d.current;
+            crate::dlog!("ui: send_form page={page} ev={ev:?}");
             self.send_pdf(PdfCmd::Form { page, ev });
         }
     }
@@ -1647,6 +1751,7 @@ impl Ui {
                 }
                 #[cfg(feature = "pro")]
                 PdfReply::FormDirty => {
+                    crate::dlog!("ui: reply FormDirty");
                     self.app.form_dirty = true;
                 }
                 #[cfg(feature = "pro")]

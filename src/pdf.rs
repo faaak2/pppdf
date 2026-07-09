@@ -330,6 +330,13 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
 
         #[cfg(feature = "pro")]
         {
+            if !form_events.is_empty() || save_requested || visible.is_some() {
+                crate::dlog!(
+                    "pdf: batch form_events={} visible={visible:?} save={save_requested} engine={}",
+                    form_events.len(),
+                    engine.is_some()
+                );
+            }
             if let Some(eng) = engine.as_mut() {
                 for (page, ev) in form_events.drain(..) {
                     eng.handle_event(pdfium.bindings(), page, ev);
@@ -384,6 +391,9 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 dropped_after = Some(i);
                 break;
             };
+            #[cfg(feature = "pro")]
+            let _ = reply_tx.send(render_page_pro(d, engine.as_ref(), *page, *px, *rot));
+            #[cfg(not(feature = "pro"))]
             let _ = reply_tx.send(render_page(d, *page, *px, *rot));
             wake();
             // Preempt: if new commands arrived mid-batch (e.g. a rapid page
@@ -504,18 +514,20 @@ fn maybe_render_unsolicited(
         .map(|last| now.duration_since(last) >= MIN_UNSOLICITED_RENDER_INTERVAL)
         .unwrap_or(true);
     if !due {
+        crate::dlog!("pdf: unsolicited throttled (flag={})", eng.peek_invalidated());
         return; // Throttled: leave the invalidated flag set for a later pass.
     }
     if !eng.peek_invalidated() {
         return; // Nothing to repaint; don't touch the throttle clock.
     }
+    crate::dlog!("pdf: unsolicited render dispatch last_visible={last_visible:?}");
     if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
         // Consume the flag only here, at the moment the render is actually
         // dispatched. With no doc or no visible-render memo the flag must
         // survive for the pass that CAN repaint (the eventual visible
         // Render command's batch consumes it).
         eng.take_invalidated();
-        let _ = reply_tx.send(render_page(d, page, px, rot));
+        let _ = reply_tx.send(render_page_pro(d, Some(&*eng), page, px, rot));
         wake();
         *last_unsolicited = Some(now);
     }
@@ -669,6 +681,80 @@ fn extract_links(page: &PdfPage) -> Vec<PageLink> {
 /// Stable PDFium ABI constants not re-exported by pdfium-render's prelude.
 const ANNOT_SUBTYPE_WIDGET: i32 = 20; // FPDF_ANNOT_WIDGET
 const FORMFIELD_TEXT: i32 = 6; // FPDF_FORMFIELD_TEXTFIELD
+#[cfg(feature = "pro")]
+const RENDER_FLAG_ANNOT: i32 = 1; // FPDF_ANNOT (render annotations)
+#[cfg(feature = "pro")]
+const BITMAP_FORMAT_BGRA: i32 = 4; // FPDFBitmap_BGRA
+
+/// Render like `render_page`, but when the form engine is live on THIS
+/// page, raster + form overlay go through the ENGINE's page handle via raw
+/// bindings. FPDF_LoadPage returns a DISTINCT page object per call, and
+/// FPDF_FFLDraw draws the live editor overlay (focus ring, caret, the
+/// focused widget's in-edit text, open combo popups) only into the page
+/// view attached to the handle it is given — pdfium-render's render path
+/// loads a private page handle, so the focused widget's live state never
+/// reached the pixels: typed text stayed invisible until its value
+/// committed on focus-loss (the 2026-07-09 "cannot type" bug, part 2).
+#[cfg(feature = "pro")]
+fn render_page_pro(
+    doc: &PdfDocument,
+    engine: Option<&crate::pro::forms::FormEngine>,
+    page_idx: u16,
+    px: SizeU,
+    rot: u8,
+) -> PdfReply {
+    let Some((form_h, page_h)) = engine.and_then(|e| e.render_handles(page_idx)) else {
+        return render_page(doc, page_idx, px, rot);
+    };
+    let b = doc.bindings();
+    let (w, h) = (px.w as i32, px.h as i32);
+    if w <= 0 || h <= 0 {
+        return PdfReply::RenderFailed { page: page_idx, reason: "empty bitmap".into() };
+    }
+    let bgra = unsafe {
+        let bmp = b.FPDFBitmap_CreateEx(w, h, BITMAP_FORMAT_BGRA, std::ptr::null_mut(), 0);
+        if bmp.is_null() {
+            return PdfReply::RenderFailed {
+                page: page_idx,
+                reason: "FPDFBitmap_CreateEx failed".into(),
+            };
+        }
+        let _ = b.FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFF_FFFF); // opaque white
+        // Same call pair + flags pdfium-render's form-aware path uses
+        // (FPDF_ANNOT on both is PDFium's canonical embedder sequence);
+        // `rot` is quarter-turns CW == FPDF's rotate arg, and px is already
+        // the output (rotation-swapped) size per PdfCmd::Render's contract.
+        b.FPDF_RenderPageBitmap(bmp, page_h, 0, 0, w, h, rot as i32, RENDER_FLAG_ANNOT);
+        b.FPDF_FFLDraw(form_h, bmp, page_h, 0, 0, w, h, rot as i32, RENDER_FLAG_ANNOT);
+        let stride = b.FPDFBitmap_GetStride(bmp) as usize;
+        let buf = b.FPDFBitmap_GetBuffer(bmp) as *const u8;
+        if buf.is_null() {
+            b.FPDFBitmap_Destroy(bmp);
+            return PdfReply::RenderFailed { page: page_idx, reason: "no bitmap buffer".into() };
+        }
+        let (wu, hu) = (w as usize, h as usize);
+        let mut tight = Vec::with_capacity(wu * hu * 4);
+        for row in 0..hu {
+            tight.extend_from_slice(std::slice::from_raw_parts(buf.add(row * stride), wu * 4));
+        }
+        b.FPDFBitmap_Destroy(bmp);
+        tight
+    };
+    // Links/fields come off a separate high-level page, exactly like the
+    // normal path — read-only walks, indifferent to which page object.
+    let page = match doc.pages().get(page_idx as PdfPageIndex) {
+        Ok(p) => p,
+        Err(e) => return PdfReply::RenderFailed { page: page_idx, reason: format!("{e:?}") },
+    };
+    PdfReply::Rendered {
+        page: page_idx,
+        px,
+        rot,
+        bgra,
+        links: extract_links(&page),
+        fields: extract_form_fields(doc, &page),
+    }
+}
 
 /// Widget-annotation rects (PDF points, bottom-left origin) + coarse kind.
 /// Read-only and shared by both editions: the free build needs the rects for

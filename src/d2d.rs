@@ -203,6 +203,7 @@ impl Renderer {
                 return Ok(bmp.clone());
             }
         }
+        crate::dlog!("d2d: upload page={page} px={}x{} rot={rot} gen={gen}", px.w, px.h);
         unsafe {
             let props = D2D1_BITMAP_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT {

@@ -52,6 +52,11 @@ pub enum FormEvent {
     MouseDown { x: f32, y: f32, modifiers: i32 },
     MouseUp { x: f32, y: f32, modifiers: i32 },
     MouseMove { x: f32, y: f32, modifiers: i32 },
+    /// Real double-click on a TEXT field (word selection). Button-like
+    /// widgets never receive this — PDFium's editor ignores DblClk on
+    /// them, so window.rs sends a plain MouseDown instead (rapid clicks
+    /// on a checkbox must toggle it every time).
+    MouseDblClk { x: f32, y: f32, modifiers: i32 },
     Char { c: u16, modifiers: i32 },
     KeyDown { vk: u16, modifiers: i32 },
     /// Ctrl+V: replace the focused field's selection with clipboard text.

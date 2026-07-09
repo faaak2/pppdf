@@ -469,6 +469,15 @@ impl App {
         // (page, px, rot) key — the pixels may differ (form filling).
         self.render_gen += 1;
         page.gen = self.render_gen;
+        crate::dlog!(
+            "app: rendered page={} px={}x{} rot={} gen={} fields={}",
+            page.page,
+            page.px.w,
+            page.px.h,
+            page.rot,
+            page.gen,
+            page.fields.len()
+        );
         self.pending.retain(|k| k.0 != page.page);
         let protected: Vec<u16> = self
             .doc()

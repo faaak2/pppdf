@@ -651,6 +651,244 @@ fn throttled_invalidate_flushes_after_save_kills_timers() {
     std::fs::remove_dir_all(&work_dir).ok();
 }
 
+/// Regression (2026-07-09, "cannot type into a text field"): PDFium builds
+/// a widget's interactive editor (caret, per-keystroke FFI_Invalidate) on
+/// mouse-ENTER or on a clean focus grab — but NOT on a bare
+/// MouseDown/MouseUp that transfers focus FROM another widget. Clicking a
+/// text field while a checkbox/radio held focus left the editor uncreated:
+/// typing edited the value invisibly (no invalidation, no re-render,
+/// nothing on screen). A first RED run of this test proved the clean-state
+/// half: a bare click with NO prior focus engages the editor fine — the
+/// trigger is specifically the widget-to-widget focus transition, which is
+/// exactly how users reach a text field (they were just clicking radios).
+/// window.rs therefore sends MouseMove immediately before every MouseDown.
+///
+/// Phase A pins the PDFium behavior that makes that leading move
+/// load-bearing (focused widget -> bare click -> Char -> no repaint). If a
+/// future pdfium.dll makes Phase A fail, the workaround has become
+/// redundant — update both, nothing is user-broken. Phase B asserts the
+/// sequence window.rs actually sends produces the keystroke repaint the UI
+/// depends on, across the same focus transition.
+#[cfg(feature = "pro")]
+#[test]
+fn typing_repaints_only_with_mouse_enter_before_click() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/form.pdf");
+    cmd_tx.send(PdfCmd::Load { path: form_pdf, password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    // Top-most Text field = FullName (same idiom as the other tests).
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let f = texts[0];
+    let (cx, cy) =
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0);
+
+    // The unpaired near-square Other widget = the Married checkbox (same
+    // heuristic as fill_save_reload_roundtrip; never blanket-click Others —
+    // the fixture's ResetButton wipes the form). It provides the "another
+    // widget holds focus" precondition both phases transition from.
+    let others: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Other).collect();
+    let squares: Vec<&FormField> = others
+        .iter()
+        .filter(|f| {
+            let w = f.rect_pt.right - f.rect_pt.left;
+            let h = f.rect_pt.top - f.rect_pt.bottom;
+            h > 0.0 && w > 0.0 && (w / h) >= 0.5 && (w / h) <= 2.0
+        })
+        .copied()
+        .collect();
+    let checkbox = squares
+        .iter()
+        .find(|f| squares.iter().filter(|g| (g.rect_pt.top - f.rect_pt.top).abs() < 1.0).count() == 1)
+        .copied()
+        .expect("unpaired near-square Other widget (Married) not found");
+    let (mx, my) = (
+        (checkbox.rect_pt.left + checkbox.rect_pt.right) / 2.0,
+        (checkbox.rect_pt.top + checkbox.rect_pt.bottom) / 2.0,
+    );
+
+    // Count Rendered replies arriving within `window`.
+    let drain_rendered = |window: Duration| {
+        let deadline = std::time::Instant::now() + window;
+        let mut n = 0u32;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match reply_rx.recv_timeout(left) {
+                Ok(PdfReply::Rendered { .. }) => n += 1,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        n
+    };
+    let bare_click = |x: f32, y: f32| {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x, y, modifiers: 0 } }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x, y, modifiers: 0 } }).unwrap();
+    };
+
+    // --- Phase A: checkbox holds focus; movement-free click into the text
+    // field; type. The keystroke must NOT repaint (the pinned defect). ---
+    bare_click(mx, my);
+    drain_rendered(Duration::from_millis(500)); // settle the toggle repaint
+    bare_click(cx, cy);
+    drain_rendered(Duration::from_millis(500)); // settle whatever the click repaints
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'Z' as u16, modifiers: 0 } }).unwrap();
+    let bare = drain_rendered(Duration::from_millis(700));
+    assert_eq!(
+        bare, 0,
+        "typing after a bare (move-free) click across a widget focus \
+         transition now repaints — PDFium no longer needs the mouse-enter \
+         workaround; retire the leading MouseMove in window.rs and update \
+         this test"
+    );
+
+    // --- Phase B: same transition, but with the sequence window.rs sends —
+    // enter, click, type. ---
+    bare_click(mx, my); // toggle Married back; checkbox regains focus
+    drain_rendered(Duration::from_millis(500));
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    bare_click(cx, cy);
+    drain_rendered(Duration::from_millis(500)); // settle focus-ring/caret repaints
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'X' as u16, modifiers: 0 } }).unwrap();
+    let entered = drain_rendered(Duration::from_secs(2));
+    assert!(
+        entered > 0,
+        "typing after mouse-enter + click must repaint (per-keystroke \
+         FFI_Invalidate -> unsolicited Rendered) — the visible-typing contract \
+         window.rs relies on"
+    );
+
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+/// Regression (2026-07-09, "cannot type" bug part 2 — invisible in-edit
+/// text): FPDF_LoadPage returns a DISTINCT page object per call, and
+/// FPDF_FFLDraw draws the focused widget's live editor (caret, in-edit
+/// text) only into the page view attached to the handle it is given. The
+/// render path used its own freshly loaded page handle, so typed text was
+/// missing from every rendered frame until the value committed on
+/// focus-loss. Post-fix, renders of the engine's active page go through
+/// the engine's page handle — the typed glyphs must be IN THE PIXELS while
+/// the field is still focused.
+#[cfg(feature = "pro")]
+#[test]
+fn focused_text_edit_pixels_are_rendered() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/form.pdf");
+    cmd_tx.send(PdfCmd::Load { path: form_pdf, password: None }).unwrap();
+    // The page-point size drives the pt->px transform below.
+    let (page_w_pt, page_h_pt) = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, page_sizes, .. } => {
+            assert!(has_forms);
+            page_sizes[0]
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    };
+    let px = SizeU { w: 612, h: 792 };
+    cmd_tx.send(PdfCmd::Render { page: 0, px, rot: 0, visible: true }).unwrap();
+    let (fields, baseline): (Vec<FormField>, Vec<u8>) = match reply_rx.recv_timeout(WAIT).unwrap()
+    {
+        PdfReply::Rendered { fields, bgra, .. } => (fields, bgra),
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    // Top-most Text field = FullName; empty in the fixture.
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let f = texts[0];
+    let (cx, cy) =
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0);
+
+    // Count dark pixels inside the field rect (with a small inset margin)
+    // mapped into bitmap space. The fixed-size render scales each page axis
+    // edge-to-edge onto the bitmap: x_px = x_pt * w/page_w, y flipped.
+    let dark_in_rect = |bgra: &[u8], page_w_pt: f32, page_h_pt: f32| {
+        let sx = px.w as f32 / page_w_pt;
+        let sy = px.h as f32 / page_h_pt;
+        let (x0, x1) = ((f.rect_pt.left * sx) as usize + 2, (f.rect_pt.right * sx) as usize - 2);
+        let (y0, y1) = (
+            ((page_h_pt - f.rect_pt.top) * sy) as usize + 2,
+            ((page_h_pt - f.rect_pt.bottom) * sy) as usize - 2,
+        );
+        let mut n = 0usize;
+        for y in y0..y1.min(px.h as usize) {
+            for x in x0..x1.min(px.w as usize) {
+                let i = (y * px.w as usize + x) * 4;
+                if bgra[i] < 128 && bgra[i + 1] < 128 && bgra[i + 2] < 128 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+
+    let before = dark_in_rect(&baseline, page_w_pt, page_h_pt);
+
+    // Focus with the sequence window.rs sends, then type two glyphs.
+    for ev in [
+        FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 },
+        FormEvent::Char { c: 'W' as u16, modifiers: 0 },
+        FormEvent::Char { c: 'W' as u16, modifiers: 0 },
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+    }
+    // Explicit visible render AFTER the edits; its reply must contain the
+    // in-edit glyphs (field still focused — value NOT committed).
+    cmd_tx.send(PdfCmd::Render { page: 0, px, rot: 0, visible: true }).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut after = None;
+    while std::time::Instant::now() < deadline && after.is_none() {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Rendered { bgra, .. }) => {
+                // Unsolicited renders race with the explicit one; ANY render
+                // arriving after the chars must show the glyphs, so take the
+                // first and require ink. (Caret-blink frames alternate the
+                // caret, but the GLYPHS are persistent ink.)
+                after = Some(dark_in_rect(&bgra, page_w_pt, page_h_pt));
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let after = after.expect("no render after typing");
+    assert!(
+        after > before + 10,
+        "typed 'WW' must add dark glyph pixels inside the focused field \
+         (before={before}, after={after}) — the render path must FFLDraw \
+         through the form engine's page handle, not a private page load"
+    );
+
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let _pdfium = pdfium_lock();

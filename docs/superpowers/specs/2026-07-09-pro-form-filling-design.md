@@ -212,3 +212,21 @@ and review:
    client-mouse hit test, not just links/zoom/overlay — otherwise a click
    on a field would drag the window instead of reaching the app, and the
    free-edition hint toast could never fire.
+9. Two post-checklist PDFium facts (2026-07-09, "nothing works" reports;
+   see the `typing_repaints_only_with_mouse_enter_before_click` and
+   `focused_text_edit_pixels_are_rendered` tests):
+   - PDFium builds a widget's interactive editor (caret, per-keystroke
+     `FFI_Invalidate`) on mouse-ENTER or a clean focus grab — but NOT on a
+     bare down/up that transfers focus from another widget. The UI
+     forwards buttonless hover moves and sends a `MouseMove` immediately
+     before every `MouseDown`; a double-click over a field is forwarded as
+     form input (text: real DblClk for word-select; button-likes: a plain
+     down, so rapid checkbox clicks all register) instead of being
+     swallowed by the zoom-reset gesture.
+   - `FPDF_LoadPage` returns a DISTINCT page object per call, and
+     `FPDF_FFLDraw` draws the live editor overlay only into the page view
+     attached to the handle it is given. Renders of the engine's active
+     page therefore raster + `FFLDraw` through the ENGINE's page handle
+     via raw bindings (`pdf.rs::render_page_pro`); rendering through
+     pdfium-render's own per-render page handle silently dropped the
+     focused widget's caret, in-edit text, and popups.
