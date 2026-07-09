@@ -442,6 +442,12 @@ impl Ui {
                             self.app.form_tab_idx = Some(idx);
                             self.app.form_focus = true;
                             self.form_mouse = true;
+                            // Capture like the pan-drag path: without it, a
+                            // release outside the window never delivers
+                            // WM_LBUTTONUP, stranding form_mouse=true (the
+                            // NEXT click's mouse-up would be eaten), and
+                            // in-field selection drags die at the window edge.
+                            SetCapture(self.hwnd);
                             let m = Self::form_modifiers();
                             self.send_form(crate::types::FormEvent::MouseDown {
                                 x: pt.x,
@@ -529,6 +535,13 @@ impl Ui {
                 }
                 WM_CAPTURECHANGED => {
                     self.drag = None;
+                    // Capture lost mid-field-drag (Alt-Tab, another window
+                    // grabbing capture): drop the form-mouse latch so the next
+                    // click's WM_LBUTTONUP isn't consumed by the form branch.
+                    #[cfg(feature = "pro")]
+                    {
+                        self.form_mouse = false;
+                    }
                     LRESULT(0)
                 }
                 WM_LBUTTONDBLCLK => {
@@ -558,6 +571,9 @@ impl Ui {
                                 modifiers: Self::form_modifiers(),
                             });
                         }
+                        // form_mouse was already taken, so the synchronous
+                        // WM_CAPTURECHANGED this delivers is a no-op here.
+                        let _ = ReleaseCapture();
                         return LRESULT(0);
                     }
                     let suppress = std::mem::take(&mut self.suppress_click);
