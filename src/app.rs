@@ -225,6 +225,24 @@ pub struct App {
     /// Pro: unsaved form changes exist (dirty dot + close-prompt gate).
     #[cfg(feature = "pro")]
     pub form_dirty: bool,
+    /// Pro: how form widgets are marked on the page ('F' cycles it).
+    /// Sticky for the window's lifetime — a viewer preference like
+    /// `help_visible`, so `doc_loaded` intentionally leaves it alone.
+    #[cfg(feature = "pro")]
+    pub field_indication: FieldIndication,
+}
+
+/// Pro: visual marking of form widgets, cycled by 'F'. Drawn client-side by
+/// d2d over the cached page bitmap — never baked into rendered pixels, so
+/// toggling repaints instantly without touching the render cache.
+#[cfg(feature = "pro")]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FieldIndication {
+    /// Translucent blue wash over each widget (the Chromium look). Default.
+    Highlight,
+    /// Dotted outline around each widget.
+    Frame,
+    Off,
 }
 
 impl App {
@@ -244,7 +262,20 @@ impl App {
             form_tab_idx: None,
             #[cfg(feature = "pro")]
             form_dirty: false,
+            #[cfg(feature = "pro")]
+            field_indication: FieldIndication::Highlight,
         }
+    }
+
+    /// Advance the field-indication mode and return the new one (toast text).
+    #[cfg(feature = "pro")]
+    pub fn cycle_field_indication(&mut self) -> FieldIndication {
+        self.field_indication = match self.field_indication {
+            FieldIndication::Highlight => FieldIndication::Frame,
+            FieldIndication::Frame => FieldIndication::Off,
+            FieldIndication::Off => FieldIndication::Highlight,
+        };
+        self.field_indication
     }
 
     /// Flip the F1 help overlay. Available in every mode.
@@ -298,6 +329,9 @@ impl App {
             self.form_focus = false;
             self.form_tab_idx = None;
             self.form_dirty = false;
+            // field_indication deliberately NOT reset: it's a viewer
+            // preference (like help_visible), not document state — turning
+            // the marks off must survive opening the next form.
         }
         self.mode = Mode::Doc(DocState {
             path,
@@ -579,6 +613,42 @@ impl App {
 
     pub fn field_at(&self, p: PointF) -> Option<FieldKind> {
         self.field_hit(p).map(|(_, k)| k)
+    }
+
+    /// Window-space rects of the current page's form widgets under the
+    /// current layout (zoom, scroll, rotation) — the drawing-side complement
+    /// of `field_hit`: that one unrotates the probe POINT, this rotates the
+    /// RECTS into the displayed frame.
+    #[cfg(feature = "pro")]
+    pub fn field_rects_window(&self) -> Vec<RectF> {
+        let Some(d) = self.doc() else { return Vec::new() };
+        let Some(entry) = self.cache.get_any(d.current, d.rot) else { return Vec::new() };
+        let Some(pr) = self.current_page_rect() else { return Vec::new() };
+        let page_pt = d.page_pt();
+        let px_per_pt = fit_scale(d.page_pt_rot(), self.client) * d.zoom;
+        // Unrotated-bitmap frame, origin (0,0) — same frame field_hit tests
+        // in; the page offset is applied AFTER rotation, because pr is where
+        // the ROTATED bitmap sits.
+        let unrot = RectF {
+            left: 0.0,
+            top: 0.0,
+            right: page_pt.0 * px_per_pt,
+            bottom: page_pt.1 * px_per_pt,
+        };
+        entry
+            .fields
+            .iter()
+            .map(|f| {
+                let r = pdf_rect_to_window(f.rect_pt, page_pt.1, px_per_pt, unrot);
+                let rr = crate::layout::rotate_rect(r, unrot.right, unrot.bottom, d.rot);
+                RectF {
+                    left: pr.left + rr.left,
+                    top: pr.top + rr.top,
+                    right: pr.left + rr.right,
+                    bottom: pr.top + rr.bottom,
+                }
+            })
+            .collect()
     }
 
     /// Window point -> PDF page coordinates (points, origin bottom-left,
@@ -1287,6 +1357,49 @@ mod tests {
 
         fn field(l: f32, b: f32, r: f32, t: f32) -> FormField {
             FormField { rect_pt: RectF { left: l, top: t, right: r, bottom: b }, kind: FieldKind::Text }
+        }
+
+        #[test]
+        fn field_indication_cycles_highlight_frame_off() {
+            let mut a = App::new();
+            assert_eq!(a.field_indication, FieldIndication::Highlight, "default is highlight");
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Frame);
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Off);
+            assert_eq!(a.cycle_field_indication(), FieldIndication::Highlight);
+        }
+
+        /// The drawn indication and the click hit-test must agree: the center
+        /// of every drawn rect must field_hit() back to that field, at every
+        /// rotation (rects live in unrotated PDF space; drawing rotates them,
+        /// hit-testing unrotates the point — the two must be exact inverses).
+        #[test]
+        fn field_rects_window_inverts_field_hit_across_rotations() {
+            let mut a = app_with_doc(1);
+            let f = field(100.0, 650.0, 300.0, 700.0);
+            for _ in 0..4 {
+                let req = a.wanted_renders()[0];
+                a.rendered(CachedPage {
+                    page: 0,
+                    px: req.px,
+                    rot: req.rot,
+                    bgra: vec![0; 4],
+                    links: vec![],
+                    fields: vec![f.clone()],
+                    gen: 0,
+                });
+                let rects = a.field_rects_window();
+                assert_eq!(rects.len(), 1, "rot {}", req.rot);
+                let r = rects[0];
+                assert!(r.left < r.right && r.top < r.bottom, "rot {}: {r:?}", req.rot);
+                let c = PointF { x: (r.left + r.right) / 2.0, y: (r.top + r.bottom) / 2.0 };
+                assert_eq!(
+                    a.field_hit(c),
+                    Some((0, FieldKind::Text)),
+                    "rot {}: center {c:?} of drawn rect {r:?} must hit the field",
+                    req.rot
+                );
+                a.rotate_cw();
+            }
         }
 
         #[test]

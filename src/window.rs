@@ -1153,6 +1153,26 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            // 'F': cycle how form widgets are marked (highlight / dotted
+            // frames / off). Only meaningful on a form-bearing document —
+            // on anything else the key stays inert (no confusing toast).
+            // In typing mode 'f' never reaches here (the focused field owns
+            // printable keys via WM_CHAR).
+            #[cfg(feature = "pro")]
+            0x46 if !ctrl => {
+                if self.app.doc().is_some_and(|d| d.has_forms) {
+                    let mode = self.app.cycle_field_indication();
+                    self.show_toast(
+                        match mode {
+                            crate::app::FieldIndication::Highlight => "Fields: highlight",
+                            crate::app::FieldIndication::Frame => "Fields: frames",
+                            crate::app::FieldIndication::Off => "Fields: unmarked",
+                        }
+                        .into(),
+                    );
+                    self.invalidate();
+                }
+            }
             _ => {}
         }
     }

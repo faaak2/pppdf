@@ -37,6 +37,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
 ];
 
+/// Pro-only rows appended to the help table (kept out of the free binary).
+#[cfg(feature = "pro")]
+const PRO_HELP_ROWS: &[(&str, &str)] = &[
+    ("Click a form field", "Fill it \u{b7} Tab/Shift+Tab next/previous \u{b7} Esc leaves"),
+    ("F", "Mark form fields: highlight / frames / off"),
+    ("Ctrl+S", "Save filled form in place"),
+];
+
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
@@ -59,6 +67,10 @@ pub struct Renderer {
     dpi: u32,
     /// ((size_dip*10) as u32, centered) -> format; rebuilt when DPI changes.
     formats: Vec<((u32, bool), IDWriteTextFormat)>,
+    /// Dotted stroke for the form-field frame indication. Factory resource
+    /// (device-independent): survives render-target loss, created once.
+    #[cfg(feature = "pro")]
+    dot_stroke: Option<ID2D1StrokeStyle>,
 }
 
 impl Renderer {
@@ -74,6 +86,8 @@ impl Renderer {
                 page_bitmap: None,
                 dpi: 96,
                 formats: Vec::new(),
+                #[cfg(feature = "pro")]
+                dot_stroke: None,
             })
         }
     }
@@ -289,6 +303,13 @@ impl Renderer {
                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
                             };
                             rt.DrawBitmap(&bmp, Some(&rectf(dest)), 1.0, mode, None);
+                            // Form-field indication ('F' cycles): drawn over
+                            // the page bitmap, under overlay/badge/toasts.
+                            // Client-side on purpose — rendered pixels stay
+                            // indication-free, so toggling is a repaint, not
+                            // a render-cache invalidation.
+                            #[cfg(feature = "pro")]
+                            self.draw_field_indication(rt, app)?;
                         }
                     }
                     if let Some(ov) = &d.overlay {
@@ -326,6 +347,64 @@ impl Renderer {
         }
     }
 
+    /// Translucent wash or dotted outline over every form widget on the
+    /// current page, per `App::field_indication` ('F' cycles it).
+    #[cfg(feature = "pro")]
+    fn draw_field_indication(&mut self, rt: &ID2D1HwndRenderTarget, app: &App) -> Result<()> {
+        use crate::app::FieldIndication;
+        if app.field_indication == FieldIndication::Off {
+            return Ok(());
+        }
+        let rects = app.field_rects_window();
+        if rects.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            match app.field_indication {
+                FieldIndication::Highlight => {
+                    // Chromium-style pale blue wash; low alpha keeps the
+                    // widget's own text and borders readable through it.
+                    let b = rt.CreateSolidColorBrush(&color(0.47, 0.62, 1.0, 0.22), None)?;
+                    for r in &rects {
+                        rt.FillRectangle(&rectf(*r), &b);
+                    }
+                }
+                FieldIndication::Frame => {
+                    let stroke = self.dot_stroke()?;
+                    let b = rt.CreateSolidColorBrush(&color(0.35, 0.52, 0.95, 0.85), None)?;
+                    let w = 1.0 * self.scale();
+                    for r in &rects {
+                        rt.DrawRectangle(&rectf(*r), &b, w, &stroke);
+                    }
+                }
+                FieldIndication::Off => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Lazily-built dotted stroke style. Dot dashes have ZERO length — with
+    /// the default flat cap nothing renders at all; round caps make the dots.
+    /// Factory (device-independent) resource: survives render-target loss.
+    #[cfg(feature = "pro")]
+    fn dot_stroke(&mut self) -> Result<ID2D1StrokeStyle> {
+        if let Some(s) = &self.dot_stroke {
+            return Ok(s.clone());
+        }
+        let props = D2D1_STROKE_STYLE_PROPERTIES {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            dashCap: D2D1_CAP_STYLE_ROUND,
+            lineJoin: D2D1_LINE_JOIN_MITER,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_DOT,
+            dashOffset: 0.0,
+        };
+        let s = unsafe { self.factory.CreateStrokeStyle(&props, None)? };
+        self.dot_stroke = Some(s.clone());
+        Ok(s)
+    }
+
     /// Full-window F1 help: a dimmed backdrop with a centered two-column table
     /// of every input binding. Laid out in physical px and clamped so the whole
     /// table always fits the window (rows shrink before they'd overflow).
@@ -339,7 +418,12 @@ impl Renderer {
             rt.FillRectangle(&rectf(full), &backdrop);
         }
 
-        let n_rows = (HELP_ROWS.len() + 1) as f32; // + header
+        // Base rows plus the pro-only ones (absent from the free binary).
+        #[allow(unused_mut)]
+        let mut rows: Vec<(&str, &str)> = HELP_ROWS.to_vec();
+        #[cfg(feature = "pro")]
+        rows.extend_from_slice(PRO_HELP_ROWS);
+        let n_rows = (rows.len() + 1) as f32; // + header
         let margin = 28.0 * s;
         let avail_w = (cw - 2.0 * margin).max(40.0);
         let avail_h = (ch - 2.0 * margin).max(40.0);
@@ -386,7 +470,7 @@ impl Renderer {
         let fmt = self.text_format(font_dip, false)?;
         let ink_in = color(1.0, 1.0, 1.0, 0.85);
         let ink_ac = color(1.0, 1.0, 1.0, 0.92);
-        for (i, (inp, act)) in HELP_ROWS.iter().enumerate() {
+        for (i, (inp, act)) in rows.iter().enumerate() {
             let ry = top + row_h * (i as f32 + 1.0);
             let in_rect = RectF { left: left + pad, top: ry, right: col_x - pad * 0.5, bottom: ry + row_h };
             let ac_rect = RectF { left: col_x + pad, top: ry, right: right - pad * 0.5, bottom: ry + row_h };

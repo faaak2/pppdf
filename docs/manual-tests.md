@@ -27,6 +27,8 @@ Document:
 - [ ] With a GPU-heavy app running (video playback + a hardware-accelerated browser session): launch and confirm content renders; if the window ever goes white, it must self-heal within ~1 s (device-loss recovery)
 
 Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
+- [ ] Fields open with a pale blue highlight (in a fresh window); `F` cycles to dotted frames, then off, then back (toast names each mode); the marks track zoom and rotation; the chosen mode survives opening another PDF in the same window (viewer preference, not document state)
+- [ ] While typing in a field, `f` types the letter (must NOT cycle the indication)
 - [ ] Click the FullName field: focus ring appears, caret appears and blinks
 - [ ] Type `Hello World`: text appears; Space typed a space (no page flip); G/R/0 type letters
 - [ ] Click the City dropdown: the popup list renders inside the page; click an option: it's selected

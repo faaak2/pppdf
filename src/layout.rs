@@ -119,6 +119,34 @@ pub fn unrotate_point(p: PointF, dest_w: f32, dest_h: f32, rot: u8) -> PointF {
     }
 }
 
+/// Inverse of `unrotate_point`: carry a point from the UNROTATED bitmap's
+/// frame (`src_w`/`src_h` = the unrotated bitmap's size) into the rotated
+/// bitmap's frame. Used to DRAW things whose rects live in unrotated page
+/// space (form-field indication) — the hit-test direction unrotates the
+/// point instead.
+pub fn rotate_point(p: PointF, src_w: f32, src_h: f32, rot: u8) -> PointF {
+    match rot % 4 {
+        1 => PointF { x: src_h - p.y, y: p.x },
+        2 => PointF { x: src_w - p.x, y: src_h - p.y },
+        3 => PointF { x: p.y, y: src_w - p.x },
+        _ => p,
+    }
+}
+
+/// Rotate an axis-aligned rect from the unrotated bitmap's frame into the
+/// rotated one. Quarter-turns keep it axis-aligned; corners are rotated and
+/// re-normalized.
+pub fn rotate_rect(r: RectF, src_w: f32, src_h: f32, rot: u8) -> RectF {
+    let a = rotate_point(PointF { x: r.left, y: r.top }, src_w, src_h, rot);
+    let b = rotate_point(PointF { x: r.right, y: r.bottom }, src_w, src_h, rot);
+    RectF {
+        left: a.x.min(b.x),
+        top: a.y.min(b.y),
+        right: a.x.max(b.x),
+        bottom: a.y.max(b.y),
+    }
+}
+
 /// PDF-point rect (origin bottom-left, y up, top > bottom) -> window px rect.
 /// `page_rect` is where the page bitmap sits in the window (from `page_rect()`).
 pub fn pdf_rect_to_window(rect_pt: RectF, page_h_pt: f32, px_per_pt: f32, page_rect: RectF) -> RectF {
@@ -167,6 +195,45 @@ mod tests {
     use super::*;
 
     const LETTER: (f32, f32) = (612.0, 792.0); // US Letter, points
+
+    #[test]
+    fn rotate_point_round_trips_through_unrotate() {
+        // Asymmetric frame so axis mixups can't cancel out. unrotate_point
+        // takes the ROTATED frame's dims (odd rots swap them).
+        let (w, h) = (300.0, 500.0);
+        for rot in 0u8..4 {
+            let (dw, dh) = if rot % 2 == 1 { (h, w) } else { (w, h) };
+            for q in [pt(0.0, 0.0), pt(300.0, 500.0), pt(17.0, 480.0), pt(299.0, 1.0)] {
+                let r = rotate_point(q, w, h, rot);
+                assert!(
+                    (0.0..=dw).contains(&r.x) && (0.0..=dh).contains(&r.y),
+                    "rot {rot}: rotated point {r:?} outside {dw}x{dh}"
+                );
+                let back = unrotate_point(r, dw, dh, rot);
+                assert!(
+                    (back.x - q.x).abs() < 1e-4 && (back.y - q.y).abs() < 1e-4,
+                    "rot {rot}: {q:?} -> {r:?} -> {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotate_rect_stays_normalized_and_round_trips_corners() {
+        let (w, h) = (300.0, 500.0);
+        let r = RectF { left: 20.0, top: 40.0, right: 120.0, bottom: 90.0 };
+        for rot in 0u8..4 {
+            let rr = rotate_rect(r, w, h, rot);
+            assert!(rr.left < rr.right && rr.top < rr.bottom, "rot {rot}: {rr:?}");
+            // Width/height swap on odd rotations, are preserved on even.
+            let (rw, rh) = (rr.right - rr.left, rr.bottom - rr.top);
+            if rot % 2 == 1 {
+                assert!((rw - 50.0).abs() < 1e-4 && (rh - 100.0).abs() < 1e-4);
+            } else {
+                assert!((rw - 100.0).abs() < 1e-4 && (rh - 50.0).abs() < 1e-4);
+            }
+        }
+    }
 
     fn sz(w: u32, h: u32) -> SizeU {
         SizeU { w, h }
