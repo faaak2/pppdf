@@ -19,6 +19,21 @@ rulebook next to your VTT and it looks like a page lying on the desktop.
    where the release build embeds it into the exe)
 3. `cargo build --release`
 
+### Pro edition
+
+The paid edition (form filling, user-created labels/inputs — in progress)
+is the same codebase behind a Cargo feature; its code lives in `src/pro/`
+and is not compiled into the free exe:
+
+```
+cargo build --release --features pro   # pppdf Pro
+cargo build --release                  # free edition
+```
+
+Both land as `target\release\pppdf.exe` — build them one at a time and copy
+the exe aside. CI/tests should run both: `cargo test` and
+`cargo test --features pro`.
+
 "Install": copy `target\release\pppdf.exe` anywhere and run it — PDFium is
 baked in, so there is nothing else to keep alongside it. Optionally
 right-click a PDF → Open with → choose pppdf.exe.

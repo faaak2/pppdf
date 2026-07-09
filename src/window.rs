@@ -137,7 +137,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
-            w!("pppdf"),
+            crate::edition::NAME_W,
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -329,7 +329,7 @@ impl Ui {
                             MessageBoxW(
                                 Some(self.hwnd),
                                 PCWSTR(msg.as_ptr()),
-                                w!("pppdf"),
+                                crate::edition::NAME_W,
                                 MB_OK | MB_ICONERROR,
                             );
                             None
@@ -1133,7 +1133,12 @@ impl Ui {
     fn error_box(&self, text: &str) {
         let wide: Vec<u16> = format!("{text}\0").encode_utf16().collect();
         unsafe {
-            MessageBoxW(Some(self.hwnd), PCWSTR(wide.as_ptr()), w!("pppdf"), MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                Some(self.hwnd),
+                PCWSTR(wide.as_ptr()),
+                crate::edition::NAME_W,
+                MB_OK | MB_ICONERROR,
+            );
         }
     }
 

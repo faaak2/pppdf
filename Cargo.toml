@@ -5,6 +5,12 @@ edition = "2021"
 rust-version = "1.82"
 description = "Borderless native PDF viewer for tabletop RPG sessions"
 
+[features]
+# Paid edition: form-fillable elements, user-created labels/inputs.
+# Free build:  cargo build --release
+# Pro build:   cargo build --release --features pro
+pro = []
+
 [dependencies]
 pdfium-render = { version = "0.9.2", default-features = false, features = ["pdfium_latest", "thread_safe"] }
 
