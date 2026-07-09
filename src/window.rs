@@ -41,6 +41,8 @@ pub const CMD_TOC: usize = 2;
 pub const CMD_FIT: usize = 3;
 pub const CMD_MINIMIZE: usize = 4;
 pub const CMD_CLOSE: usize = 5;
+pub const CMD_NEW_WINDOW: usize = 6;
+pub const CMD_OPEN_NEW_WINDOW: usize = 7;
 
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
@@ -693,6 +695,13 @@ impl Ui {
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            0x4E if ctrl => self.spawn_new_window(None), // Ctrl+N
+            0x4F if ctrl && shift => {
+                // Ctrl+Shift+O — must precede the plain Ctrl+O arm
+                if let Some(path) = self.pick_pdf() {
+                    self.spawn_new_window(Some(path));
+                }
+            }
             0x4F if ctrl => self.open_dialog(), // Ctrl+O
             _ if vk == VK_F11.0 => self.toggle_fill(),
             _ if vk == VK_TAB.0 => {
@@ -808,6 +817,13 @@ impl Ui {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("Open…\tCtrl+O"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CMD_OPEN_NEW_WINDOW,
+                w!("Open in New Window…\tCtrl+Shift+O"),
+            );
+            let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_WINDOW, w!("New Window\tCtrl+N"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOC, w!("Table of Contents\tTab"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_FIT, w!("Fit to Window\t0"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -838,6 +854,12 @@ impl Ui {
                 }
             }
             CMD_OPEN => self.open_dialog(),
+            CMD_NEW_WINDOW => self.spawn_new_window(None),
+            CMD_OPEN_NEW_WINDOW => {
+                if let Some(path) = self.pick_pdf() {
+                    self.spawn_new_window(Some(path));
+                }
+            }
             _ => {}
         }
     }
@@ -942,6 +964,13 @@ impl Ui {
     }
 
     fn open_dialog(&mut self) {
+        if let Some(path) = self.pick_pdf() {
+            self.open_document(path);
+        }
+    }
+
+    /// Modal "Open PDF" file picker. None if the user cancelled.
+    fn pick_pdf(&self) -> Option<PathBuf> {
         let mut file_buf = [0u16; 1024];
         let mut ofn = OPENFILENAMEW {
             lStructSize: core::mem::size_of::<OPENFILENAMEW>() as u32,
@@ -957,7 +986,29 @@ impl Ui {
         };
         if unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
             let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
-            self.open_document(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])));
+            Some(PathBuf::from(String::from_utf16_lossy(&file_buf[..len])))
+        } else {
+            None
+        }
+    }
+
+    /// Launch a fresh pppdf process — each window is its own process, keeping
+    /// documents fully isolated (the pdfium binding is a process-global
+    /// singleton, and a hung PDF can never stall other windows).
+    fn spawn_new_window(&self, path: Option<PathBuf>) {
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                self.error_box(&format!("Couldn't start a new window:\n{e}"));
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(path) = path {
+            cmd.arg(path);
+        }
+        if let Err(e) = cmd.spawn() {
+            self.error_box(&format!("Couldn't start a new window:\n{e}"));
         }
     }
 

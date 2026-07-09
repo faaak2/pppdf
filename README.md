@@ -24,6 +24,8 @@ choose pppdf.exe.
 ## Use
 
 `pppdf.exe book.pdf` — or start it empty and right-click / drop a PDF on it.
+Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
+(pick a file), each in its own window.
 
 | Input | Action |
 |---|---|
@@ -40,6 +42,8 @@ choose pppdf.exe.
 | Double-click or 0 | Back to fit |
 | Wheel (zoomed) | Scroll; one more notch at the edge flips the page |
 | Ctrl+O | Open file · drop a PDF works too |
+| Ctrl+N | Open a new empty window |
+| Ctrl+Shift+O | Open a file in a new window |
 | F11 | Fill the screen (work area) / restore |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
 
