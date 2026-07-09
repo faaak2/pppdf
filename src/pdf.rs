@@ -249,18 +249,9 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         }
 
         if let Some((path, password)) = load {
-            // Teardown the form engine on the OLD document before we drop or
-            // replace it — the engine holds a raw page handle into it.
-            #[cfg(feature = "pro")]
-            if let Some(mut eng) = engine.take() {
-                eng.teardown(pdfium.bindings());
-            }
-            #[cfg(feature = "pro")]
-            {
-                last_visible = None;
-            }
-            // Keep the old document until the new one opens successfully, so a
-            // failed open leaves the current book fully usable.
+            // Keep the old document (and its form engine) until the new one
+            // opens successfully, so a failed open leaves the current book
+            // fully usable.
             // Load from bytes: pdfium then holds no file handle, so the
             // original stays writable (in-place save) and un-locked on disk.
             let loaded = std::fs::read(&path)
@@ -274,6 +265,19 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                             reason: "document has no pages".into(),
                         });
                     } else {
+                        // Teardown the form engine on the OLD document before
+                        // we drop or replace it — the engine holds a raw page
+                        // handle into it. Only reached once the new document
+                        // is known-good, so a failed open never tears down
+                        // the still-current document's engine.
+                        #[cfg(feature = "pro")]
+                        if let Some(mut eng) = engine.take() {
+                            eng.teardown(pdfium.bindings());
+                        }
+                        #[cfg(feature = "pro")]
+                        {
+                            last_visible = None;
+                        }
                         // `describe` borrows `path`; send first, then keep it.
                         let _ = reply_tx.send(describe(&d, &path));
                         #[cfg(feature = "pro")]
@@ -326,15 +330,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     }
                 }
             }
-            // Events (or fired timers) dirtied the widgets: refresh the
-            // visible page — unless this very batch already renders it.
-            if visible.is_none() {
-                if let Some(eng) = engine.as_mut() {
-                    if eng.take_invalidated() {
-                        if let (Some(d), Some((page, px, rot))) = (&doc, last_visible) {
-                            let _ = reply_tx.send(render_page(d, page, px, rot));
-                            wake();
-                        }
+            // Events (or fired timers) dirtied the widgets: always consume
+            // the flag so it doesn't linger stale, but only refresh the
+            // visible page when this very batch didn't already render it.
+            if let Some(eng) = engine.as_mut() {
+                let invalidated = eng.take_invalidated();
+                if visible.is_none() && invalidated {
+                    if let (Some(d), Some((page, px, rot))) = (&doc, last_visible) {
+                        let _ = reply_tx.send(render_page(d, page, px, rot));
+                        wake();
                     }
                 }
             }
