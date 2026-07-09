@@ -45,3 +45,8 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+# Vendored copy of the exact pinned version, carrying only the accessor
+# patches documented in vendor/PATCHES.md (form handles for Pro form filling).
+[patch.crates-io]
+pdfium-render = { path = "vendor/pdfium-render" }

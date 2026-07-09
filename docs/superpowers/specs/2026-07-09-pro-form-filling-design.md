@@ -33,16 +33,17 @@ borderless zoomable DPI-scaled window, two write paths).
 
 ## Vendored dependency patch
 
-`PdfForm::handle()` is `pub(crate)` in pdfium-render 0.9.2, so the form
-handle is unreachable from outside the crate. Decision:
+`PdfForm::handle()` and related handles are `pub(crate)` in pdfium-render 0.9.2, so the form
+handles are unreachable from outside the crate. Decision:
 
 - Vendor pdfium-render 0.9.2 source into `vendor/pdfium-render/`.
 - Wire with `[patch.crates-io]` in Cargo.toml. Version stays exactly 0.9.2.
 - Patch (documented in `vendor/PATCHES.md`):
-  1. `PdfForm::handle()` → `pub`.
-  2. New `PdfForm::form_fill_info_mut()` → `&mut FPDF_FORMFILLINFO`, so the
-     pro module can install callbacks after init (PDFium reads callback
-     pointers at call time, so post-init installation is valid).
+  1. `src/pdf/document.rs` — `PdfDocument::handle()` pub(crate) → pub
+  2. `src/pdf/document.rs` — added `PdfDocument::form_mut()`
+  3. `src/pdf/document/form.rs` — `PdfForm::handle()` pub(crate) → pub
+  4. `src/pdf/document/form.rs` — added `PdfForm::form_fill_info_mut()` → `&mut FPDF_FORMFILLINFO`, so the pro module can install callbacks after init (PDFium reads callback pointers at call time, so post-init installation is valid)
+  5. `src/pdf/document/page.rs` — `PdfPage::page_handle()` pub(crate) → pub
 
 ## Module structure & gating
 
