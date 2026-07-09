@@ -363,6 +363,115 @@ fn fill_save_reload_roundtrip() {
     std::fs::remove_file(&work).ok();
 }
 
+/// Regression for the focus-transition render flood (see
+/// .superpowers/sdd/flood-investigation.md, dated 2026-07-09): PDFium keeps
+/// a caret-blink timer alive across a focus transition (clicking straight
+/// from one widget into another, without an intervening `KillFocus`), and
+/// if that timer's requested interval is ~0 the old code clamped it to 1ms
+/// and rendered the full page on every tick — a CPU-pegging flood measured
+/// at 1363 Rendered replies in 3s (454/s) with a forced tiny interval.
+///
+/// This test drives the NATURAL trigger (no forced interval): click into
+/// the top-most Text field (starts the caret timer), then click a
+/// near-square `Other` widget WITHOUT sending `KillFocus` in between (the
+/// investigation confirmed a widget click alone does not kill the caret
+/// timer). Whatever interval this environment's pdfium.dll actually
+/// requests, the fix must bound the render rate to ~30/s (1 per 33ms); we
+/// assert a generous ceiling of 80 renders in 2s (vs. the 900+ that a
+/// pegged-core flood at ~454/s would produce in the same window).
+#[cfg(feature = "pro")]
+#[test]
+fn focus_transition_without_killfocus_does_not_flood_renders() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    let form_pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/form.pdf");
+    cmd_tx.send(PdfCmd::Load { path: form_pdf, password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    let center = |f: &FormField| {
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0)
+    };
+
+    // Top-most Text field (same idiom as fill_save_reload_roundtrip's
+    // FullName identification: rank by rect top descending).
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let text_field = texts[0];
+    let (tx, ty) = center(text_field);
+
+    // The unpaired near-square Other widget (same heuristic as
+    // fill_save_reload_roundtrip's Married identification: near-square,
+    // and the only one in its row — the two Gender radio options share a
+    // row and are excluded by that "only one at this top" test).
+    let others: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Other).collect();
+    let squares: Vec<&FormField> = others
+        .iter()
+        .filter(|f| {
+            let w = f.rect_pt.right - f.rect_pt.left;
+            let h = f.rect_pt.top - f.rect_pt.bottom;
+            h > 0.0 && w > 0.0 && (w / h) >= 0.5 && (w / h) <= 2.0
+        })
+        .copied()
+        .collect();
+    let other_widget = squares
+        .iter()
+        .find(|f| squares.iter().filter(|g| (g.rect_pt.top - f.rect_pt.top).abs() < 1.0).count() == 1)
+        .copied()
+        .unwrap_or_else(|| {
+            for f in &fields {
+                eprintln!("field kind={:?} rect={:?}", f.kind, f.rect_pt);
+            }
+            panic!("unpaired near-square Other widget not found");
+        });
+    let (ox, oy) = center(other_widget);
+
+    // Focus the text field: starts PDFium's caret-blink timer.
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: tx, y: ty, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: tx, y: ty, modifiers: 0 } }).unwrap();
+    // Click straight into the Other widget WITHOUT an intervening
+    // KillFocus — the natural trigger for the flood (a widget click alone
+    // does not kill the caret timer per the investigation).
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: ox, y: oy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: ox, y: oy, modifiers: 0 } }).unwrap();
+
+    // Drain replies for a bounded window, counting Rendered messages.
+    let drain_window = Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + drain_window;
+    let mut rendered_count = 0u32;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match reply_rx.recv_timeout(remaining) {
+            Ok(PdfReply::Rendered { .. }) => rendered_count += 1,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        rendered_count <= 80,
+        "focus transition without KillFocus flooded {rendered_count} Rendered replies in {drain_window:?} \
+         (pre-fix measured 1363 renders / 3s = 454/s with a forced tiny timer interval; \
+         bounded ceiling is 80 for a 2s window at the ~30/s throttle)"
+    );
+
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let (reply_tx, reply_rx) = mpsc::channel();

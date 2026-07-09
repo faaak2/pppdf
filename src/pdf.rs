@@ -158,6 +158,13 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     // reads it, so gating it keeps that build's behavior byte-identical.
     #[cfg(feature = "pro")]
     let mut last_visible: Option<(u16, SizeU, u8)> = None;
+    // Throttle for unsolicited (timer/invalidate-driven) re-renders: see
+    // maybe_render_unsolicited. Investigated 2026-07-09
+    // (.superpowers/sdd/flood-investigation.md) — without this, a PDFium
+    // timer firing every ~1ms (see ffi_set_timer's floor clamp) drove a
+    // full-page render on every tick, pegging a CPU core.
+    #[cfg(feature = "pro")]
+    let mut last_unsolicited: Option<std::time::Instant> = None;
     #[cfg(feature = "pro")]
     let mut current_path: Option<PathBuf> = None;
     #[cfg(feature = "pro")]
@@ -169,7 +176,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             None => {
                 #[cfg(feature = "pro")]
                 {
-                    match wait_cmd(&cmd_rx, &mut engine, &doc, last_visible, &reply_tx, &wake) {
+                    match wait_cmd(
+                        &cmd_rx,
+                        &mut engine,
+                        &doc,
+                        last_visible,
+                        &mut last_unsolicited,
+                        &reply_tx,
+                        &wake,
+                    ) {
                         Some(c) => c,
                         None => break,
                     }
@@ -331,16 +346,26 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 let _ = reply_tx.send(PdfReply::Saved { result });
                 wake();
             }
-            // Events (or fired timers) dirtied the widgets: always consume
-            // the flag so it doesn't linger stale, but only refresh the
-            // visible page when this very batch didn't already render it.
+            // Events (or fired timers) dirtied the widgets. If this batch
+            // already has a visible-page render queued below, that render
+            // covers the current state — consume the flag so it doesn't
+            // linger stale. Otherwise this would be an UNSOLICITED render
+            // (nothing else in this batch is about to repaint the page), so
+            // it goes through the same throttle as wait_cmd's timer-driven
+            // renders; maybe_render_unsolicited leaves the flag SET when
+            // throttled, so a later pass still catches up.
             if let Some(eng) = engine.as_mut() {
-                let invalidated = eng.take_invalidated();
-                if visible.is_none() && invalidated {
-                    if let (Some(d), Some((page, px, rot))) = (&doc, last_visible) {
-                        let _ = reply_tx.send(render_page(d, page, px, rot));
-                        wake();
-                    }
+                if visible.is_some() {
+                    eng.take_invalidated();
+                } else {
+                    maybe_render_unsolicited(
+                        eng,
+                        &doc,
+                        last_visible,
+                        &mut last_unsolicited,
+                        &reply_tx,
+                        &wake,
+                    );
                 }
             }
         }
@@ -388,13 +413,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
 
 /// Block for the next command; while form timers exist, wake at their
 /// deadlines to blink the caret (fire timers -> pdfium invalidates -> the
-/// visible page re-renders). Returns None when the UI hung up.
+/// visible page re-renders, throttled — see maybe_render_unsolicited).
+/// Returns None when the UI hung up.
 #[cfg(feature = "pro")]
 fn wait_cmd(
     cmd_rx: &Receiver<PdfCmd>,
     engine: &mut Option<crate::pro::forms::FormEngine>,
     doc: &Option<PdfDocument<'static>>,
     last_visible: Option<(u16, SizeU, u8)>,
+    last_unsolicited: &mut Option<std::time::Instant>,
     reply_tx: &Sender<PdfReply>,
     wake: &impl Fn(),
 ) -> Option<PdfCmd> {
@@ -409,16 +436,59 @@ fn wait_cmd(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(eng) = engine.as_mut() {
                     eng.fire_due_timers();
-                    if eng.take_invalidated() {
-                        if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
-                            let _ = reply_tx.send(render_page(d, page, px, rot));
-                            wake();
-                        }
-                    }
+                    maybe_render_unsolicited(eng, doc, last_visible, last_unsolicited, reply_tx, wake);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
         }
+    }
+}
+
+/// Minimum spacing between UNSOLICITED (timer/invalidate-driven, not
+/// directly requested by the UI) page re-renders. 33ms = ~30fps — plenty
+/// for a caret blink (PDFium's own cadence is ~500ms) while bounding the
+/// worst case: a pathological PDFium timer requesting a near-0ms interval
+/// (investigated 2026-07-09, .superpowers/sdd/flood-investigation.md) would
+/// otherwise drive a full-page render on every tick and peg a CPU core
+/// (454 renders/s measured pre-fix).
+#[cfg(feature = "pro")]
+const MIN_UNSOLICITED_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// Render the visible page if the form layer's widgets were invalidated
+/// AND the unsolicited-render throttle allows it now. Shared by wait_cmd's
+/// timer-fire path and the main loop's post-event invalidate check — both
+/// render in response to PDFium state changes that the UI never explicitly
+/// requested, so both must be throttled the same way.
+///
+/// CRITICAL: when the throttle suppresses a render, the invalidated flag is
+/// left SET (never taken) — the caller must not otherwise consume it in
+/// that case. A later pass (the next timer wake, at least
+/// MIN_UNSOLICITED_RENDER_INTERVAL away, or the next command batch) will
+/// see it still set and repaint the final state. The flag is only consumed
+/// (via take_invalidated) when a render actually happens here.
+#[cfg(feature = "pro")]
+fn maybe_render_unsolicited(
+    eng: &mut crate::pro::forms::FormEngine,
+    doc: &Option<PdfDocument<'static>>,
+    last_visible: Option<(u16, SizeU, u8)>,
+    last_unsolicited: &mut Option<std::time::Instant>,
+    reply_tx: &Sender<PdfReply>,
+    wake: &impl Fn(),
+) {
+    let now = std::time::Instant::now();
+    let due = last_unsolicited
+        .map(|last| now.duration_since(last) >= MIN_UNSOLICITED_RENDER_INTERVAL)
+        .unwrap_or(true);
+    if !due {
+        return; // Throttled: leave the invalidated flag set for a later pass.
+    }
+    if !eng.take_invalidated() {
+        return; // Nothing to repaint; don't touch the throttle clock.
+    }
+    if let (Some(d), Some((page, px, rot))) = (doc, last_visible) {
+        let _ = reply_tx.send(render_page(d, page, px, rot));
+        wake();
+        *last_unsolicited = Some(now);
     }
 }
 

@@ -57,7 +57,19 @@ unsafe extern "C" fn ffi_set_timer(
     func: Option<unsafe extern "C" fn(c_int)>,
 ) -> c_int {
     let Some(func) = func else { return 0 };
-    let interval = Duration::from_millis(elapse_ms.max(1) as u64);
+    // Floor (not just a min-1ms clamp): investigated 2026-07-09
+    // (.superpowers/sdd/flood-investigation.md) — PDFium sometimes requests
+    // a ~0ms timer during a form focus transition (e.g. deferred caret
+    // setup). A `.max(1)` clamp let that become a 1ms repeating timer,
+    // which `wait_cmd` fired on every wake, each fire triggering a
+    // full-page `render_page` — a CPU-pegging flood (454 renders/s
+    // measured with a forced ~0ms request) that persists until
+    // `KillFocus`. PDFium's own caret blink is ~500ms, so a 100ms floor is
+    // imperceptible for legitimate timers (caret blink, deferred work) and
+    // caps the worst case at ~10 renders/s by itself; the render-coalescing
+    // throttle in pdf.rs is the primary defense and brings that down to
+    // ~30/s regardless of the requested interval.
+    let interval = Duration::from_millis((elapse_ms.max(0) as u64).clamp(100, 60_000));
     CB.with(|s| {
         let mut s = s.borrow_mut();
         s.next_timer_id += 1;
