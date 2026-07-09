@@ -127,7 +127,7 @@ fn extract_pdfium_to(dir: &Path, bytes: &[u8], name: &str, force: bool) -> std::
 /// (a second bind returns PdfiumLibraryBindingsAlreadyInitialized), so bind
 /// exactly once and share the leaked instance — this also lets multiple test
 /// functions in one test process each spawn a PDF thread safely.
-fn pdfium() -> Result<&'static Pdfium, String> {
+pub(crate) fn pdfium() -> Result<&'static Pdfium, String> {
     static PDFIUM: OnceLock<Result<&'static Pdfium, String>> = OnceLock::new();
     PDFIUM
         .get_or_init(|| {
@@ -315,20 +315,21 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
 
         #[cfg(feature = "pro")]
         {
-            if !form_events.is_empty() || save_requested {
-                if let Some(eng) = engine.as_mut() {
-                    for (page, ev) in form_events.drain(..) {
-                        eng.handle_event(pdfium.bindings(), page, ev);
-                    }
-                    if save_requested {
-                        let result = match (&doc, &current_path) {
-                            (Some(d), Some(p)) => eng.save(pdfium.bindings(), d, p),
-                            _ => Err("no document open".into()),
-                        };
-                        let _ = reply_tx.send(PdfReply::Saved { result });
-                        wake();
-                    }
+            if let Some(eng) = engine.as_mut() {
+                for (page, ev) in form_events.drain(..) {
+                    eng.handle_event(pdfium.bindings(), page, ev);
                 }
+            }
+            // SaveDoc must ALWAYS get exactly one Saved reply, even with no
+            // engine/document/path — otherwise a UI waiting on the reply
+            // would hang forever.
+            if save_requested {
+                let result = match (engine.as_mut(), &doc, &current_path) {
+                    (Some(eng), Some(d), Some(p)) => eng.save(pdfium.bindings(), d, p),
+                    _ => Err("no document open".into()),
+                };
+                let _ = reply_tx.send(PdfReply::Saved { result });
+                wake();
             }
             // Events (or fired timers) dirtied the widgets: always consume
             // the flag so it doesn't linger stale, but only refresh the

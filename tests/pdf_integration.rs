@@ -230,6 +230,139 @@ fn form_events_mark_dirty_and_rerender() {
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
 }
 
+/// The full pro loop: click + type into FullName, toggle the Married
+/// checkbox, save in place, reload from disk, and read the values back.
+///
+/// AUTHORING NOTE (fixture-empirical, do not weaken): the fixture's
+/// `ResetButton` resets the whole form (including FullName) when clicked, so
+/// this test must NOT blanket-click every `Other`-kind widget — it clicks
+/// only the specific widget identified as the Married checkbox. Order is
+/// FullName click+type, then the Married click; since ResetButton is never
+/// touched, the relative order of those two doesn't interact with the reset
+/// action.
+#[cfg(feature = "pro")]
+#[test]
+fn fill_save_reload_roundtrip() {
+    use pppdf::types::{FieldKind, FormEvent, FormField};
+
+    // Work on a copy — the test saves in place.
+    let src =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/form.pdf");
+    let work = std::env::temp_dir().join(format!("pppdf-roundtrip-{}.pdf", std::process::id()));
+    std::fs::copy(&src, &work).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { .. } => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    let center = |f: &FormField| {
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0)
+    };
+
+    // Highest text field on the page = FullName (fields are page-ordered;
+    // rank by rect top descending to be layout-robust).
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let fullname = texts[0];
+    let (cx, cy) = center(fullname);
+
+    // Identify Married. A rect-shape heuristic (near-square, smallest area)
+    // is AMBIGUOUS here: the fixture has three identically-sized 20x20
+    // Other-kind widgets — the two Gender radio options (Male/Female, side
+    // by side in the same row) plus the Married checkbox (alone in its own
+    // row) — so "smallest near-square" ties across all three and doesn't
+    // pick Married reliably.
+    //
+    // Pinned instead by dumping tests/fixtures/form.pdf's raw object
+    // structure (uncompressed): page /Annots order is
+    // [FullName, ID, Gender-Male(17), Gender-Female(18), Married(7), City,
+    // Language, Notes, ResetButton], with rects:
+    //   17 (Gender/Male):   Rect[202.66 594.78 222.66 614.78]  (top 614.78)
+    //   18 (Gender/Female): Rect[277.66 594.78 297.66 614.78]  (top 614.78)
+    //   7  (Married):       Rect[202.66 554.78 222.66 574.78]  (top 574.78)
+    // The two Gender widgets share a row (same top); Married is the only
+    // near-square Other widget whose row has no sibling — that's the
+    // structural signal pinned below, confirmed empirically: clicking the
+    // rect at top~614.78 left~202.66 (a Gender option) left Married==false
+    // and Gender=="Off" (a first RED run of this test caught exactly that).
+    let others: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Other).collect();
+    let squares: Vec<&FormField> = others
+        .iter()
+        .filter(|f| {
+            let w = f.rect_pt.right - f.rect_pt.left;
+            let h = f.rect_pt.top - f.rect_pt.bottom;
+            h > 0.0 && w > 0.0 && (w / h) >= 0.5 && (w / h) <= 2.0
+        })
+        .copied()
+        .collect();
+    let married = squares
+        .iter()
+        .find(|f| squares.iter().filter(|g| (g.rect_pt.top - f.rect_pt.top).abs() < 1.0).count() == 1)
+        .copied()
+        .unwrap_or_else(|| {
+            for f in &fields {
+                eprintln!("field kind={:?} rect={:?}", f.kind, f.rect_pt);
+            }
+            panic!("Married checkbox (the unpaired near-square Other widget) not found");
+        });
+    let (mx, my) = center(married);
+
+    for ev in [
+        FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 },
+        FormEvent::Char { c: 'A' as u16, modifiers: 0 },
+        FormEvent::Char { c: 'b' as u16, modifiers: 0 },
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+    }
+    // Kill focus before moving to a different widget: this both commits
+    // FullName's typed text (matching how save() itself force-kills focus)
+    // and stops the caret-blink timer FullName's focus started. Skipping
+    // this and clicking straight into Married was tried first and produced
+    // a sustained flood of unsolicited Rendered replies (observed: a stuck
+    // multi-minute run pegging a CPU core with continuous re-renders) —
+    // i.e. a real hazard when switching focus between widgets without an
+    // intervening commit, not just test flakiness. See task-4-report.md.
+    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    for ev in [
+        FormEvent::MouseDown { x: mx, y: my, modifiers: 0 },
+        FormEvent::MouseUp { x: mx, y: my, modifiers: 0 },
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+    }
+
+    cmd_tx.send(PdfCmd::SaveDoc).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saved = false;
+    while std::time::Instant::now() < deadline && !saved {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Saved { result }) => {
+                result.expect("save must succeed");
+                saved = true;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(saved, "no Saved reply");
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+
+    let values = pppdf::pro::forms::read_field_values(&work).unwrap();
+    assert_eq!(values.get("FullName"), Some(&Some("Ab".to_string())));
+    assert_eq!(values.get("Married"), Some(&Some("true".to_string())));
+    std::fs::remove_file(&work).ok();
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let (reply_tx, reply_rx) = mpsc::channel();

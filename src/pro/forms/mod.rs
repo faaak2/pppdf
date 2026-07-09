@@ -157,14 +157,37 @@ impl FormEngine {
         }
     }
 
-    /// Placeholder — implemented in the save task.
+    /// Commit the in-progress edit, then write the document atomically over
+    /// `path`: full save to a temp file in the same directory, then rename.
+    /// The original is untouched on any failure. Rename is retried a few
+    /// times — antivirus briefly locks freshly written files (same idiom as
+    /// pdf.rs's pdfium extraction).
     pub fn save(
         &mut self,
-        _b: &dyn PdfiumLibraryBindings,
-        _doc: &PdfDocument,
-        _path: &std::path::Path,
+        b: &dyn PdfiumLibraryBindings,
+        doc: &PdfDocument,
+        path: &std::path::Path,
     ) -> Result<(), String> {
-        Err("save not implemented yet".into())
+        unsafe {
+            b.FORM_ForceToKillFocus(self.form);
+        }
+        CB.with(|s| s.borrow_mut().invalidated = true); // caret/focus ring gone
+        let bytes = doc.save_to_bytes().map_err(|e| format!("{e:?}"))?;
+        let dir = path.parent().ok_or("path has no parent directory")?;
+        let tmp = dir.join(format!(".pppdf-save-{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        let mut last = None;
+        for attempt in 0..5u64 {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+        Err(last.map(|e| e.to_string()).unwrap_or_else(|| "rename failed".into()))
     }
 
     pub fn take_invalidated(&mut self) -> bool {
@@ -207,4 +230,17 @@ impl FormEngine {
         }
         CB.with(|s| *s.borrow_mut() = CallbackState::default());
     }
+}
+
+/// Read all form field values from a PDF on disk. Test/diagnostic helper —
+/// uses the process-wide pdfium binding.
+pub fn read_field_values(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, Option<String>>, String> {
+    let pdfium = crate::pdf::pdfium()?;
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let doc = pdfium.load_pdf_from_byte_vec(bytes, None).map_err(|e| format!("{e:?}"))?;
+    let form = doc.form().ok_or("document has no form")?;
+    let pages = doc.pages();
+    Ok(form.field_values(pages))
 }
