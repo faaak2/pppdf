@@ -92,6 +92,11 @@ pub struct Ui {
     /// form until release.
     #[cfg(feature = "pro")]
     pub form_mouse: bool,
+    /// Pro: a Save/Discard/Cancel prompt chose "Save" while closing — the
+    /// window should destroy itself once the pending SaveDoc completes,
+    /// instead of showing the "Saved" toast.
+    #[cfg(feature = "pro")]
+    pub pending_close: bool,
     /// Free: the one-per-run "Pro feature" hint has been shown.
     #[cfg(not(feature = "pro"))]
     pub hint_shown: bool,
@@ -141,6 +146,8 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             always_on_top: false,
             #[cfg(feature = "pro")]
             form_mouse: false,
+            #[cfg(feature = "pro")]
+            pending_close: false,
             #[cfg(not(feature = "pro"))]
             hint_shown: false,
         });
@@ -727,6 +734,12 @@ impl Ui {
                         // (already inside handle()'s unsafe block)
                         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                         if c != 0x09 && c != 0x1B && !ctrl {
+                            // PDFium only fires FFI_OnChange for a TEXT field
+                            // when its value COMMITS (focus leaves the field)
+                            // — not per keystroke. Mark dirty here so a typed
+                            // character isn't silently lost if the window
+                            // closes before the field ever loses focus.
+                            self.app.form_dirty = true;
                             self.send_form(crate::types::FormEvent::Char {
                                 c: c as u16,
                                 modifiers: Self::form_modifiers(),
@@ -760,6 +773,13 @@ impl Ui {
                             &buf[..n as usize],
                         )));
                     }
+                    LRESULT(0)
+                }
+                WM_CLOSE => {
+                    // Alt+F4 / external close (taskbar, Task Manager "Close
+                    // window") goes through the same save-prompt gate as Esc
+                    // and Ctrl+W.
+                    self.quit();
                     LRESULT(0)
                 }
                 WM_DESTROY => {
@@ -887,7 +907,6 @@ impl Ui {
                     || vk == VK_RIGHT.0
                     || vk == VK_UP.0
                     || vk == VK_DOWN.0
-                    || vk == VK_DELETE.0
                     || vk == VK_HOME.0
                     || vk == VK_END.0 =>
                 {
@@ -896,7 +915,21 @@ impl Ui {
                         modifiers: Self::form_modifiers(),
                     });
                 }
+                _ if vk == VK_DELETE.0 => {
+                    // PDFium only fires FFI_OnChange for a TEXT field when its
+                    // value COMMITS (focus leaves the field) — not per
+                    // keystroke. Delete can mutate the field's content right
+                    // now, so mark dirty optimistically rather than waiting
+                    // for a commit-time signal that may never arrive before
+                    // the window closes (would silently lose the edit).
+                    self.app.form_dirty = true;
+                    self.send_form(crate::types::FormEvent::KeyDown {
+                        vk,
+                        modifiers: Self::form_modifiers(),
+                    });
+                }
                 0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
+                0x53 if ctrl => self.save_doc(), // Ctrl+S
                 _ => {} // printable keys arrive via WM_CHAR
             }
             return;
@@ -914,6 +947,8 @@ impl Ui {
         match vk {
             _ if vk == VK_ESCAPE.0 => self.quit(),
             0x57 if ctrl => self.quit(), // Ctrl+W
+            #[cfg(feature = "pro")]
+            0x53 if ctrl => self.save_doc(), // Ctrl+S
             0x4E if ctrl => self.spawn_new_window(None), // Ctrl+N
             0x4F if ctrl && shift => {
                 // Ctrl+Shift+O — must precede the plain Ctrl+O arm
@@ -1004,7 +1039,29 @@ impl Ui {
         true
     }
 
-    fn quit(&self) {
+    fn quit(&mut self) {
+        #[cfg(feature = "pro")]
+        if self.app.form_dirty && self.app.doc().is_some() {
+            let choice = unsafe {
+                MessageBoxW(
+                    Some(self.hwnd),
+                    w!("Save changes to this PDF before closing?"),
+                    crate::edition::NAME_W,
+                    MB_YESNOCANCEL | MB_ICONWARNING,
+                )
+            };
+            match choice {
+                IDYES => {
+                    self.pending_close = true;
+                    self.save_doc();
+                }
+                IDNO => unsafe {
+                    let _ = DestroyWindow(self.hwnd);
+                },
+                _ => {} // IDCANCEL: stay open, keep edits
+            }
+            return;
+        }
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -1357,8 +1414,24 @@ impl Ui {
     #[cfg(feature = "pro")]
     fn form_paste(&mut self) {
         if let Some(text) = clipboard_text(self.hwnd) {
+            // PDFium only fires FFI_OnChange for a TEXT field when its value
+            // COMMITS (focus leaves the field) — not per edit. Mark dirty
+            // here so a paste isn't silently lost if the window closes
+            // before the field ever loses focus.
+            self.app.form_dirty = true;
             self.send_form(crate::types::FormEvent::ReplaceSelection { text });
         }
+    }
+
+    /// Ctrl+S: save the (form-bearing) document in place.
+    #[cfg(feature = "pro")]
+    fn save_doc(&mut self) {
+        let has_forms = self.app.doc().map_or(false, |d| d.has_forms);
+        if !has_forms {
+            return;
+        }
+        self.app.form_focus = false; // the save commits + kills focus PDF-side
+        self.send_pdf(PdfCmd::SaveDoc);
     }
 
     /// Ask the PDF thread for whatever the current state needs rendered.
@@ -1468,13 +1541,27 @@ impl Ui {
                         }
                     }
                 }
-                // Form-fill replies: the UI acts on these in later tasks
-                // (dirty-state tracking / save feedback). Accept them now so
-                // the pro build's reply match stays exhaustive.
                 #[cfg(feature = "pro")]
-                PdfReply::FormDirty => {}
+                PdfReply::FormDirty => {
+                    self.app.form_dirty = true;
+                }
                 #[cfg(feature = "pro")]
-                PdfReply::Saved { .. } => {}
+                PdfReply::Saved { result } => match result {
+                    Ok(()) => {
+                        self.app.form_dirty = false;
+                        if self.pending_close {
+                            unsafe {
+                                let _ = DestroyWindow(self.hwnd);
+                            }
+                        } else {
+                            self.show_toast("Saved".into());
+                        }
+                    }
+                    Err(e) => {
+                        self.pending_close = false;
+                        self.error_box(&format!("Could not save:\n{e}"));
+                    }
+                },
             }
         }
         self.reply_rx = Some(rx);

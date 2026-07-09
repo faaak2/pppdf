@@ -32,8 +32,19 @@ Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Click the City dropdown: the popup list renders inside the page; click an option: it's selected
 - [ ] Married checkbox toggles on click; Gender radios are mutually exclusive
 - [ ] Tab cycles fields top-to-bottom; Shift+Tab reverses
-- [ ] Esc leaves the field (caret gone); second Esc quits (no save prompt yet — Task 6)
+- [ ] Esc leaves the field (caret gone)
 - [ ] Ctrl+wheel zoom in, click a field while zoomed: caret lands where clicked; R rotate, type again: still correct
 - [ ] Wheel over the page in typing mode: leaves the field, flips the page
 - [ ] Ctrl+V pastes clipboard text into the focused field
 - [ ] Free edition (`cargo run -- tests/fixtures/form.pdf`): clicking a field shows the toast "Form filling is a pppdf Pro feature" exactly once per run; fields never focus
+
+Save UX (Pro) — same `tests/fixtures/form.pdf`:
+- [ ] Type into a field: an amber dot appears top-right (quiet, small); it stays while typing
+- [ ] Ctrl+S (in typing mode, and again after Esc/outside it): "Saved" toast appears, dot disappears
+- [ ] Type again, press Esc then Esc (quit) with unsaved changes: Save/Discard/Cancel box appears, text exactly "Save changes to this PDF before closing?"
+- [ ] Cancel: window stays open, edits and dot are untouched
+- [ ] Esc-Esc again, Discard: window closes without writing (reopen to confirm the file is unchanged)
+- [ ] Reopen, type into a field, Alt+F4: same Save/Discard/Cancel prompt (WM_CLOSE routes through the same gate)
+- [ ] Yes: saves then closes — verify via `pro::forms::read_field_values` or by reopening the file
+- [ ] Ctrl+S on a document with no form fields (e.g. a plain PDF) is a silent no-op (no toast, no save)
+- [ ] Quitting with no unsaved changes (fresh open, or right after a successful save) closes immediately with no prompt

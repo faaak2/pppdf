@@ -215,6 +215,9 @@ pub struct App {
     /// click or Tab — the anchor for Tab cycling.
     #[cfg(feature = "pro")]
     pub form_tab_idx: Option<usize>,
+    /// Pro: unsaved form changes exist (dirty dot + close-prompt gate).
+    #[cfg(feature = "pro")]
+    pub form_dirty: bool,
 }
 
 impl App {
@@ -231,12 +234,26 @@ impl App {
             form_focus: false,
             #[cfg(feature = "pro")]
             form_tab_idx: None,
+            #[cfg(feature = "pro")]
+            form_dirty: false,
         }
     }
 
     /// Flip the F1 help overlay. Available in every mode.
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
+    }
+
+    /// Unsaved form changes exist (always false in the free edition).
+    pub fn dirty_dot_visible(&self) -> bool {
+        #[cfg(feature = "pro")]
+        {
+            self.form_dirty
+        }
+        #[cfg(not(feature = "pro"))]
+        {
+            false
+        }
     }
 
     pub fn doc(&self) -> Option<&DocState> {
@@ -272,6 +289,7 @@ impl App {
         {
             self.form_focus = false;
             self.form_tab_idx = None;
+            self.form_dirty = false;
         }
         self.mode = Mode::Doc(DocState {
             path,
@@ -1231,6 +1249,17 @@ mod tests {
 
         fn field(l: f32, b: f32, r: f32, t: f32) -> FormField {
             FormField { rect_pt: RectF { left: l, top: t, right: r, bottom: b }, kind: FieldKind::Text }
+        }
+
+        #[test]
+        fn dirty_flag_lifecycle() {
+            let mut a = app_with_doc(1);
+            assert!(!a.dirty_dot_visible());
+            a.form_dirty = true;
+            assert!(a.dirty_dot_visible());
+            // A fresh document clears it.
+            a.doc_loaded(PathBuf::from("y.pdf"), 1, vec![LETTER], vec![], false);
+            assert!(!a.dirty_dot_visible());
         }
 
         #[test]
