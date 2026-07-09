@@ -179,6 +179,9 @@ pub struct App {
     pub failed: HashSet<u16>,
     pub client: SizeU,
     pub dpi: u32,
+    /// F1 help overlay. Global (not per-document): available in every mode,
+    /// so it lives here rather than on DocState like the TOC overlay.
+    pub help_visible: bool,
 }
 
 impl App {
@@ -190,7 +193,13 @@ impl App {
             failed: HashSet::new(),
             client: SizeU { w: 0, h: 0 },
             dpi: 96,
+            help_visible: false,
         }
+    }
+
+    /// Flip the F1 help overlay. Available in every mode.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
     }
 
     pub fn doc(&self) -> Option<&DocState> {
@@ -480,6 +489,16 @@ mod tests {
     }
 
     // --- paging ---
+
+    #[test]
+    fn help_toggles() {
+        let mut a = App::new();
+        assert!(!a.help_visible);
+        a.toggle_help();
+        assert!(a.help_visible);
+        a.toggle_help();
+        assert!(!a.help_visible);
+    }
 
     #[test]
     fn flip_clamps_at_both_ends() {

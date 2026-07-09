@@ -45,6 +45,7 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | Ctrl+N | Open a new empty window |
 | Ctrl+Shift+O | Open a file in a new window |
 | F11 | Fill the screen (work area) / restore |
+| F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
 
 ## Licenses

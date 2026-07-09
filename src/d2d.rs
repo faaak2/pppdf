@@ -12,6 +12,29 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 const BG: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.102, g: 0.102, b: 0.102, a: 1.0 }; // #1a1a1a
 
+/// F1 help: the full input reference, drawn as a two-column table. Order and
+/// wording mirror the README key map so the two never drift.
+const HELP_ROWS: &[(&str, &str)] = &[
+    ("Drag anywhere", "Move the window (Aero Snap works)"),
+    ("Drag near an edge (8 px)", "Resize"),
+    ("PgDn / \u{2192} / Space / wheel", "Next page"),
+    ("PgUp / \u{2190} / Shift+Space / wheel up", "Previous page"),
+    ("Home / End", "First / last page"),
+    ("Tab (or right-click menu)", "Table of contents overlay"),
+    ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
+    ("Click a link", "Follow it (web links open in your browser)"),
+    ("Ctrl+wheel", "Zoom at the cursor"),
+    ("Drag (zoomed)", "Pan \u{b7} Ctrl+drag moves the window"),
+    ("Double-click or 0", "Back to fit"),
+    ("Wheel (zoomed)", "Scroll; one more notch at the edge flips the page"),
+    ("Ctrl+O", "Open file \u{b7} drop a PDF works too"),
+    ("Ctrl+N", "Open a new empty window"),
+    ("Ctrl+Shift+O", "Open a file in a new window"),
+    ("F11", "Fill the screen (work area) / restore"),
+    ("F1", "Show / hide this help"),
+    ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
+];
+
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
@@ -264,8 +287,82 @@ impl Renderer {
                     }
                 }
             }
+            // F1 help sits above everything (page, overlay, badge) in every mode.
+            if app.help_visible {
+                self.draw_help(rt, client)?;
+            }
             rt.EndDraw(None, None)
         }
+    }
+
+    /// Full-window F1 help: a dimmed backdrop with a centered two-column table
+    /// of every input binding. Laid out in physical px and clamped so the whole
+    /// table always fits the window (rows shrink before they'd overflow).
+    fn draw_help(&mut self, rt: &ID2D1HwndRenderTarget, client: SizeU) -> Result<()> {
+        let s = self.scale();
+        let (cw, ch) = (client.w as f32, client.h as f32);
+        let full = RectF { left: 0.0, top: 0.0, right: cw, bottom: ch };
+        unsafe {
+            // Near-opaque backdrop: readable over any page, still hints at it.
+            let backdrop = rt.CreateSolidColorBrush(&color(0.09, 0.09, 0.09, 0.97), None)?;
+            rt.FillRectangle(&rectf(full), &backdrop);
+        }
+
+        let n_rows = (HELP_ROWS.len() + 1) as f32; // + header
+        let margin = 28.0 * s;
+        let avail_w = (cw - 2.0 * margin).max(40.0);
+        let avail_h = (ch - 2.0 * margin).max(40.0);
+        let table_w = avail_w.min(880.0 * s);
+        let row_h = (34.0 * s).min(avail_h / n_rows).max(1.0);
+        let table_h = row_h * n_rows;
+        let left = ((cw - table_w) / 2.0).max(margin);
+        let top = ((ch - table_h) / 2.0).max(margin);
+        let right = left + table_w;
+        let bottom = top + table_h;
+        let col_x = left + table_w * 0.40; // Input | Action divider
+        // row_h is physical px; text_format wants a logical DIP size.
+        let font_dip = (row_h / s * 0.42).clamp(9.0, 15.0);
+        let pad = 16.0 * s;
+
+        // Grid lines are drawn as thin filled rects (windows-rs DrawLine wants
+        // windows_numerics::Vector2, a crate we intentionally don't depend on).
+        let lw = (1.0 * s).max(1.0);
+        unsafe {
+            let line = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.08), None)?;
+            for i in 1..(n_rows as i32) {
+                let y = top + row_h * i as f32;
+                let sep = RectF { left, top: y - lw * 0.5, right, bottom: y + lw * 0.5 };
+                rt.FillRectangle(&rectf(sep), &line);
+            }
+            let divider = RectF { left: col_x - lw * 0.5, top, right: col_x + lw * 0.5, bottom };
+            rt.FillRectangle(&rectf(divider), &line);
+            let border = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.14), None)?;
+            let rr = D2D1_ROUNDED_RECT {
+                rect: rectf(RectF { left, top, right, bottom }),
+                radiusX: 6.0 * s,
+                radiusY: 6.0 * s,
+            };
+            rt.DrawRoundedRectangle(&rr, &border, 1.5 * s, None);
+        }
+
+        // Header (centered, accent-colored).
+        let hdr_fmt = self.text_format(font_dip + 1.0, true)?;
+        let accent = color(0.74, 0.78, 0.96, 1.0);
+        self.draw_text(rt, "Input", &hdr_fmt, RectF { left, top, right: col_x, bottom: top + row_h }, accent)?;
+        self.draw_text(rt, "Action", &hdr_fmt, RectF { left: col_x, top, right, bottom: top + row_h }, accent)?;
+
+        // Data rows (left-aligned, vertically centered in each row).
+        let fmt = self.text_format(font_dip, false)?;
+        let ink_in = color(1.0, 1.0, 1.0, 0.85);
+        let ink_ac = color(1.0, 1.0, 1.0, 0.92);
+        for (i, (inp, act)) in HELP_ROWS.iter().enumerate() {
+            let ry = top + row_h * (i as f32 + 1.0);
+            let in_rect = RectF { left: left + pad, top: ry, right: col_x - pad * 0.5, bottom: ry + row_h };
+            let ac_rect = RectF { left: col_x + pad, top: ry, right: right - pad * 0.5, bottom: ry + row_h };
+            self.draw_text(rt, inp, &fmt, in_rect, ink_in)?;
+            self.draw_text(rt, act, &fmt, ac_rect, ink_ac)?;
+        }
+        Ok(())
     }
 
     fn draw_overlay(

@@ -24,7 +24,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F11,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F11,
     VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
     VK_TAB, VK_UP,
 };
@@ -43,6 +43,7 @@ pub const CMD_MINIMIZE: usize = 4;
 pub const CMD_CLOSE: usize = 5;
 pub const CMD_NEW_WINDOW: usize = 6;
 pub const CMD_OPEN_NEW_WINDOW: usize = 7;
+pub const CMD_HELP: usize = 8;
 
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
@@ -397,6 +398,12 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDOWN => {
+                    // A click anywhere dismisses the help overlay (it's modal).
+                    if self.app.help_visible {
+                        self.app.toggle_help();
+                        self.invalidate();
+                        return LRESULT(0);
+                    }
                     self.suppress_click = false;
                     let p = self.mouse_point(lparam);
                     let over_panel = self.app.doc().map_or(false, |d| {
@@ -663,6 +670,11 @@ impl Ui {
     /// dragging the window? Extended in Task 8 (links, overlay) and Task 9
     /// (zoomed state).
     fn wants_client_mouse(&self, p: PointF) -> bool {
+        // While help is up, clicks must reach the client so they can dismiss it
+        // (otherwise a click on the "caption" area would drag the window).
+        if self.app.help_visible {
+            return true;
+        }
         if let Some(d) = self.app.doc() {
             if d.overlay.is_some() && p.x < crate::overlay::PANEL_W * self.dpi_scale() {
                 return true;
@@ -686,6 +698,19 @@ impl Ui {
                 self.invalidate();
             }
             return; // printable input + Enter/Backspace arrive via WM_CHAR
+        }
+        // F1 help is modal: while it's up, swallow every key; F1/Esc dismiss.
+        if self.app.help_visible {
+            if vk == VK_F1.0 || vk == VK_ESCAPE.0 {
+                self.app.toggle_help();
+                self.invalidate();
+            }
+            return;
+        }
+        if vk == VK_F1.0 {
+            self.app.toggle_help();
+            self.invalidate();
+            return;
         }
         if self.overlay_key(vk) {
             return;
@@ -826,6 +851,7 @@ impl Ui {
             let _ = AppendMenuW(menu, MF_STRING, CMD_NEW_WINDOW, w!("New Window\tCtrl+N"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_TOC, w!("Table of Contents\tTab"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_FIT, w!("Fit to Window\t0"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_HELP, w!("Help\tF1"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_MINIMIZE, w!("Minimize"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_CLOSE, w!("Close\tEsc"));
@@ -854,6 +880,10 @@ impl Ui {
                 }
             }
             CMD_OPEN => self.open_dialog(),
+            CMD_HELP => {
+                self.app.help_visible = true;
+                self.invalidate();
+            }
             CMD_NEW_WINDOW => self.spawn_new_window(None),
             CMD_OPEN_NEW_WINDOW => {
                 if let Some(path) = self.pick_pdf() {
