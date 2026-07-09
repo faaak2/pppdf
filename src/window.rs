@@ -314,6 +314,20 @@ impl Ui {
                     }
                     LRESULT(hit as isize)
                 }
+                WM_NCLBUTTONDOWN => {
+                    // Unzoomed page background hit-tests as HTCAPTION (that's
+                    // what makes the borderless window draggable), so a
+                    // click-off-field there never reaches WM_LBUTTONDOWN's
+                    // kill-focus path — typing mode would survive and keep
+                    // eating the app shortcuts (TOC, rotate...). Leave typing
+                    // mode first, then let DefWindowProc run the drag.
+                    #[cfg(feature = "pro")]
+                    if wparam.0 as u32 == HTCAPTION {
+                        crate::dlog!("ui: nclbuttondown caption -> kill form focus");
+                        self.form_kill_focus();
+                    }
+                    DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                }
                 WM_NCLBUTTONDBLCLK => {
                     // DefWindowProc would toggle maximize on caption dbl-click.
                     // Swallow it, resetting zoom instead (double-click on the
