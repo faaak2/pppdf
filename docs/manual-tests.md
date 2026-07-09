@@ -37,6 +37,9 @@ Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Wheel over the page in typing mode: leaves the field, flips the page
 - [ ] Ctrl+V pastes clipboard text into the focused field
 - [ ] Free edition (`cargo run -- tests/fixtures/form.pdf`): clicking a field shows the toast "Form filling is a pppdf Pro feature" exactly once per run; fields never focus
+- [ ] Multi-page form: flip to page 2+, click a field there — it accepts focus and typing (engine page-switch path), and Tab still cycles that page's fields
+- [ ] Fill a field, then open another PDF (Ctrl+O / drag-drop): Save/Discard/Cancel prompt appears ("Save changes to this PDF first?") — Cancel keeps the current doc + edits (nothing loads); Yes saves then opens the new PDF; No discards the edits and opens
+- [ ] Ctrl+S with no unsaved changes (fresh open, or right after a save) on a form document: nothing happens — no "Saved" toast, file mtime unchanged
 
 Save UX (Pro) — same `tests/fixtures/form.pdf`:
 - [ ] Type into a field: an amber dot appears top-right (quiet, small); it stays while typing

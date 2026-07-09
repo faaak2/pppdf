@@ -94,14 +94,24 @@ pub struct Ui {
     pub form_mouse: bool,
     /// Pro: a Save/Discard/Cancel prompt chose "Save" while closing — the
     /// window should destroy itself once the pending SaveDoc completes,
-    /// instead of showing the "Saved" toast.
+    /// instead of showing the "Saved" toast. Mutually exclusive with
+    /// pending_open (last user intent wins).
     #[cfg(feature = "pro")]
     pub pending_close: bool,
-    /// Pro: a SaveDoc has been dispatched and its Saved reply hasn't arrived.
-    /// quit() defers while set — destroying the window exits the process and
-    /// would kill the detached PDF thread possibly mid-write.
+    /// Pro: a Save/Discard/Cancel prompt chose "Save" (or a save was already
+    /// in flight) while an Open was requested — replace the document with this
+    /// path once the pending SaveDoc resolves, instead of silently discarding
+    /// the unsaved edits. Mutually exclusive with pending_close.
     #[cfg(feature = "pro")]
-    pub save_inflight: bool,
+    pub pending_open: Option<std::path::PathBuf>,
+    /// Pro: number of dispatched SaveDoc commands whose Saved reply hasn't
+    /// arrived. A counter, not a bool: overlapping saves (a 2nd Ctrl+S while
+    /// the 1st is still in flight) must both be accounted for, or the first
+    /// Saved(Ok) would clear the latch while another write is still running.
+    /// quit() and the open gate defer while > 0 — destroying the window exits
+    /// the process and would kill the detached PDF thread possibly mid-write.
+    #[cfg(feature = "pro")]
+    pub saves_inflight: u32,
     /// Free: the one-per-run "Pro feature" hint has been shown.
     #[cfg(not(feature = "pro"))]
     pub hint_shown: bool,
@@ -154,7 +164,9 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             #[cfg(feature = "pro")]
             pending_close: false,
             #[cfg(feature = "pro")]
-            save_inflight: false,
+            pending_open: None,
+            #[cfg(feature = "pro")]
+            saves_inflight: 0,
             #[cfg(not(feature = "pro"))]
             hint_shown: false,
         });
@@ -1065,8 +1077,9 @@ impl Ui {
         // meanwhile), Saved(Err)+pending_close clears it and stays open with
         // the error box. Exactly the semantics wanted here.
         #[cfg(feature = "pro")]
-        if self.save_inflight {
+        if self.saves_inflight > 0 {
             self.pending_close = true;
+            self.pending_open = None; // last intent: the close supersedes any deferred open
             return;
         }
         #[cfg(feature = "pro")]
@@ -1082,6 +1095,7 @@ impl Ui {
             match choice {
                 IDYES => {
                     self.pending_close = true;
+                    self.pending_open = None; // close supersedes any deferred open
                     self.save_doc();
                 }
                 IDNO => unsafe {
@@ -1314,6 +1328,41 @@ impl Ui {
 
 impl Ui {
     pub fn open_document(&mut self, path: PathBuf) {
+        // Data-loss guard (Pro): replacing the document nukes any unsaved form
+        // edits, so gate the open the same way quit() gates the close — before
+        // any existing logic runs.
+        #[cfg(feature = "pro")]
+        {
+            if self.saves_inflight > 0 {
+                // A save is resolving. Defer the open until it lands: the save
+                // must finish before we drop the doc (like quit()'s deferral),
+                // and Saved(Ok) re-runs open_document so this gate re-evaluates.
+                self.pending_open = Some(path);
+                self.pending_close = false; // the open supersedes any deferred close
+                return;
+            }
+            if self.app.form_dirty && self.app.doc().is_some() {
+                let choice = unsafe {
+                    MessageBoxW(
+                        Some(self.hwnd),
+                        w!("Save changes to this PDF first?"),
+                        crate::edition::NAME_W,
+                        MB_YESNOCANCEL | MB_ICONWARNING,
+                    )
+                };
+                match choice {
+                    IDYES => {
+                        // Save first; the open runs when Saved(Ok) fires.
+                        self.pending_open = Some(path);
+                        self.pending_close = false; // the open supersedes any deferred close
+                        self.save_doc();
+                        return;
+                    }
+                    IDNO => {} // discard edits: fall through and open now
+                    _ => return, // IDCANCEL / dismissed: keep the current doc + edits
+                }
+            }
+        }
         // Opening a different file while a password prompt is up abandons
         // the prompt; restore the stashed doc first so it isn't silently
         // lost (password_cancel is a no-op outside Password mode).
@@ -1460,6 +1509,14 @@ impl Ui {
         if !has_forms {
             return;
         }
+        // Nothing changed since the last save/open: a reflex Ctrl+S must not
+        // rewrite the file (needless disk write + mtime churn, and a spurious
+        // "Saved" toast). The quit()/open-gate callers only reach save_doc from
+        // behind their OWN form_dirty checks, so this never strands a
+        // pending_close/pending_open waiting on a save that was skipped.
+        if !self.app.form_dirty {
+            return;
+        }
         self.app.form_focus = false; // the save commits + kills focus PDF-side
         // Clear the dirty flag at DISPATCH, not on Saved(Ok): the save
         // snapshots the document as of NOW, so edits made while it is in
@@ -1468,7 +1525,7 @@ impl Ui {
         // correction -> Saved(Ok) clears -> Alt+F4 closes silently, the
         // correction lost). Saved(Err) restores the flag.
         self.app.form_dirty = false;
-        self.save_inflight = true; // quit() defers until the Saved reply
+        self.saves_inflight += 1; // quit()/open defer until every Saved reply lands
         self.send_pdf(PdfCmd::SaveDoc);
     }
 
@@ -1586,7 +1643,36 @@ impl Ui {
                 #[cfg(feature = "pro")]
                 PdfReply::Saved { result } => match result {
                     Ok(()) => {
-                        self.save_inflight = false;
+                        // Each dispatched save lands its own reply; decrement
+                        // per reply so the latch only clears once the LAST
+                        // overlapping save resolves.
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
+                        // A pending open was gated on this save. Re-run
+                        // open_document FIRST (before the pending_close/toast
+                        // logic) so its own gate re-evaluates now that this save
+                        // landed: if another save is still in flight it
+                        // re-defers; if the user re-dirtied mid-flight it
+                        // re-prompts; otherwise it proceeds cleanly. The open is
+                        // the acknowledgment — no "Saved" toast for this reply.
+                        if let Some(path) = self.pending_open.take() {
+                            self.open_document(path);
+                            // open_document may have loaded a new doc, dispatched
+                            // another save, or shown a modal — this reply is
+                            // fully handled either way. Put the receiver back and
+                            // stop (same early discipline the pending_close
+                            // branch uses); remaining replies re-pump via their
+                            // own WM_APP_PDF_REPLY wakes.
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        // An earlier overlapping Ctrl+S is still in flight: don't
+                        // act on pending_close or show a toast until every write
+                        // has resolved — tearing the window down now would kill
+                        // the PDF thread mid-write.
+                        if self.saves_inflight > 0 {
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
                         // form_dirty was cleared when the save was DISPATCHED
                         // (save_doc) and must NOT be cleared here: if it is
                         // set again, the user edited while the save was in
@@ -1616,11 +1702,16 @@ impl Ui {
                         self.show_toast("Saved".into());
                     }
                     Err(e) => {
-                        self.save_inflight = false;
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
                         // Unsaved changes definitely exist — restore the flag
                         // that save_doc cleared optimistically at dispatch.
                         self.app.form_dirty = true;
                         self.pending_close = false;
+                        // Abandon any deferred open too: the save just FAILED, so
+                        // the edits are still unsaved — proceeding with the open
+                        // would discard exactly the data the failed save proved
+                        // is at risk.
+                        self.pending_open = None;
                         self.error_box(&format!("Could not save:\n{e}"));
                     }
                 },
