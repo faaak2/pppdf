@@ -47,13 +47,15 @@ pub struct FormField {
 /// One interactive form input event, in PDF page coordinates (points,
 /// origin bottom-left — what App::pdf_point_at produces).
 #[cfg(feature = "pro")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum FormEvent {
     MouseDown { x: f32, y: f32, modifiers: i32 },
     MouseUp { x: f32, y: f32, modifiers: i32 },
     MouseMove { x: f32, y: f32, modifiers: i32 },
     Char { c: u16, modifiers: i32 },
     KeyDown { vk: u16, modifiers: i32 },
+    /// Ctrl+V: replace the focused field's selection with clipboard text.
+    ReplaceSelection { text: String },
     KillFocus,
 }
 

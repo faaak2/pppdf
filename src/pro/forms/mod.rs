@@ -162,6 +162,11 @@ impl FormEngine {
                 FormEvent::KeyDown { vk, modifiers } => {
                     b.FORM_OnKeyDown(self.form, h, vk as c_int, modifiers);
                 }
+                FormEvent::ReplaceSelection { ref text } => {
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    wide.push(0);
+                    b.FORM_ReplaceSelection(self.form, h, wide.as_ptr());
+                }
                 FormEvent::KillFocus => {
                     b.FORM_ForceToKillFocus(self.form);
                 }

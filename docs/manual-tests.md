@@ -25,3 +25,15 @@ Document:
 - [ ] Double-click directly on a hyperlink: exactly ONE navigation (no spurious second jump)
 - [ ] Open a new PDF (drop/menu) while the password prompt is showing: previously open doc keeps working
 - [ ] With a GPU-heavy app running (video playback + a hardware-accelerated browser session): launch and confirm content renders; if the window ever goes white, it must self-heal within ~1 s (device-loss recovery)
+
+Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
+- [ ] Click the FullName field: focus ring appears, caret appears and blinks
+- [ ] Type `Hello World`: text appears; Space typed a space (no page flip); G/R/0 type letters
+- [ ] Click the City dropdown: the popup list renders inside the page; click an option: it's selected
+- [ ] Married checkbox toggles on click; Gender radios are mutually exclusive
+- [ ] Tab cycles fields top-to-bottom; Shift+Tab reverses
+- [ ] Esc leaves the field (caret gone); second Esc quits (no save prompt yet — Task 6)
+- [ ] Ctrl+wheel zoom in, click a field while zoomed: caret lands where clicked; R rotate, type again: still correct
+- [ ] Wheel over the page in typing mode: leaves the field, flips the page
+- [ ] Ctrl+V pastes clipboard text into the focused field
+- [ ] Free edition (`cargo run -- tests/fixtures/form.pdf`): clicking a field shows the toast "Form filling is a pppdf Pro feature" exactly once per run; fields never focus

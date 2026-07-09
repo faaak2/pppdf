@@ -28,6 +28,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_F1, VK_F11, VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
     VK_SPACE, VK_TAB, VK_UP,
 };
+// Pro-only VKs: typing mode forwards these to the form. Free build never
+// references them, so gate the import to keep it warning-free.
+#[cfg(feature = "pro")]
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_MENU};
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, SHAppBarMessage, ShellExecuteW, HDROP,
     ABM_GETAUTOHIDEBAREX, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA,
@@ -84,6 +88,13 @@ pub struct Ui {
     /// Whether the window is pinned above others (WS_EX_TOPMOST). Toggled from
     /// the context menu; not persisted (the app keeps no config).
     pub always_on_top: bool,
+    /// Pro: left button went down inside a form field; route move/up to the
+    /// form until release.
+    #[cfg(feature = "pro")]
+    pub form_mouse: bool,
+    /// Free: the one-per-run "Pro feature" hint has been shown.
+    #[cfg(not(feature = "pro"))]
+    pub hint_shown: bool,
 }
 
 const BADGE_HOLD_TICKS: u32 = 21; // ~700 ms at 33 ms/tick
@@ -128,6 +139,10 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             saved_rect: None,
             wheel_residual: 0,
             always_on_top: false,
+            #[cfg(feature = "pro")]
+            form_mouse: false,
+            #[cfg(not(feature = "pro"))]
+            hint_shown: false,
         });
 
         // Every flag here is load-bearing for native snap/animations; the
@@ -354,6 +369,8 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEWHEEL => {
+                    #[cfg(feature = "pro")]
+                    self.form_kill_focus();
                     // Wheel navigation abandons a half-typed go-to-page entry —
                     // the prompt must not sit open while pages flip under it.
                     self.dismiss_goto_entry();
@@ -415,6 +432,39 @@ impl Ui {
                     }
                     // A click also abandons the go-to-page entry (then acts normally).
                     self.dismiss_goto_entry();
+                    // Form fields win over links and window dragging.
+                    #[cfg(feature = "pro")]
+                    {
+                        let p = self.mouse_point(lparam);
+                        if let (Some((idx, _)), Some(pt)) =
+                            (self.app.field_hit(p), self.app.pdf_point_at(p))
+                        {
+                            self.app.form_tab_idx = Some(idx);
+                            self.app.form_focus = true;
+                            self.form_mouse = true;
+                            let m = Self::form_modifiers();
+                            self.send_form(crate::types::FormEvent::MouseDown {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: m,
+                            });
+                            return LRESULT(0);
+                        }
+                        // Clicking off-field leaves typing mode (commit), then
+                        // the click acts normally (drag/pan/link).
+                        self.form_kill_focus();
+                    }
+                    #[cfg(not(feature = "pro"))]
+                    {
+                        let p = self.mouse_point(lparam);
+                        if self.app.field_at(p).is_some() {
+                            if !self.hint_shown {
+                                self.hint_shown = true;
+                                self.show_toast("Form filling is a pppdf Pro feature".into());
+                            }
+                            return LRESULT(0);
+                        }
+                    }
                     self.suppress_click = false;
                     let p = self.mouse_point(lparam);
                     let over_panel = self.app.doc().map_or(false, |d| {
@@ -440,6 +490,19 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEMOVE => {
+                    #[cfg(feature = "pro")]
+                    if self.form_mouse && (wparam.0 as u32 & 0x0001) != 0 {
+                        // MK_LBUTTON: drag inside a field = text selection.
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseMove {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        return LRESULT(0);
+                    }
                     let p = self.mouse_point(lparam);
                     if let Some(drag) = &mut self.drag {
                         let (dx, dy) = (p.x - drag.start.x, p.y - drag.start.y);
@@ -469,6 +532,8 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDBLCLK => {
+                    #[cfg(feature = "pro")]
+                    self.form_kill_focus();
                     self.dismiss_goto_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
@@ -483,6 +548,18 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
+                    #[cfg(feature = "pro")]
+                    if std::mem::take(&mut self.form_mouse) {
+                        let p = self.mouse_point(lparam);
+                        if let Some(pt) = self.app.pdf_point_at(p) {
+                            self.send_form(crate::types::FormEvent::MouseUp {
+                                x: pt.x,
+                                y: pt.y,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        return LRESULT(0);
+                    }
                     let suppress = std::mem::take(&mut self.suppress_click);
                     // ORDER MATTERS: take the drag state BEFORE ReleaseCapture().
                     // ReleaseCapture delivers WM_CAPTURECHANGED synchronously (reentering
@@ -510,6 +587,19 @@ impl Ui {
                                 let _ = SetCursor(Some(hand));
                             }
                             return LRESULT(1);
+                        }
+                        #[cfg(feature = "pro")]
+                        if !over_overlay {
+                            if let Some(kind) = self.app.field_at(p) {
+                                let cursor = match kind {
+                                    crate::types::FieldKind::Text => IDC_IBEAM,
+                                    crate::types::FieldKind::Other => IDC_HAND,
+                                };
+                                if let Ok(c) = LoadCursorW(None, cursor) {
+                                    let _ = SetCursor(Some(c));
+                                }
+                                return LRESULT(1);
+                            }
                         }
                     }
                     DefWindowProcW(self.hwnd, msg, wparam, lparam)
@@ -610,6 +700,24 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_CHAR => {
+                    #[cfg(feature = "pro")]
+                    if self.app.form_focus
+                        && !matches!(self.app.mode, crate::app::Mode::Password { .. })
+                    {
+                        let c = wparam.0 as u32;
+                        // Tab/Esc handled in WM_KEYDOWN; Ctrl chords (incl.
+                        // Ctrl+S=0x13, Ctrl+V=0x16) must not type control
+                        // bytes — \r (Enter) and \x08 (Backspace) pass.
+                        // (already inside handle()'s unsafe block)
+                        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                        if c != 0x09 && c != 0x1B && !ctrl {
+                            self.send_form(crate::types::FormEvent::Char {
+                                c: c as u16,
+                                modifiers: Self::form_modifiers(),
+                            });
+                        }
+                        return LRESULT(0);
+                    }
                     if matches!(self.app.mode, crate::app::Mode::Password { .. }) {
                         let c = char::from_u32(wparam.0 as u32).unwrap_or('\0');
                         match c {
@@ -697,6 +805,9 @@ impl Ui {
             if self.app.link_at(p).is_some() {
                 return true;
             }
+            if self.app.field_at(p).is_some() {
+                return true; // form fields: pro types into them, free shows the hint
+            }
         }
         false
     }
@@ -741,6 +852,37 @@ impl Ui {
                 _ => {}
             }
             self.invalidate();
+            return;
+        }
+        // Typing mode: the focused field owns the keyboard. Only Esc
+        // (commit + leave) and F1 stay app shortcuts; Space/G/R/0 type text.
+        #[cfg(feature = "pro")]
+        if self.app.form_focus {
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+            match vk {
+                _ if vk == VK_ESCAPE.0 => self.form_kill_focus(),
+                _ if vk == VK_F1.0 => {
+                    self.app.toggle_help();
+                    self.invalidate();
+                }
+                _ if vk == VK_TAB.0 => self.form_tab(shift),
+                _ if vk == VK_LEFT.0
+                    || vk == VK_RIGHT.0
+                    || vk == VK_UP.0
+                    || vk == VK_DOWN.0
+                    || vk == VK_DELETE.0
+                    || vk == VK_HOME.0
+                    || vk == VK_END.0 =>
+                {
+                    self.send_form(crate::types::FormEvent::KeyDown {
+                        vk,
+                        modifiers: Self::form_modifiers(),
+                    });
+                }
+                0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
+                _ => {} // printable keys arrive via WM_CHAR
+            }
             return;
         }
         if vk == VK_F1.0 {
@@ -1148,6 +1290,61 @@ impl Ui {
         }
     }
 
+    /// FWL_EVENTFLAG modifier bits for FORM_On* (fpdf_fwlevent.h: Shift=1,
+    /// Control=2, Alt=4).
+    #[cfg(feature = "pro")]
+    fn form_modifiers() -> i32 {
+        let mut m = 0;
+        unsafe {
+            if GetKeyState(VK_SHIFT.0 as i32) < 0 {
+                m |= 1;
+            }
+            if GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                m |= 2;
+            }
+            if GetKeyState(VK_MENU.0 as i32) < 0 {
+                m |= 4;
+            }
+        }
+        m
+    }
+
+    #[cfg(feature = "pro")]
+    fn send_form(&self, ev: crate::types::FormEvent) {
+        if let Some(d) = self.app.doc() {
+            let page = d.current;
+            self.send_pdf(PdfCmd::Form { page, ev });
+        }
+    }
+
+    /// Leave typing mode, committing the in-progress edit.
+    #[cfg(feature = "pro")]
+    fn form_kill_focus(&mut self) {
+        if self.app.form_focus {
+            self.app.form_focus = false;
+            self.send_form(crate::types::FormEvent::KillFocus);
+        }
+    }
+
+    /// Synthesize a click at a PDF-point to move focus (Tab cycling).
+    #[cfg(feature = "pro")]
+    fn form_tab(&mut self, backwards: bool) {
+        if let Some(pt) = self.app.form_tab_target(backwards) {
+            let m = Self::form_modifiers() & !1; // strip Shift: it selects text
+            self.send_form(crate::types::FormEvent::MouseDown { x: pt.x, y: pt.y, modifiers: m });
+            self.send_form(crate::types::FormEvent::MouseUp { x: pt.x, y: pt.y, modifiers: m });
+            self.app.form_focus = true;
+        }
+    }
+
+    /// Ctrl+V: paste clipboard text into the focused field.
+    #[cfg(feature = "pro")]
+    fn form_paste(&mut self) {
+        if let Some(text) = clipboard_text(self.hwnd) {
+            self.send_form(crate::types::FormEvent::ReplaceSelection { text });
+        }
+    }
+
     /// Ask the PDF thread for whatever the current state needs rendered.
     pub fn sync_renders(&mut self) {
         for req in self.app.wanted_renders() {
@@ -1167,13 +1364,19 @@ impl Ui {
         }
     }
 
+    /// Transient bottom-right pill with arbitrary text (badge family).
+    fn show_toast(&mut self, text: String) {
+        self.badge = Some((text, 0));
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
+        }
+        self.invalidate();
+    }
+
     fn show_badge(&mut self) {
         if let Some(d) = self.app.doc() {
-            self.badge = Some((format!("{} / {}", d.current + 1, d.pages), 0));
-            unsafe {
-                SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
-            }
-            self.invalidate();
+            let text = format!("{} / {}", d.current + 1, d.pages);
+            self.show_toast(text);
         }
     }
 
@@ -1264,11 +1467,40 @@ impl Ui {
     }
 
     fn flip(&mut self, delta: i32) {
+        #[cfg(feature = "pro")]
+        self.form_kill_focus();
         if self.app.flip(delta) {
             self.sync_renders();
             self.show_badge();
             self.invalidate();
         }
+    }
+}
+
+/// Plain-text clipboard contents (CF_UNICODETEXT), if any.
+#[cfg(feature = "pro")]
+fn clipboard_text(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    unsafe {
+        OpenClipboard(Some(hwnd)).ok()?;
+        let out = GetClipboardData(13 /* CF_UNICODETEXT */).ok().and_then(|h| {
+            let hg = HGLOBAL(h.0 as *mut core::ffi::c_void);
+            let ptr = GlobalLock(hg) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        });
+        let _ = CloseClipboard();
+        out
     }
 }
 

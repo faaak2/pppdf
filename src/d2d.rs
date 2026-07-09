@@ -477,7 +477,12 @@ impl Renderer {
             return Ok(());
         }
         let s = self.scale();
-        let (bw, bh, m) = (110.0 * s, 36.0 * s, 24.0 * s);
+        // Width tracks the text so longer toasts (save confirmation, the
+        // free-edition Pro hint) fit; the page badge keeps its old size.
+        let bw = ((text.chars().count() as f32 * 8.0 + 44.0) * s)
+            .max(110.0 * s)
+            .min(client.w as f32 - 16.0 * s);
+        let (bh, m) = (36.0 * s, 24.0 * s);
         let r = RectF {
             left: client.w as f32 - bw - m,
             top: client.h as f32 - bh - m,

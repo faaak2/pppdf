@@ -207,6 +207,14 @@ pub struct App {
     /// F1 help overlay. Global (not per-document): available in every mode,
     /// so it lives here rather than on DocState like the TOC overlay.
     pub help_visible: bool,
+    /// Pro: a form field currently has keyboard focus (typing mode). The UI
+    /// owns this state — it initiates every focus change (click, Tab, Esc).
+    #[cfg(feature = "pro")]
+    pub form_focus: bool,
+    /// Pro: index (into the current cache entry's fields) last focused via
+    /// click or Tab — the anchor for Tab cycling.
+    #[cfg(feature = "pro")]
+    pub form_tab_idx: Option<usize>,
 }
 
 impl App {
@@ -219,6 +227,10 @@ impl App {
             client: SizeU { w: 0, h: 0 },
             dpi: 96,
             help_visible: false,
+            #[cfg(feature = "pro")]
+            form_focus: false,
+            #[cfg(feature = "pro")]
+            form_tab_idx: None,
         }
     }
 
@@ -256,6 +268,11 @@ impl App {
         self.cache.clear();
         self.pending.clear();
         self.failed.clear();
+        #[cfg(feature = "pro")]
+        {
+            self.form_focus = false;
+            self.form_tab_idx = None;
+        }
         self.mode = Mode::Doc(DocState {
             path,
             pages,
@@ -530,6 +547,34 @@ impl App {
     pub fn pdf_point_at(&self, p: PointF) -> Option<PointF> {
         let (q, px_per_pt, page_pt) = self.page_hit_frame(p)?;
         Some(PointF { x: q.x / px_per_pt, y: page_pt.1 - q.y / px_per_pt })
+    }
+
+    /// Advance Tab focus through the current page's fields in reading order
+    /// (top-to-bottom, then left-to-right; PDF y is up, so top DESCENDING).
+    /// Returns the next field's center in PDF points for a synthesized click.
+    #[cfg(feature = "pro")]
+    pub fn form_tab_target(&mut self, backwards: bool) -> Option<PointF> {
+        let d = self.doc()?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
+        if entry.fields.is_empty() {
+            return None;
+        }
+        let mut order: Vec<usize> = (0..entry.fields.len()).collect();
+        order.sort_by(|&a, &b| {
+            let (ra, rb) = (&entry.fields[a].rect_pt, &entry.fields[b].rect_pt);
+            rb.top.total_cmp(&ra.top).then(ra.left.total_cmp(&rb.left))
+        });
+        let pos = self.form_tab_idx.and_then(|cur| order.iter().position(|&i| i == cur));
+        let next_pos = match (pos, backwards) {
+            (Some(p), false) => (p + 1) % order.len(),
+            (Some(p), true) => (p + order.len() - 1) % order.len(),
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+        };
+        let idx = order[next_pos];
+        self.form_tab_idx = Some(idx);
+        let r = entry.fields[idx].rect_pt;
+        Some(PointF { x: (r.left + r.right) / 2.0, y: (r.top + r.bottom) / 2.0 })
     }
 
     // --- go-to-page entry (G, digits, Enter — drawn as a small prompt) ---
@@ -1177,5 +1222,39 @@ mod tests {
         b.mode = Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev: None };
         b.password_cancel();
         assert!(matches!(b.mode, Mode::Empty));
+    }
+
+    #[cfg(feature = "pro")]
+    mod pro_tests {
+        use super::*;
+        use crate::types::{FieldKind, FormField};
+
+        fn field(l: f32, b: f32, r: f32, t: f32) -> FormField {
+            FormField { rect_pt: RectF { left: l, top: t, right: r, bottom: b }, kind: FieldKind::Text }
+        }
+
+        #[test]
+        fn tab_cycles_fields_in_reading_order_and_wraps() {
+            let mut a = app_with_doc(1);
+            let fit_px = render_size(LETTER, a.client, 1.0);
+            // Three fields: top (y 700..720), middle (500..520), bottom (300..320).
+            a.rendered(CachedPage {
+                page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![],
+                fields: vec![field(72.0, 500.0, 300.0, 520.0),   // middle
+                             field(72.0, 700.0, 300.0, 720.0),   // top
+                             field(72.0, 300.0, 300.0, 320.0)],  // bottom
+            });
+            // From nothing selected, Tab goes to the TOP field (max top).
+            let p1 = a.form_tab_target(false).unwrap();
+            assert!((p1.y - 710.0).abs() < 1.0, "first tab -> top field, got y {}", p1.y);
+            let p2 = a.form_tab_target(false).unwrap();
+            assert!((p2.y - 510.0).abs() < 1.0, "then middle");
+            let p3 = a.form_tab_target(false).unwrap();
+            assert!((p3.y - 310.0).abs() < 1.0, "then bottom");
+            let p4 = a.form_tab_target(false).unwrap();
+            assert!((p4.y - 710.0).abs() < 1.0, "wraps to top");
+            let p5 = a.form_tab_target(true).unwrap();
+            assert!((p5.y - 310.0).abs() < 1.0, "shift-tab goes back (wraps to bottom)");
+        }
     }
 }
