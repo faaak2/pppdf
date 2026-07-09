@@ -87,12 +87,18 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class_name = w!("pppdf_window");
 
+        // Embedded via build.rs (winresource, id "1"). A missing/failed load
+        // just falls back to the default icon — never worth crashing over.
+        let icon = LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)).unwrap_or_default();
+
         let wc = WNDCLASSEXW {
             cbSize: core::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: icon,
+            hIconSm: icon,
             hbrBackground: HBRUSH::default(), // we paint everything ourselves
             lpszClassName: class_name,
             ..Default::default()
