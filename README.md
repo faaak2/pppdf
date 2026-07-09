@@ -21,9 +21,13 @@ rulebook next to your VTT and it looks like a page lying on the desktop.
 
 ### Pro edition
 
-The paid edition (form filling, user-created labels/inputs — in progress)
-is the same codebase behind a Cargo feature; its code lives in `src/pro/`
-and is not compiled into the free exe:
+The paid edition adds interactive form filling — click a field, type,
+toggle checkboxes/radios, pick from dropdowns, press Ctrl+S to save the
+filled PDF in place, with an unsaved-changes dot and a close prompt
+(Save/Discard/Cancel) protecting anything unsaved. (User-created
+labels/inputs are planned for a future release.) It's the same codebase
+behind a Cargo feature; its code lives in `src/pro/` and is not compiled
+into the free exe:
 
 ```
 cargo build --release --features pro   # pppdf Pro
@@ -64,6 +68,7 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | Ctrl+O | Open file · drop a PDF works too |
 | Ctrl+N | Open a new empty window |
 | Ctrl+Shift+O | Open a file in a new window |
+| Ctrl+S | Save filled form (Pro) |
 | F11 | Fill the screen (work area) / restore |
 | F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |

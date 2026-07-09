@@ -25,5 +25,7 @@ Rules:
   exe version resources (build scripts can't see the crate) — keep in sync.
 - **Verify both editions**: any change must pass `cargo build` and
   `cargo test` both with and without `--features pro`.
-- Pro scope (planned): form-fillable elements, user-created labels and
-  input fields.
+- Pro scope: form filling has shipped (fill/save AcroForm fields);
+  user-created labels and input fields remain planned.
+- Interactive form code: `src/pro/forms/` drives PDFium's form engine via
+  vendored accessor patches (`vendor/PATCHES.md`).
