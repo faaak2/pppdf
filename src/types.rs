@@ -33,7 +33,9 @@ pub struct PageLink {
 #[derive(Debug)]
 pub enum PdfCmd {
     Load { path: PathBuf, password: Option<String> },
-    Render { page: u16, px: SizeU, visible: bool },
+    /// `px` is the desired OUTPUT size — already swapped for 90°/270°.
+    /// `rot` = clockwise quarter-turns (0..=3) to render the page at.
+    Render { page: u16, px: SizeU, rot: u8, visible: bool },
     Shutdown,
 }
 
@@ -56,6 +58,8 @@ pub enum PdfReply {
     Rendered {
         page: u16,
         px: SizeU,
+        /// The quarter-turn rotation this bitmap was rendered at.
+        rot: u8,
         bgra: Vec<u8>,
         links: Vec<PageLink>,
     },

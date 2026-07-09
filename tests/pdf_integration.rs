@@ -41,9 +41,9 @@ fn load_render_outline_links() {
 
     // --- render page 1 (index 0) at exact pixel size ---
     let px = SizeU { w: 612, h: 792 };
-    cmd_tx.send(PdfCmd::Render { page: 0, px, visible: true }).unwrap();
+    cmd_tx.send(PdfCmd::Render { page: 0, px, rot: 0, visible: true }).unwrap();
     let (rpage, rpx, bgra, links) = match reply_rx.recv_timeout(WAIT).unwrap() {
-        PdfReply::Rendered { page, px, bgra, links } => (page, px, bgra, links),
+        PdfReply::Rendered { page, px, bgra, links, .. } => (page, px, bgra, links),
         other => panic!("expected Rendered, got {other:?}"),
     };
     assert_eq!(rpage, 0);
@@ -65,7 +65,68 @@ fn load_render_outline_links() {
     let uri = links.iter().find(|l| matches!(l.target, LinkTarget::Uri(_))).unwrap();
     assert_eq!(uri.target, LinkTarget::Uri("https://example.com/".into()));
 
+    // --- rotated render: 90° CW must come back with the axes swapped ---
+    // The requested px is the desired OUTPUT size (already landscape); the
+    // reply must match it, proving the rotation plumbing through pdfium
+    // (target size is internally un-swapped back to page terms).
+    let px_rot = SizeU { w: 792, h: 612 };
+    cmd_tx.send(PdfCmd::Render { page: 0, px: px_rot, rot: 1, visible: true }).unwrap();
+    let (rpx, rrot, bgra_rot) = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { px, rot, bgra, .. } => (px, rot, bgra),
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    assert_eq!(rrot, 1);
+    assert_eq!(rpx, px_rot, "rotated output size must be the swapped page size");
+    assert_eq!(bgra_rot.len(), (px_rot.w * px_rot.h * 4) as usize);
+    // The red rect (100 600 200 100 re: x 100..300, y-up 600..700) draws in
+    // the upright bitmap's TOP-LEFT quadrant. Rotated 90° CW it must land in
+    // the TOP-RIGHT quadrant of the landscape bitmap — and be gone from the
+    // top-left.
+    let quadrant_has_red = |x0: u32, y0: u32| {
+        (y0..y0 + px_rot.h / 2).any(|y| {
+            (x0..x0 + px_rot.w / 2).any(|x| {
+                let i = ((y * px_rot.w + x) * 4) as usize;
+                bgra_rot[i] < 60 && bgra_rot[i + 1] < 60 && bgra_rot[i + 2] > 200
+            })
+        })
+    };
+    assert!(quadrant_has_red(px_rot.w / 2, 0), "red must rotate into the top-right");
+    assert!(!quadrant_has_red(0, 0), "red must vanish from the top-left");
+
     // --- shutdown is clean ---
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+}
+
+/// Anti-livelock invariant: whatever output size the UI requests — including
+/// awkward sizes for a rotated high-aspect page — the reply must be EXACTLY
+/// that size. wanted_renders() accepts a cached render only within
+/// SIZE_TOLERANCE (2 px); with the old target-size render path, pdfium's
+/// per-axis re-rounding drifted up to ~5 px at 90°/270° on a 10:1 page, so
+/// the UI re-requested the identical render forever.
+#[test]
+fn rotated_render_size_is_exact_even_for_high_aspect_pages() {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::tall_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { pages, page_sizes, .. } => {
+            assert_eq!(pages, 1);
+            assert_eq!(page_sizes[0], (100.0, 1000.0));
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    for (w, h, rot) in [(985, 98, 1), (973, 97, 1), (501, 50, 3), (98, 985, 2), (100, 1000, 0)] {
+        let px = SizeU { w, h };
+        cmd_tx.send(PdfCmd::Render { page: 0, px, rot, visible: true }).unwrap();
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::Rendered { px: rpx, rot: rrot, bgra, .. } => {
+                assert_eq!(rrot, rot);
+                assert_eq!(rpx, px, "rot {rot}: output size must match the request EXACTLY");
+                assert_eq!(bgra.len(), (px.w * px.h * 4) as usize);
+            }
+            other => panic!("expected Rendered, got {other:?}"),
+        }
+    }
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
 }
 

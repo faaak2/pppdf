@@ -37,12 +37,14 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | PgDn / → / Space / wheel | Next page |
 | PgUp / ← / Shift+Space / wheel up | Previous page |
 | Home / End | First / last page |
+| G, then a number, Enter | Go to a page |
 | Tab (or right-click menu) | Table of contents overlay |
 | ↑ ↓ → ← / Enter / Esc | Navigate the open overlay |
 | Click a link | Follow it (web links open in your browser) |
 | Ctrl+wheel | Zoom at the cursor |
 | Drag (zoomed) | Pan · Ctrl+drag moves the window |
 | Double-click or 0 | Back to fit |
+| R | Rotate 90° clockwise |
 | Wheel (zoomed) | Scroll; one more notch at the edge flips the page |
 | Ctrl+O | Open file · drop a PDF works too |
 | Ctrl+N | Open a new empty window |

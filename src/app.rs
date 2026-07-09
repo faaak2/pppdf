@@ -1,8 +1,8 @@
 //! Application state machine + page cache. Pure logic — no OS types.
 
 use crate::layout::{
-    clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size, zoom_scroll,
-    PointF, RectF, SizeU, SCROLL_STEP,
+    clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size, unrotate_point,
+    zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
 use crate::types::{LinkTarget, OutlineItem, PageLink};
@@ -15,6 +15,10 @@ use std::path::PathBuf;
 pub struct CachedPage {
     pub page: u16,
     pub px: SizeU,
+    /// Clockwise quarter-turns the bitmap was rendered at. Part of the cache
+    /// identity: a 180° render has the SAME px as the unrotated one, so
+    /// matching on (page, px) alone would serve stale pixels forever.
+    pub rot: u8,
     pub bgra: Vec<u8>,
     pub links: Vec<PageLink>,
 }
@@ -55,20 +59,22 @@ impl PageCache {
     }
 
     /// Freshest cached render of this page at any size (soft preview).
-    pub fn get_any(&self, page: u16) -> Option<&CachedPage> {
-        self.entries.iter().find(|e| e.page == page)
+    /// Rotation must match exactly — drawing a differently-rotated bitmap
+    /// into the destination rect would show sideways/stretched content.
+    pub fn get_any(&self, page: u16, rot: u8) -> Option<&CachedPage> {
+        self.entries.iter().find(|e| e.page == page && e.rot == rot)
     }
 
     /// Entry within SIZE_TOLERANCE of `want` if one exists, else the freshest.
-    pub fn get_best(&self, page: u16, want: SizeU) -> Option<&CachedPage> {
+    pub fn get_best(&self, page: u16, rot: u8, want: SizeU) -> Option<&CachedPage> {
         self.entries
             .iter()
-            .find(|e| e.page == page && close(e.px, want))
-            .or_else(|| self.get_any(page))
+            .find(|e| e.page == page && e.rot == rot && close(e.px, want))
+            .or_else(|| self.get_any(page, rot))
     }
 
-    pub fn has_close(&self, page: u16, px: SizeU) -> bool {
-        self.entries.iter().any(|e| e.page == page && close(e.px, px))
+    pub fn has_close(&self, page: u16, rot: u8, px: SizeU) -> bool {
+        self.entries.iter().any(|e| e.page == page && e.rot == rot && close(e.px, px))
     }
 
     pub fn len(&self) -> usize {
@@ -87,7 +93,8 @@ impl PageCache {
     /// place, and a page flip resets zoom so old sizes age out normally).
     /// That bounded overshoot is the price of guaranteed convergence.
     pub fn put(&mut self, entry: CachedPage, protected: &[u16]) {
-        self.entries.retain(|e| !(e.page == entry.page && e.px == entry.px));
+        self.entries
+            .retain(|e| !(e.page == entry.page && e.px == entry.px && e.rot == entry.rot));
         self.entries.push_front(entry);
         while (self.entries.len() > self.cap || self.total_bytes() > self.max_bytes)
             && self.entries.len() > 1
@@ -129,14 +136,28 @@ pub struct DocState {
     pub scroll: PointF,
     /// Some = TOC overlay is open.
     pub overlay: Option<OutlineState>,
+    /// Clockwise quarter-turns (0..=3) the document view is rotated by.
+    /// Applies to every page; reset by opening another document.
+    pub rot: u8,
+    /// Some = the "G" go-to-page prompt is open, holding the typed digits.
+    pub goto_entry: Option<String>,
 }
 
 impl DocState {
+    /// Current page size in PDF points, as authored (unrotated).
     fn page_pt(&self) -> (f32, f32) {
         self.page_sizes
             .get(self.current as usize)
             .copied()
             .unwrap_or((612.0, 792.0))
+    }
+
+    /// Current page size as displayed: axes swap at 90°/270°. ALL fit/zoom/
+    /// scroll geometry must use this; `page_pt()` is only for link rects,
+    /// which pdfium reports in unrotated page space.
+    fn page_pt_rot(&self) -> (f32, f32) {
+        let (w, h) = self.page_pt();
+        if self.rot % 2 == 1 { (h, w) } else { (w, h) }
     }
 }
 
@@ -159,6 +180,7 @@ pub enum Mode {
 pub struct RenderReq {
     pub page: u16,
     pub px: SizeU,
+    pub rot: u8,
     pub visible: bool,
 }
 
@@ -172,8 +194,9 @@ pub enum WheelOutcome {
 pub struct App {
     pub mode: Mode,
     pub cache: PageCache,
-    /// Render requests sent to the PDF thread but not yet answered.
-    pub pending: HashSet<(u16, u32, u32)>,
+    /// Render requests sent to the PDF thread but not yet answered,
+    /// keyed (page, w, h, rot).
+    pub pending: HashSet<(u16, u32, u32, u8)>,
     /// Pages whose render genuinely failed — never re-requested (avoids a
     /// request/fail hot loop on malformed pages). Cleared on document load.
     pub failed: HashSet<u16>,
@@ -239,6 +262,8 @@ impl App {
             zoom: 1.0,
             scroll: PointF::default(),
             overlay: None,
+            rot: 0,
+            goto_entry: None,
         });
     }
 
@@ -278,7 +303,7 @@ impl App {
                 WheelOutcome::None
             };
         }
-        let px = render_size(d.page_pt(), client, d.zoom);
+        let px = render_size(d.page_pt_rot(), client, d.zoom);
         let max_y = (px.h as f32 - client.h as f32).max(0.0);
         let at_bottom = d.scroll.y >= max_y - 0.5;
         let at_top = d.scroll.y <= 0.5;
@@ -299,7 +324,7 @@ impl App {
     pub fn zoom_by(&mut self, cursor: PointF, factor: f32) -> bool {
         let client = self.client;
         let Some(d) = self.doc_mut() else { return false };
-        let page_pt = d.page_pt();
+        let page_pt = d.page_pt_rot();
         let old_zoom = d.zoom;
         let new_zoom = (old_zoom * factor).clamp(1.0, max_zoom(page_pt, client));
         if (new_zoom - old_zoom).abs() < 1e-4 {
@@ -336,10 +361,21 @@ impl App {
         };
     }
 
+    /// Rotate the view 90° clockwise (cycles back to upright after four).
+    /// Resets to fit like a page flip does — cursor-anchored zoom math has no
+    /// meaningful anchor across a rotation. Returns true if a doc is open.
+    pub fn rotate_cw(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        d.rot = (d.rot + 1) % 4;
+        d.zoom = 1.0;
+        d.scroll = PointF::default();
+        true
+    }
+
     /// Pixel size the current page renders at (current zoom).
     pub fn current_px(&self) -> Option<SizeU> {
         let d = self.doc()?;
-        Some(render_size(d.page_pt(), self.client, d.zoom))
+        Some(render_size(d.page_pt_rot(), self.client, d.zoom))
     }
 
     /// Window-space rect the current page occupies.
@@ -351,22 +387,24 @@ impl App {
     /// Crisp render of the current page first, then prefetch next/prev at fit.
     pub fn wanted_renders(&self) -> Vec<RenderReq> {
         let Some(d) = self.doc() else { return Vec::new() };
+        let rot = d.rot;
         let mut out = Vec::new();
         let mut push_if_needed = |page: u16, px: SizeU, visible: bool| {
-            if !self.cache.has_close(page, px)
-                && !self.pending.contains(&(page, px.w, px.h))
+            if !self.cache.has_close(page, rot, px)
+                && !self.pending.contains(&(page, px.w, px.h, rot))
                 && !self.failed.contains(&page)
             {
-                out.push(RenderReq { page, px, visible });
+                out.push(RenderReq { page, px, rot, visible });
             }
         };
-        push_if_needed(d.current, render_size(d.page_pt(), self.client, d.zoom), true);
+        push_if_needed(d.current, render_size(d.page_pt_rot(), self.client, d.zoom), true);
         for neighbor in [d.current as i32 + 1, d.current as i32 - 1] {
             if neighbor < 0 || neighbor >= d.pages as i32 {
                 continue;
             }
             let page = neighbor as u16;
-            let pt = d.page_sizes.get(page as usize).copied().unwrap_or((612.0, 792.0));
+            let (w, h) = d.page_sizes.get(page as usize).copied().unwrap_or((612.0, 792.0));
+            let pt = if rot % 2 == 1 { (h, w) } else { (w, h) };
             push_if_needed(page, render_size(pt, self.client, 1.0), false);
         }
         drop(push_if_needed);
@@ -374,7 +412,7 @@ impl App {
     }
 
     pub fn mark_pending(&mut self, req: &RenderReq) {
-        self.pending.insert((req.page, req.px.w, req.px.h));
+        self.pending.insert((req.page, req.px.w, req.px.h, req.rot));
     }
 
     /// A render reply arrived: clear the page's pending entries (by page, not
@@ -408,20 +446,96 @@ impl App {
         }
     }
 
-    /// Link under a window-space point on the current page, if any.
+    /// Link under a window-space point on the current page, if any. Link
+    /// rects live in unrotated page space, so the window point is first
+    /// carried back through the view rotation.
     pub fn link_at(&self, p: PointF) -> Option<LinkTarget> {
         let d = self.doc()?;
-        let entry = self.cache.get_any(d.current)?;
+        let entry = self.cache.get_any(d.current, d.rot)?;
         let pr = self.current_page_rect()?;
+        // Points outside the displayed page can't be on a link — and must be
+        // rejected BEFORE unrotating: negating coordinates flips the half-open
+        // page interval, which would otherwise turn the first point past one
+        // edge into an exact hit on the opposite edge.
+        if !pr.contains(p) {
+            return None;
+        }
         let page_pt = d.page_pt();
-        let px_per_pt = fit_scale(page_pt, self.client) * d.zoom;
+        // Same scalar in both frames — rotation is rigid.
+        let px_per_pt = fit_scale(d.page_pt_rot(), self.client) * d.zoom;
+        // Window point -> rotated-bitmap coords -> unrotated-bitmap coords.
+        // The same interval flip makes an exact on-edge point land exactly ON
+        // the far bound (q == dims), where half-open `contains` misses a link
+        // that bleeds to the page edge; nudge it back inside.
+        let q = unrotate_point(
+            PointF { x: p.x - pr.left, y: p.y - pr.top },
+            pr.width(),
+            pr.height(),
+            d.rot,
+        );
+        let q = PointF {
+            x: q.x.min(page_pt.0 * px_per_pt - 1e-3),
+            y: q.y.min(page_pt.1 * px_per_pt - 1e-3),
+        };
+        // Links compared inside the unrotated bitmap's own frame (origin 0,0).
+        let unrot = RectF {
+            left: 0.0,
+            top: 0.0,
+            right: page_pt.0 * px_per_pt,
+            bottom: page_pt.1 * px_per_pt,
+        };
         for link in &entry.links {
-            let wr = pdf_rect_to_window(link.rect_pt, page_pt.1, px_per_pt, pr);
-            if wr.contains(p) {
+            let wr = pdf_rect_to_window(link.rect_pt, page_pt.1, px_per_pt, unrot);
+            if wr.contains(q) {
                 return Some(link.target.clone());
             }
         }
         None
+    }
+
+    // --- go-to-page entry (G, digits, Enter — drawn as a small prompt) ---
+
+    /// Open the go-to-page prompt. Only meaningful with a document.
+    pub fn goto_entry_start(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        d.goto_entry = Some(String::new());
+        true
+    }
+
+    pub fn goto_entry_active(&self) -> bool {
+        self.doc().is_some_and(|d| d.goto_entry.is_some())
+    }
+
+    /// Append a typed digit (anything else is ignored; length capped so the
+    /// buffer can't grow without bound).
+    pub fn goto_entry_char(&mut self, c: char) {
+        if let Some(buf) = self.doc_mut().and_then(|d| d.goto_entry.as_mut()) {
+            if c.is_ascii_digit() && buf.len() < 6 {
+                buf.push(c);
+            }
+        }
+    }
+
+    pub fn goto_entry_backspace(&mut self) {
+        if let Some(buf) = self.doc_mut().and_then(|d| d.goto_entry.as_mut()) {
+            buf.pop();
+        }
+    }
+
+    pub fn goto_entry_cancel(&mut self) {
+        if let Some(d) = self.doc_mut() {
+            d.goto_entry = None;
+        }
+    }
+
+    /// Enter: jump to the typed 1-based page, clamped to the document.
+    /// An empty buffer just closes the prompt. Returns true if the page changed.
+    pub fn goto_entry_commit(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        let Some(buf) = d.goto_entry.take() else { return false };
+        let Ok(n) = buf.parse::<u32>() else { return false };
+        let page_1 = n.clamp(1, d.pages.max(1) as u32) as u16;
+        self.goto(page_1 - 1)
     }
 
     // --- password entry (typed straight into the borderless window) ---
@@ -485,7 +599,7 @@ mod tests {
     }
 
     fn cached(page: u16, px: SizeU) -> CachedPage {
-        CachedPage { page, px, bgra: vec![0; 4], links: vec![] }
+        CachedPage { page, px, rot: 0, bgra: vec![0; 4], links: vec![] }
     }
 
     // --- paging ---
@@ -673,9 +787,9 @@ mod tests {
         c.put(cached(0, px), &[]);
         c.put(cached(1, px), &[]);
         c.put(cached(2, px), &[]);
-        assert!(c.get_any(0).is_none(), "0 was evicted");
-        assert!(c.get_any(1).is_some());
-        assert!(c.get_any(2).is_some());
+        assert!(c.get_any(0, 0).is_none(), "0 was evicted");
+        assert!(c.get_any(1, 0).is_some());
+        assert!(c.get_any(2, 0).is_some());
     }
 
     #[test]
@@ -684,15 +798,16 @@ mod tests {
         let big = |page: u16, bytes: usize| CachedPage {
             page,
             px: SizeU { w: 1, h: 1 },
+            rot: 0,
             bgra: vec![0; bytes],
             links: vec![],
         };
         c.put(big(0, 60), &[]);
         c.put(big(1, 60), &[]); // 120 > 100: page 0 evicted
-        assert!(c.get_any(0).is_none());
-        assert!(c.get_any(1).is_some());
+        assert!(c.get_any(0, 0).is_none());
+        assert!(c.get_any(1, 0).is_some());
         c.put(big(2, 300), &[]); // oversized alone: still kept (newest never evicted)
-        assert!(c.get_any(2).is_some());
+        assert!(c.get_any(2, 0).is_some());
         assert_eq!(c.len(), 1);
     }
 
@@ -710,9 +825,10 @@ mod tests {
     fn cache_has_close_tolerates_render_rounding() {
         let mut c = PageCache::new(4);
         c.put(cached(0, SizeU { w: 800, h: 1000 }), &[]);
-        assert!(c.has_close(0, SizeU { w: 801, h: 999 }));
-        assert!(!c.has_close(0, SizeU { w: 850, h: 1000 }));
-        assert!(!c.has_close(1, SizeU { w: 800, h: 1000 }));
+        assert!(c.has_close(0, 0, SizeU { w: 801, h: 999 }));
+        assert!(!c.has_close(0, 0, SizeU { w: 850, h: 1000 }));
+        assert!(!c.has_close(1, 0, SizeU { w: 800, h: 1000 }));
+        assert!(!c.has_close(0, 2, SizeU { w: 800, h: 1000 }), "rot mismatch is a miss");
     }
 
     #[test]
@@ -720,10 +836,11 @@ mod tests {
         let mut c = PageCache::new(4);
         c.put(cached(0, SizeU { w: 100, h: 100 }), &[]);
         c.put(cached(0, SizeU { w: 200, h: 200 }), &[]); // freshest
-        let best = c.get_best(0, SizeU { w: 101, h: 100 }).unwrap();
+        let best = c.get_best(0, 0, SizeU { w: 101, h: 100 }).unwrap();
         assert_eq!(best.px, SizeU { w: 100, h: 100 }, "size match wins over freshness");
-        let fallback = c.get_best(0, SizeU { w: 999, h: 999 }).unwrap();
+        let fallback = c.get_best(0, 0, SizeU { w: 999, h: 999 }).unwrap();
         assert_eq!(fallback.px, SizeU { w: 200, h: 200 }, "no size match -> freshest");
+        assert!(c.get_best(0, 1, SizeU { w: 100, h: 100 }).is_none(), "other rot never previews");
     }
 
     #[test]
@@ -734,6 +851,7 @@ mod tests {
                 CachedPage {
                     page: 1,
                     px: SizeU { w: 100 + i, h: 100 + i },
+                    rot: 0,
                     bgra: vec![0; 10],
                     links: vec![],
                 },
@@ -741,7 +859,7 @@ mod tests {
             );
         }
         assert!(c.len() <= 2, "len = {}", c.len());
-        assert!(c.has_close(1, SizeU { w: 111, h: 111 }), "newest size must survive");
+        assert!(c.has_close(1, 0, SizeU { w: 111, h: 111 }), "newest size must survive");
     }
 
     #[test]
@@ -762,10 +880,16 @@ mod tests {
             for r in reqs {
                 a.mark_pending(&r);
                 let bytes = if r.visible { 60 } else { 30 }; // 60+30+30 = 120 > budget 100
-                a.rendered(CachedPage { page: r.page, px: r.px, bgra: vec![0; bytes], links: vec![] });
+                a.rendered(CachedPage {
+                    page: r.page,
+                    px: r.px,
+                    rot: r.rot,
+                    bgra: vec![0; bytes],
+                    links: vec![],
+                });
             }
         }
-        assert!(a.cache.get_any(1).is_some(), "visible page must remain cached");
+        assert!(a.cache.get_any(1, 0).is_some(), "visible page must remain cached");
     }
 
     #[test]
@@ -806,7 +930,7 @@ mod tests {
             rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
             target: LinkTarget::Page(0),
         };
-        a.rendered(CachedPage { page: 0, px: fit_px, bgra: vec![0; 4], links: vec![link] });
+        a.rendered(CachedPage { page: 0, px: fit_px, rot: 0, bgra: vec![0; 4], links: vec![link] });
         let pr = a.current_page_rect().unwrap();
         // A window point just inside the page's top-left corner is on the link.
         let p = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
@@ -814,6 +938,121 @@ mod tests {
         // Bottom-left corner of the page is NOT on the link.
         let q = PointF { x: pr.left + 5.0, y: pr.bottom - 5.0 };
         assert_eq!(a.link_at(q), None);
+    }
+
+    #[test]
+    fn link_at_follows_the_rotated_view() {
+        let mut a = app_with_doc(1);
+        // Same top-left-quarter link as above, but the view is rotated 90° CW,
+        // so that quarter now shows in the window's TOP-RIGHT.
+        let link = PageLink {
+            rect_pt: RectF { left: 0.0, top: 792.0, right: 306.0, bottom: 396.0 },
+            target: LinkTarget::Page(0),
+        };
+        assert!(a.rotate_cw());
+        let px = a.current_px().unwrap();
+        assert!(px.w > px.h, "rotated portrait page must be landscape");
+        a.rendered(CachedPage { page: 0, px, rot: 1, bgra: vec![0; 4], links: vec![link] });
+        let pr = a.current_page_rect().unwrap();
+        let top_right = PointF { x: pr.right - 5.0, y: pr.top + 5.0 };
+        assert_eq!(a.link_at(top_right), Some(LinkTarget::Page(0)));
+        let top_left = PointF { x: pr.left + 5.0, y: pr.top + 5.0 };
+        assert_eq!(a.link_at(top_left), None, "unrotated hotspot must have moved");
+    }
+
+    // --- rotation ---
+
+    #[test]
+    fn rotate_cycles_and_resets_to_fit() {
+        let mut a = app_with_doc(2);
+        assert!(!App::new().rotate_cw(), "no doc: no-op");
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 2.0);
+        assert!(a.rotate_cw());
+        let d = a.doc().unwrap();
+        assert_eq!((d.rot, d.zoom), (1, 1.0));
+        assert_eq!(d.scroll, PointF::default());
+        for want in [2, 3, 0, 1] {
+            a.rotate_cw();
+            assert_eq!(a.doc().unwrap().rot, want);
+        }
+    }
+
+    #[test]
+    fn rotated_renders_swap_axes_and_carry_rot() {
+        let mut a = app_with_doc(2);
+        let upright = a.wanted_renders()[0];
+        a.rotate_cw();
+        let reqs = a.wanted_renders();
+        assert_eq!(reqs[0].rot, 1);
+        // In a square client the fit scale is symmetric, so the rotated
+        // request is exactly the upright one with its axes swapped.
+        assert_eq!((reqs[0].px.w, reqs[0].px.h), (upright.px.h, upright.px.w));
+        // A portrait page fit into a square client: upright is taller than
+        // wide, rotated is wider than tall.
+        assert!(upright.px.h > upright.px.w);
+        assert!(reqs[0].px.w > reqs[0].px.h);
+        // The prefetch request is rotated too.
+        assert!(reqs.iter().all(|r| r.rot == 1));
+        // An upright cached entry must NOT satisfy a rotated request, even at
+        // 180° where the pixel size is identical.
+        a.rotate_cw(); // rot = 2: same px as upright
+        let px180 = a.current_px().unwrap();
+        a.rendered(CachedPage { page: 0, px: px180, rot: 0, bgra: vec![0; 4], links: vec![] });
+        assert!(
+            a.wanted_renders().iter().any(|r| r.page == 0 && r.rot == 2),
+            "180° must re-render despite identical px"
+        );
+    }
+
+    // --- go-to-page entry ---
+
+    #[test]
+    fn goto_entry_flow_commits_clamped_1_based() {
+        let mut a = app_with_doc(5);
+        assert!(!a.goto_entry_active());
+        assert!(a.goto_entry_start());
+        assert!(a.goto_entry_active());
+        a.goto_entry_char('x'); // non-digit ignored
+        a.goto_entry_char('4');
+        a.goto_entry_char('2');
+        a.goto_entry_backspace();
+        assert_eq!(a.doc().unwrap().goto_entry.as_deref(), Some("4"));
+        assert!(a.goto_entry_commit(), "page 4 (1-based) = index 3");
+        assert_eq!(a.doc().unwrap().current, 3);
+        assert!(!a.goto_entry_active(), "commit closes the prompt");
+        // Out-of-range clamps to the last page; "0" clamps to the first.
+        a.goto_entry_start();
+        for c in "999".chars() {
+            a.goto_entry_char(c);
+        }
+        assert!(a.goto_entry_commit());
+        assert_eq!(a.doc().unwrap().current, 4);
+        a.goto_entry_start();
+        a.goto_entry_char('0');
+        assert!(a.goto_entry_commit());
+        assert_eq!(a.doc().unwrap().current, 0);
+    }
+
+    #[test]
+    fn goto_entry_cancel_and_empty_commit_close_without_jump() {
+        let mut a = app_with_doc(5);
+        a.flip(2);
+        a.goto_entry_start();
+        a.goto_entry_char('5');
+        a.goto_entry_cancel();
+        assert!(!a.goto_entry_active());
+        assert_eq!(a.doc().unwrap().current, 2, "cancel must not jump");
+        a.goto_entry_start();
+        assert!(!a.goto_entry_commit(), "empty Enter just closes");
+        assert!(!a.goto_entry_active());
+        assert_eq!(a.doc().unwrap().current, 2);
+        // Buffer length is capped at 6 digits.
+        a.goto_entry_start();
+        for c in "1234567890".chars() {
+            a.goto_entry_char(c);
+        }
+        assert_eq!(a.doc().unwrap().goto_entry.as_deref(), Some("123456"));
+        a.goto_entry_cancel();
     }
 
     // --- password mode ---

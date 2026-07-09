@@ -20,12 +20,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("PgDn / \u{2192} / Space / wheel", "Next page"),
     ("PgUp / \u{2190} / Shift+Space / wheel up", "Previous page"),
     ("Home / End", "First / last page"),
+    ("G, then a number, Enter", "Go to a page"),
     ("Tab (or right-click menu)", "Table of contents overlay"),
     ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
     ("Click a link", "Follow it (web links open in your browser)"),
     ("Ctrl+wheel", "Zoom at the cursor"),
     ("Drag (zoomed)", "Pan \u{b7} Ctrl+drag moves the window"),
     ("Double-click or 0", "Back to fit"),
+    ("R", "Rotate 90\u{b0} clockwise"),
     ("Wheel (zoomed)", "Scroll; one more notch at the edge flips the page"),
     ("Ctrl+O", "Open file \u{b7} drop a PDF works too"),
     ("Ctrl+N", "Open a new empty window"),
@@ -47,8 +49,10 @@ pub struct Renderer {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
     rt: Option<ID2D1HwndRenderTarget>,
-    /// Memo of the last uploaded page bitmap: (page, px) -> device bitmap.
-    page_bitmap: Option<(u16, SizeU, ID2D1Bitmap)>,
+    /// Memo of the last uploaded page bitmap: (page, px, rot) -> device
+    /// bitmap. `rot` matters: a 180° render has the same px as the upright
+    /// one, and without it the memo would keep serving the stale pixels.
+    page_bitmap: Option<(u16, SizeU, u8, ID2D1Bitmap)>,
     dpi: u32,
     /// ((size_dip*10) as u32, centered) -> format; rebuilt when DPI changes.
     formats: Vec<((u32, bool), IDWriteTextFormat)>,
@@ -187,10 +191,11 @@ impl Renderer {
         rt: &ID2D1HwndRenderTarget,
         page: u16,
         px: SizeU,
+        rot: u8,
         bgra: &[u8],
     ) -> Result<ID2D1Bitmap> {
-        if let Some((p, s, bmp)) = &self.page_bitmap {
-            if *p == page && *s == px {
+        if let Some((p, s, r, bmp)) = &self.page_bitmap {
+            if *p == page && *s == px && *r == rot {
                 return Ok(bmp.clone());
             }
         }
@@ -209,7 +214,7 @@ impl Renderer {
                 px.w * 4,
                 &props,
             )?;
-            self.page_bitmap = Some((page, px, bmp.clone()));
+            self.page_bitmap = Some((page, px, rot, bmp.clone()));
             Ok(bmp)
         }
     }
@@ -267,8 +272,9 @@ impl Renderer {
                 }
                 Mode::Doc(d) => {
                     if let (Some(px), Some(dest)) = (app.current_px(), app.current_page_rect()) {
-                        if let Some(entry) = app.cache.get_best(d.current, px) {
-                            let bmp = self.page_bitmap(rt, entry.page, entry.px, &entry.bgra)?;
+                        if let Some(entry) = app.cache.get_best(d.current, d.rot, px) {
+                            let bmp =
+                                self.page_bitmap(rt, entry.page, entry.px, entry.rot, &entry.bgra)?;
                             let crisp = entry.px.w as f32 == dest.width().round()
                                 && entry.px.h as f32 == dest.height().round();
                             let mode = if crisp {
@@ -284,6 +290,9 @@ impl Renderer {
                     }
                     if let Some((text, alpha)) = badge {
                         self.draw_badge(rt, text, alpha, client)?;
+                    }
+                    if let Some(buf) = &d.goto_entry {
+                        self.draw_goto(rt, buf, d.pages, client)?;
                     }
                 }
             }
@@ -422,6 +431,39 @@ impl Renderer {
             self.draw_text(rt, &it.title, &fmt, title_rect, color(1.0, 1.0, 1.0, 0.9))?;
         }
         Ok(())
+    }
+
+    /// The "G" go-to-page prompt: a bottom-centered pill showing the typed
+    /// digits, styled like the page badge so it reads as the same family.
+    fn draw_goto(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        buf: &str,
+        pages: u16,
+        client: SizeU,
+    ) -> Result<()> {
+        let s = self.scale();
+        // Never wider than the window: the 200-DIP minimum window is narrower
+        // than the pill's natural width, and an overhanging pill gets clipped
+        // by the window edges.
+        let (bw, bh, m) = ((240.0 * s).min(client.w as f32 - 16.0 * s), 36.0 * s, 24.0 * s);
+        let cx = client.w as f32 / 2.0;
+        let r = RectF {
+            left: cx - bw / 2.0,
+            top: client.h as f32 - bh - m,
+            right: cx + bw / 2.0,
+            bottom: client.h as f32 - m,
+        };
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT { rect: rectf(r), radiusX: bh / 2.0, radiusY: bh / 2.0 };
+            let bg = rt.CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 0.8), None)?;
+            rt.FillRoundedRectangle(&rr, &bg);
+            let border = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.25), None)?;
+            rt.DrawRoundedRectangle(&rr, &border, 1.0 * s, None);
+        }
+        let fmt = self.text_format(14.0, true)?;
+        let text = format!("Go to page: {buf}_ ({pages} pages)");
+        self.draw_text(rt, &text, &fmt, r, color(1.0, 1.0, 1.0, 0.92))
     }
 
     fn draw_badge(

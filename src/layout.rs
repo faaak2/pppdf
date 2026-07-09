@@ -106,6 +106,19 @@ pub fn zoom_scroll(
     clamp_scroll(new_page_px, client, PointF { x: want_x, y: want_y })
 }
 
+/// Map a point inside a ROTATED page bitmap (coords relative to its top-left,
+/// `dest_w`/`dest_h` = the rotated bitmap's size) back into the unrotated
+/// bitmap's frame. `rot` = clockwise quarter-turns applied at render time.
+/// Used to hit-test links, whose rects live in unrotated page space.
+pub fn unrotate_point(p: PointF, dest_w: f32, dest_h: f32, rot: u8) -> PointF {
+    match rot % 4 {
+        1 => PointF { x: p.y, y: dest_w - p.x },
+        2 => PointF { x: dest_w - p.x, y: dest_h - p.y },
+        3 => PointF { x: dest_h - p.y, y: p.x },
+        _ => p,
+    }
+}
+
 /// PDF-point rect (origin bottom-left, y up, top > bottom) -> window px rect.
 /// `page_rect` is where the page bitmap sits in the window (from `page_rect()`).
 pub fn pdf_rect_to_window(rect_pt: RectF, page_h_pt: f32, px_per_pt: f32, page_rect: RectF) -> RectF {
@@ -275,6 +288,45 @@ mod tests {
         let w = pdf_rect_to_window(link, 792.0, 2.0, pr);
         assert_eq!(w.left, 50.0 + 200.0);
         assert_eq!(w.top, 10.0 + (792.0 - 400.0) * 2.0);
+    }
+
+    // --- unrotate_point: inverse of the render-time clockwise rotation ---
+
+    #[test]
+    fn unrotate_maps_rotated_corners_back() {
+        // Unrotated bitmap: 100 wide, 200 tall. Take the point 10 px inside
+        // its top-left corner and check every rotation maps the corresponding
+        // rotated-frame point back onto it.
+        let want = pt(10.0, 10.0);
+        // rot 0: identity (dest dims = 100x200).
+        assert_eq!(unrotate_point(pt(10.0, 10.0), 100.0, 200.0, 0), want);
+        // rot 1 (90° CW): dest is 200x100; unrotated top-left lands at the
+        // dest's top-right. (x,y) -> (dest_w - y, x): (10,10) -> (190, 10).
+        assert_eq!(unrotate_point(pt(190.0, 10.0), 200.0, 100.0, 1), want);
+        // rot 2 (180°): dest is 100x200; (10,10) -> (90, 190).
+        assert_eq!(unrotate_point(pt(90.0, 190.0), 100.0, 200.0, 2), want);
+        // rot 3 (270° CW): dest is 200x100; (x,y) -> (y, dest_h - x): (10,10) -> (10, 90).
+        assert_eq!(unrotate_point(pt(10.0, 90.0), 200.0, 100.0, 3), want);
+    }
+
+    #[test]
+    fn unrotate_round_trips_through_forward_rotation() {
+        // Forward clockwise rotation of (x, y) in a wu x hu bitmap.
+        fn rot_fwd(p: PointF, wu: f32, hu: f32, rot: u8) -> PointF {
+            match rot % 4 {
+                1 => pt(hu - p.y, p.x),
+                2 => pt(wu - p.x, hu - p.y),
+                3 => pt(p.y, wu - p.x),
+                _ => p,
+            }
+        }
+        let (wu, hu) = (612.0, 792.0);
+        let p = pt(123.0, 456.0);
+        for rot in 0..4u8 {
+            let (dw, dh) = if rot % 2 == 1 { (hu, wu) } else { (wu, hu) };
+            let back = unrotate_point(rot_fwd(p, wu, hu, rot), dw, dh, rot);
+            assert!((back.x - p.x).abs() < 1e-4 && (back.y - p.y).abs() < 1e-4, "rot {rot}: {back:?}");
+        }
     }
 
     // --- hit_zone: corners take precedence over edges ---

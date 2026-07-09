@@ -1,6 +1,6 @@
 //! The PDF thread: owns ALL pdfium state; speaks PdfCmd in, PdfReply out.
 
-use crate::layout::{RectF, SizeU, MAX_RENDER_DIM};
+use crate::layout::{RectF, SizeU};
 use crate::types::{LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
 use pdfium_render::prelude::*;
 use std::path::{Path, PathBuf};
@@ -178,37 +178,37 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         // forever. When the load succeeds, the extra replies are harmless
         // (Loaded clears everything anyway).
         let mut load: Option<(PathBuf, Option<String>)> = None;
-        let mut visible: Option<(u16, SizeU)> = None;
-        let mut prefetch: Vec<(u16, SizeU)> = Vec::new();
+        let mut visible: Option<(u16, SizeU, u8)> = None;
+        let mut prefetch: Vec<(u16, SizeU, u8)> = Vec::new();
         let mut superseded: Vec<u16> = Vec::new();
         for cmd in batch {
             match cmd {
                 PdfCmd::Shutdown => break 'outer,
                 PdfCmd::Load { path, password } => {
-                    if let Some((old, _)) = visible.take() {
+                    if let Some((old, ..)) = visible.take() {
                         superseded.push(old);
                     }
-                    superseded.extend(prefetch.drain(..).map(|(page, _)| page));
+                    superseded.extend(prefetch.drain(..).map(|(page, ..)| page));
                     load = Some((path, password));
                 }
-                PdfCmd::Render { page, px, visible: true } => {
-                    if let Some((old, _)) = visible.replace((page, px)) {
+                PdfCmd::Render { page, px, rot, visible: true } => {
+                    if let Some((old, ..)) = visible.replace((page, px, rot)) {
                         superseded.push(old);
                     }
                 }
-                PdfCmd::Render { page, px, visible: false } => prefetch.push((page, px)),
+                PdfCmd::Render { page, px, rot, visible: false } => prefetch.push((page, px, rot)),
             }
         }
         // Dedup prefetches per page (keep the newest) and drop ones that
         // duplicate the visible page. Dropping silently is safe here only
         // because the surviving same-page request's reply clears the UI's
         // pending set by page.
-        let visible_page = visible.map(|(p, _)| p);
+        let visible_page = visible.map(|(p, ..)| p);
         let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
-        let mut kept: Vec<(u16, SizeU)> = Vec::new();
-        for &(page, px) in prefetch.iter().rev() {
+        let mut kept: Vec<(u16, SizeU, u8)> = Vec::new();
+        for &(page, px, rot) in prefetch.iter().rev() {
             if Some(page) != visible_page && seen.insert(page) {
-                kept.push((page, px));
+                kept.push((page, px, rot));
             }
         }
         kept.reverse();
@@ -244,9 +244,9 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             wake();
         }
 
-        let work: Vec<(u16, SizeU)> = visible.into_iter().chain(prefetch).collect();
+        let work: Vec<(u16, SizeU, u8)> = visible.into_iter().chain(prefetch).collect();
         let mut dropped_after: Option<usize> = None;
-        for (i, (page, px)) in work.iter().enumerate() {
+        for (i, (page, px, rot)) in work.iter().enumerate() {
             let Some(d) = &doc else {
                 // No document (e.g. the first-ever load failed): every
                 // remaining request still needs a reply or the UI's
@@ -254,7 +254,7 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 dropped_after = Some(i);
                 break;
             };
-            let _ = reply_tx.send(render_page(d, *page, *px));
+            let _ = reply_tx.send(render_page(d, *page, *px, *rot));
             wake();
             // Preempt: if new commands arrived mid-batch (e.g. a rapid page
             // flip), stop rendering stale work and loop around.
@@ -269,7 +269,7 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
             }
         }
         if let Some(from) = dropped_after {
-            for (page, _) in &work[from..] {
+            for (page, ..) in &work[from..] {
                 let _ = reply_tx
                     .send(PdfReply::RenderFailed { page: *page, reason: "superseded".into() });
             }
@@ -325,18 +325,32 @@ fn to_u16(i: PdfPageIndex) -> u16 {
     i.clamp(0, u16::MAX as i32) as u16
 }
 
-fn render_page(doc: &PdfDocument, page_idx: u16, px: SizeU) -> PdfReply {
+fn render_page(doc: &PdfDocument, page_idx: u16, px: SizeU, rot: u8) -> PdfReply {
     let page = match doc.pages().get(page_idx as PdfPageIndex) {
         Ok(p) => p,
         Err(e) => return PdfReply::RenderFailed { page: page_idx, reason: format!("{e:?}") },
     };
-    let config = PdfRenderConfig::new()
-        .set_target_size(px.w as Pixels, px.h as Pixels)
-        .set_maximum_width(MAX_RENDER_DIM as Pixels)
-        .set_maximum_height(MAX_RENDER_DIM as Pixels)
+    // set_fixed_size renders into a bitmap of EXACTLY px — for every
+    // rotation. This is load-bearing: set_target_size computes per-axis
+    // scales against the unrotated page and re-rounds them per axis, so at
+    // 90°/270° the output could drift several px from the request on
+    // high-aspect pages. wanted_renders() would never accept such a reply
+    // (SIZE_TOLERANCE) and would re-request forever — a render livelock.
+    // The caller caps px at MAX_RENDER_DIM (layout::render_size), so the
+    // auto-scaling maximum_width/height constraints aren't needed here.
+    let mut config = PdfRenderConfig::new()
+        .set_fixed_size(px.w as Pixels, px.h as Pixels)
         .set_format(PdfBitmapFormat::BGRA)
         // Default is true, which writes RGBA; Direct2D wants real BGRA.
         .set_reverse_byte_order(false);
+    if rot % 4 != 0 {
+        let rotation = match rot % 4 {
+            1 => PdfPageRenderRotation::Degrees90,
+            2 => PdfPageRenderRotation::Degrees180,
+            _ => PdfPageRenderRotation::Degrees270,
+        };
+        config = config.rotate(rotation, true);
+    }
     let bitmap = match page.render_with_config(&config) {
         Ok(b) => b,
         Err(e) => return PdfReply::RenderFailed { page: page_idx, reason: format!("{e:?}") },
@@ -361,6 +375,7 @@ fn render_page(doc: &PdfDocument, page_idx: u16, px: SizeU) -> PdfReply {
     PdfReply::Rendered {
         page: page_idx,
         px: SizeU { w: w as u32, h: h as u32 },
+        rot,
         bgra,
         links: extract_links(&page),
     }

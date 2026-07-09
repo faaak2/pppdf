@@ -24,9 +24,9 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F11,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
-    VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, VK_BACK, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_F1, VK_F11, VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, SHAppBarMessage, ShellExecuteW, HDROP,
@@ -267,6 +267,7 @@ impl Ui {
                     // Swallow it, resetting zoom instead (double-click on the
                     // caption-draggable page body resets to fit).
                     if wparam.0 as u32 == HTCAPTION {
+                        self.dismiss_goto_entry();
                         if self.app.reset_zoom() {
                             self.sync_renders();
                             self.invalidate();
@@ -353,6 +354,9 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_MOUSEWHEEL => {
+                    // Wheel navigation abandons a half-typed go-to-page entry —
+                    // the prompt must not sit open while pages flip under it.
+                    self.dismiss_goto_entry();
                     // Precision touchpads send many small deltas (±20-60); accumulate to
                     // whole 120-unit notches instead of truncating each event to zero.
                     let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -409,6 +413,8 @@ impl Ui {
                         self.invalidate();
                         return LRESULT(0);
                     }
+                    // A click also abandons the go-to-page entry (then acts normally).
+                    self.dismiss_goto_entry();
                     self.suppress_click = false;
                     let p = self.mouse_point(lparam);
                     let over_panel = self.app.doc().map_or(false, |d| {
@@ -463,6 +469,7 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDBLCLK => {
+                    self.dismiss_goto_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
                         self.sync_renders();
@@ -712,6 +719,30 @@ impl Ui {
             }
             return;
         }
+        // Go-to-page entry is modal like the password prompt: digits build the
+        // number, Enter jumps, Esc cancels, everything else is swallowed so a
+        // stray Space can't flip the page mid-entry.
+        if self.app.goto_entry_active() {
+            match vk {
+                _ if vk == VK_RETURN.0 => {
+                    if self.app.goto_entry_commit() {
+                        self.sync_renders();
+                        self.show_badge();
+                    }
+                }
+                _ if vk == VK_ESCAPE.0 => self.app.goto_entry_cancel(),
+                _ if vk == VK_BACK.0 => self.app.goto_entry_backspace(),
+                _ if (0x30..=0x39).contains(&vk) => {
+                    self.app.goto_entry_char((b'0' + (vk - 0x30) as u8) as char);
+                }
+                _ if (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&vk) => {
+                    self.app.goto_entry_char((b'0' + (vk - VK_NUMPAD0.0) as u8) as char);
+                }
+                _ => {}
+            }
+            self.invalidate();
+            return;
+        }
         if vk == VK_F1.0 {
             self.app.toggle_help();
             self.invalidate();
@@ -761,6 +792,24 @@ impl Ui {
                 // '0': reset to fit
                 if self.app.reset_zoom() {
                     self.sync_renders();
+                    self.invalidate();
+                }
+            }
+            // Plain letters only: Ctrl+R carries "reload" muscle memory from
+            // browsers — silently rotating (and resetting zoom) would surprise.
+            0x52 if !ctrl => {
+                // 'R': rotate the view 90° clockwise
+                if self.app.rotate_cw() {
+                    self.sync_renders();
+                    self.invalidate();
+                }
+            }
+            0x47 if !ctrl => {
+                // 'G': go to page — not while the TOC overlay is up (its own
+                // keys own the keyboard there)
+                if self.app.doc().is_some_and(|d| d.overlay.is_none())
+                    && self.app.goto_entry_start()
+                {
                     self.invalidate();
                 }
             }
@@ -862,7 +911,19 @@ impl Ui {
         }
     }
 
+    /// Close the go-to-page prompt if it is open. Mouse interaction and the
+    /// context menu abandon the entry (they could otherwise stack a second
+    /// modal — e.g. the TOC via the menu — on top of it, leaving the keyboard
+    /// owned by an invisible prompt).
+    fn dismiss_goto_entry(&mut self) {
+        if self.app.goto_entry_active() {
+            self.app.goto_entry_cancel();
+            self.invalidate();
+        }
+    }
+
     fn show_menu(&mut self, sx: i32, sy: i32) {
+        self.dismiss_goto_entry();
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("Open…\tCtrl+O"));
@@ -1086,7 +1147,12 @@ impl Ui {
     pub fn sync_renders(&mut self) {
         for req in self.app.wanted_renders() {
             self.app.mark_pending(&req);
-            self.send_pdf(PdfCmd::Render { page: req.page, px: req.px, visible: req.visible });
+            self.send_pdf(PdfCmd::Render {
+                page: req.page,
+                px: req.px,
+                rot: req.rot,
+                visible: req.visible,
+            });
         }
     }
 
@@ -1140,8 +1206,8 @@ impl Ui {
                     }
                     self.show_badge();
                 }
-                PdfReply::Rendered { page, px, bgra, links } => {
-                    self.app.rendered(crate::app::CachedPage { page, px, bgra, links });
+                PdfReply::Rendered { page, px, rot, bgra, links } => {
+                    self.app.rendered(crate::app::CachedPage { page, px, rot, bgra, links });
                 }
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");

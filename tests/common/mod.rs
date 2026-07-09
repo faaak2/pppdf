@@ -55,9 +55,29 @@ pub fn build_fixture_pdf() -> Vec<u8> {
         ),
     ];
 
+    serialize_pdf(&objs)
+}
+
+/// One 100x1000pt page (10:1 aspect, like a receipt or banner). Regression
+/// fixture for rotated rendering: high aspect ratios amplify any rounding
+/// drift between the requested and returned pixel sizes.
+pub fn build_tall_pdf() -> Vec<u8> {
+    fn stream_obj(content: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
+    }
+    let objs: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into()),
+        (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 1000] /Contents 4 0 R >>".into()),
+        (4, stream_obj("1 0 0 rg 10 900 80 80 re f")),
+    ];
+    serialize_pdf(&objs)
+}
+
+fn serialize_pdf(objs: &[(u32, String)]) -> Vec<u8> {
     let mut out = b"%PDF-1.7\n".to_vec();
     let mut offsets = vec![0usize; objs.len() + 1];
-    for (id, body) in &objs {
+    for (id, body) in objs {
         offsets[*id as usize] = out.len();
         out.extend_from_slice(format!("{id} 0 obj\n{body}\nendobj\n").as_bytes());
     }
@@ -82,5 +102,12 @@ pub fn build_fixture_pdf() -> Vec<u8> {
 pub fn fixture_path() -> std::path::PathBuf {
     let path = std::env::temp_dir().join("pppdf_fixture.pdf");
     std::fs::write(&path, build_fixture_pdf()).expect("write fixture pdf");
+    path
+}
+
+/// Write the tall 10:1 fixture to a temp file and return its path.
+pub fn tall_fixture_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("pppdf_tall_fixture.pdf");
+    std::fs::write(&path, build_tall_pdf()).expect("write tall fixture pdf");
     path
 }
