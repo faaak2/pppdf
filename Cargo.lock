@@ -292,7 +292,7 @@ checksum = "ad78bf43dcf80e8f950c92b84f938a0fc7590b7f6866fbcbeca781609c115590"
 
 [[package]]
 name = "pppdf"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "embed-manifest",
  "pdfium-render",
