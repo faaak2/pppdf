@@ -31,7 +31,7 @@ Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Type `Hello World`: text appears; Space typed a space (no page flip); G/R/0 type letters
 - [ ] Click the City dropdown: the popup list renders inside the page; click an option: it's selected
 - [ ] Married checkbox toggles on click; Gender radios are mutually exclusive
-- [ ] Tab cycles fields top-to-bottom; Shift+Tab reverses
+- [ ] Tab cycles fields top-to-bottom; Shift+Tab reverses; passing over checkboxes/radios must NOT toggle them
 - [ ] Esc leaves the field (caret gone)
 - [ ] Ctrl+wheel zoom in, click a field while zoomed: caret lands where clicked; R rotate, type again: still correct
 - [ ] Wheel over the page in typing mode: leaves the field, flips the page

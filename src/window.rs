@@ -97,6 +97,11 @@ pub struct Ui {
     /// instead of showing the "Saved" toast.
     #[cfg(feature = "pro")]
     pub pending_close: bool,
+    /// Pro: a SaveDoc has been dispatched and its Saved reply hasn't arrived.
+    /// quit() defers while set — destroying the window exits the process and
+    /// would kill the detached PDF thread possibly mid-write.
+    #[cfg(feature = "pro")]
+    pub save_inflight: bool,
     /// Free: the one-per-run "Pro feature" hint has been shown.
     #[cfg(not(feature = "pro"))]
     pub hint_shown: bool,
@@ -148,6 +153,8 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             form_mouse: false,
             #[cfg(feature = "pro")]
             pending_close: false,
+            #[cfg(feature = "pro")]
+            save_inflight: false,
             #[cfg(not(feature = "pro"))]
             hint_shown: false,
         });
@@ -1051,6 +1058,17 @@ impl Ui {
     }
 
     fn quit(&mut self) {
+        // A save is in flight: destroying the window now would exit the
+        // process, killing the detached PDF thread possibly mid-write. Defer
+        // the close until the save resolves — Saved(Ok)+pending_close
+        // destroys the window (or re-runs this gate if new edits landed
+        // meanwhile), Saved(Err)+pending_close clears it and stays open with
+        // the error box. Exactly the semantics wanted here.
+        #[cfg(feature = "pro")]
+        if self.save_inflight {
+            self.pending_close = true;
+            return;
+        }
         #[cfg(feature = "pro")]
         if self.app.form_dirty && self.app.doc().is_some() {
             let choice = unsafe {
@@ -1410,13 +1428,14 @@ impl Ui {
         }
     }
 
-    /// Synthesize a click at a PDF-point to move focus (Tab cycling).
+    /// Move focus to the next field's center (Tab cycling). Uses FORM_OnFocus
+    /// — focus WITHOUT button events — because a synthesized MouseDown/Up
+    /// pair is a real click: on a checkbox/radio it would TOGGLE the widget
+    /// as Tab passes over it. Focusing mutates nothing (no dirty-marking).
     #[cfg(feature = "pro")]
     fn form_tab(&mut self, backwards: bool) {
         if let Some(pt) = self.app.form_tab_target(backwards) {
-            let m = Self::form_modifiers() & !1; // strip Shift: it selects text
-            self.send_form(crate::types::FormEvent::MouseDown { x: pt.x, y: pt.y, modifiers: m });
-            self.send_form(crate::types::FormEvent::MouseUp { x: pt.x, y: pt.y, modifiers: m });
+            self.send_form(crate::types::FormEvent::Focus { x: pt.x, y: pt.y });
             self.app.form_focus = true;
         }
     }
@@ -1449,6 +1468,7 @@ impl Ui {
         // correction -> Saved(Ok) clears -> Alt+F4 closes silently, the
         // correction lost). Saved(Err) restores the flag.
         self.app.form_dirty = false;
+        self.save_inflight = true; // quit() defers until the Saved reply
         self.send_pdf(PdfCmd::SaveDoc);
     }
 
@@ -1566,6 +1586,7 @@ impl Ui {
                 #[cfg(feature = "pro")]
                 PdfReply::Saved { result } => match result {
                     Ok(()) => {
+                        self.save_inflight = false;
                         // form_dirty was cleared when the save was DISPATCHED
                         // (save_doc) and must NOT be cleared here: if it is
                         // set again, the user edited while the save was in
@@ -1595,6 +1616,7 @@ impl Ui {
                         self.show_toast("Saved".into());
                     }
                     Err(e) => {
+                        self.save_inflight = false;
                         // Unsaved changes definitely exist — restore the flag
                         // that save_doc cleared optimistically at dispatch.
                         self.app.form_dirty = true;

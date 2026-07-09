@@ -167,6 +167,11 @@ impl FormEngine {
                     wide.push(0);
                     b.FORM_ReplaceSelection(self.form, h, wide.as_ptr());
                 }
+                FormEvent::Focus { x, y } => {
+                    // Focuses the annotation at the point WITHOUT button
+                    // events — never toggles a checkbox/radio (Tab cycling).
+                    b.FORM_OnFocus(self.form, h, 0, x as f64, y as f64);
+                }
                 FormEvent::KillFocus => {
                     b.FORM_ForceToKillFocus(self.form);
                 }

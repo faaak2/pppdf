@@ -56,6 +56,9 @@ pub enum FormEvent {
     KeyDown { vk: u16, modifiers: i32 },
     /// Ctrl+V: replace the focused field's selection with clipboard text.
     ReplaceSelection { text: String },
+    /// Move form focus to the annotation at a point WITHOUT button events —
+    /// Tab cycling must never click (and thus toggle) the widgets it passes.
+    Focus { x: f32, y: f32 },
     KillFocus,
 }
 
