@@ -1168,12 +1168,18 @@ fn load_kills_the_scan_without_a_done() {
             _ => {}
         }
     }
-    match reply_rx.recv_timeout(Duration::from_millis(500)) {
-        Err(_) => {} // silence: correct
-        Ok(PdfReply::SearchHits { .. }) | Ok(PdfReply::SearchDone { .. }) => {
-            panic!("no search replies may straggle after the Load")
+    // Drain a settling window: no search reply may straggle after the Load
+    // (benign stragglers like a late RenderFailed{"superseded"} are fine).
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match reply_rx.recv_timeout(left) {
+            Err(_) => break, // silence: correct
+            Ok(PdfReply::SearchHits { .. }) | Ok(PdfReply::SearchDone { .. }) => {
+                panic!("no search replies may straggle after the Load")
+            }
+            Ok(_) => {}
         }
-        Ok(_) => {} // e.g. a late RenderFailed{"superseded"} is fine
     }
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
