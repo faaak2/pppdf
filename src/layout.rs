@@ -106,6 +106,41 @@ pub fn zoom_scroll(
     clamp_scroll(new_page_px, client, PointF { x: want_x, y: want_y })
 }
 
+/// Minimal scroll change that brings `target` — a rect in WINDOW space as
+/// drawn under the input `scroll` — fully into the viewport with a comfort
+/// `margin` on every side. No-op when it is already fully visible. A rect
+/// larger than the viewport aligns its left/top edge to the margin (the
+/// start of the content is what the user is looking for). The result passes
+/// through `clamp_scroll`, so axes where the page fits snap to 0.
+pub fn scroll_to_reveal(
+    scroll: PointF,
+    target: RectF,
+    page_px: SizeU,
+    client: SizeU,
+    margin: f32,
+) -> PointF {
+    // Increasing scroll.x moves the page (and the target rect) LEFT in the
+    // window, so a rect off the right edge needs scroll += overshoot.
+    let reveal_axis = |scroll: f32, lo: f32, hi: f32, extent: f32| -> f32 {
+        let (min, max) = (margin, extent - margin);
+        if hi - lo > max - min {
+            // Oversized: align the start edge to the margin.
+            scroll + (lo - min)
+        } else if lo < min {
+            scroll - (min - lo)
+        } else if hi > max {
+            scroll + (hi - max)
+        } else {
+            scroll
+        }
+    };
+    let want = PointF {
+        x: reveal_axis(scroll.x, target.left, target.right, client.w as f32),
+        y: reveal_axis(scroll.y, target.top, target.bottom, client.h as f32),
+    };
+    clamp_scroll(page_px, client, want)
+}
+
 /// Map a point inside a ROTATED page bitmap (coords relative to its top-left,
 /// `dest_w`/`dest_h` = the rotated bitmap's size) back into the unrotated
 /// bitmap's frame. `rot` = clockwise quarter-turns applied at render time.
@@ -422,5 +457,79 @@ mod tests {
         let r = RectF { left: 0.0, top: 0.0, right: 10.0, bottom: 10.0 };
         assert!(r.contains(pt(0.0, 0.0)));
         assert!(!r.contains(pt(10.0, 5.0)));
+    }
+
+    // --- scroll_to_reveal: minimal scroll bringing a rect into view ---
+
+    #[test]
+    fn reveal_noop_when_already_visible() {
+        let client = sz(1000, 1000);
+        let page = sz(3000, 3000);
+        let scroll = pt(500.0, 500.0);
+        let target = RectF { left: 200.0, top: 200.0, right: 400.0, bottom: 300.0 };
+        assert_eq!(scroll_to_reveal(scroll, target, page, client, 48.0), scroll);
+    }
+
+    #[test]
+    fn reveal_scrolls_right_and_down_minimally() {
+        let client = sz(1000, 1000);
+        let page = sz(3000, 3000);
+        let scroll = pt(0.0, 0.0);
+        // Off the right/bottom edges: right = 1200 > 1000 - 48, bottom = 1100.
+        let target = RectF { left: 1100.0, top: 1050.0, right: 1200.0, bottom: 1100.0 };
+        let s = scroll_to_reveal(scroll, target, page, client, 48.0);
+        // Minimal: bring right edge to client.w - margin, bottom to client.h - margin.
+        assert!((s.x - (1200.0 - (1000.0 - 48.0))).abs() < 1e-3, "x: {}", s.x);
+        assert!((s.y - (1100.0 - (1000.0 - 48.0))).abs() < 1e-3, "y: {}", s.y);
+    }
+
+    #[test]
+    fn reveal_scrolls_left_and_up_minimally() {
+        let client = sz(1000, 1000);
+        let page = sz(3000, 3000);
+        let scroll = pt(800.0, 800.0);
+        // Off the left/top edges (negative window coords).
+        let target = RectF { left: -100.0, top: -50.0, right: 20.0, bottom: 0.0 };
+        let s = scroll_to_reveal(scroll, target, page, client, 48.0);
+        // left must land at margin: new.x = 800 - (48 - (-100)) = 652.
+        assert!((s.x - 652.0).abs() < 1e-3, "x: {}", s.x);
+        assert!((s.y - 702.0).abs() < 1e-3, "y: {}", s.y);
+    }
+
+    #[test]
+    fn reveal_result_is_clamped() {
+        let client = sz(1000, 1000);
+        let page = sz(1200, 1200); // max scroll 200
+        let scroll = pt(0.0, 0.0);
+        let target = RectF { left: 5000.0, top: 5000.0, right: 5100.0, bottom: 5050.0 };
+        let s = scroll_to_reveal(scroll, target, page, client, 48.0);
+        assert_eq!(s, pt(200.0, 200.0), "must clamp to the overhang");
+    }
+
+    #[test]
+    fn reveal_oversized_rect_aligns_start_edge() {
+        let client = sz(1000, 1000);
+        let page = sz(5000, 5000);
+        let scroll = pt(0.0, 0.0);
+        // Wider AND taller than the viewport: align left/top to margin.
+        let target = RectF { left: 2000.0, top: 2000.0, right: 3500.0, bottom: 3500.0 };
+        let s = scroll_to_reveal(scroll, target, page, client, 48.0);
+        assert!((s.x - (2000.0 - 48.0)).abs() < 1e-3, "x: {}", s.x);
+        assert!((s.y - (2000.0 - 48.0)).abs() < 1e-3, "y: {}", s.y);
+    }
+
+    #[test]
+    fn reveal_snaps_to_zero_on_fitting_axis() {
+        let client = sz(1000, 1000);
+        let page = sz(800, 3000); // x fits: clamp snaps x to 0
+        let s = scroll_to_reveal(
+            pt(0.0, 0.0),
+            RectF { left: 100.0, top: 2000.0, right: 200.0, bottom: 2100.0 },
+            page,
+            client,
+            48.0,
+        );
+        assert_eq!(s.x, 0.0);
+        assert!(s.y > 0.0);
     }
 }
