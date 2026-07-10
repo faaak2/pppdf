@@ -81,15 +81,37 @@ Add to `PdfReply` (after `RenderFailed`, before the Pro-gated `FormDirty`):
     SearchDone { id: u32 },
 ```
 
-- [ ] **Step 2: Verify both editions compile**
+- [ ] **Step 2: Stub the two exhaustive matches so both editions keep compiling**
+
+Two existing `match`es are exhaustive over these enums and would fail with
+E0004 the moment the variants exist. Add **named placeholder arms** (never
+`_` catch-alls — future variants must keep exhaustiveness protection):
+
+1. `src/pdf.rs`, in the coalescer's `match cmd` (inside `run()`), after the
+`PdfCmd::Render { .., visible: false }` arm:
+
+```rust
+                // Placeholder: replaced wholesale by the scan-engine task.
+                PdfCmd::Search { .. } | PdfCmd::CancelSearch => {}
+```
+
+2. `src/window.rs`, in `pump_pdf_replies`' `match reply`, after the
+`PdfReply::RenderFailed { .. }` arm:
+
+```rust
+                // Placeholder: replaced wholesale by the window-wiring task.
+                PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {}
+```
+
+- [ ] **Step 3: Verify both editions compile**
 
 Run: `cargo build` then `cargo build --features pro`
-Expected: both succeed (warnings about unused variants are acceptable until later tasks consume them — if `-D warnings` style failures appear, add `#[allow(dead_code)]` on nothing; enum variants don't trigger dead_code when the enum is pub).
+Expected: both succeed with no new warnings.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/types.rs
+git add src/types.rs src/pdf.rs src/window.rs
 git commit -m "feat(search): add Search/CancelSearch commands and SearchHits/SearchDone replies"
 ```
 
@@ -425,8 +447,12 @@ impl SearchState {
     }
 
     /// Ctrl+V. Control chars (incl. newlines) are stripped; the cap applies.
+    /// An armed replace that ends up appending nothing (control-only
+    /// clipboard) still cleared the query and MUST route through edited()
+    /// so the stale results are cleared and a CancelSearch goes out.
     pub fn paste(&mut self, text: &str) -> QueryEffect {
-        if std::mem::take(&mut self.replace_on_type) {
+        let replaced = std::mem::take(&mut self.replace_on_type);
+        if replaced {
             self.query.clear();
         }
         let mut appended = false;
@@ -437,7 +463,7 @@ impl SearchState {
             self.query.push(c);
             appended = true;
         }
-        if appended {
+        if appended || replaced {
             self.edited()
         } else {
             QueryEffect::Nothing
@@ -699,6 +725,20 @@ mod tests {
     }
 
     #[test]
+    fn armed_paste_of_only_control_chars_clears_and_cancels() {
+        // Regression: an armed replace clears the query even when the
+        // clipboard held nothing printable — the old query's results must
+        // not survive under an empty "Find: _" bar.
+        let mut st = SearchState::new(Some(("dragon".into(), SearchOptions::default())));
+        st.begin_scan(1);
+        st.hits(1, 0, m(2));
+        assert_eq!(st.paste("\r\n"), QueryEffect::Cancel);
+        assert_eq!(st.query, "");
+        assert_eq!(st.total(), 0, "stale highlights must be gone");
+        assert!(!st.scanning);
+    }
+
+    #[test]
     fn replace_on_type_first_char_replaces_backspace_clears() {
         let mut st = SearchState::new(Some(("dragon".into(), SearchOptions::default())));
         assert!(st.replace_on_type, "restored query arms replace");
@@ -911,7 +951,9 @@ mod tests {
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib search::`
-Expected: all pass (17 tests). Then `cargo test --lib` and `cargo test --lib --features pro` — all green.
+Expected: every test in `search::tests` passes (do not anchor on a specific
+count). Then `cargo test --lib` and `cargo test --lib --features pro` — all
+green.
 
 - [ ] **Step 6: Commit**
 
@@ -1394,6 +1436,50 @@ pub fn text_fixture_path() -> std::path::PathBuf {
     std::fs::write(&path, build_text_pdf()).expect("write text fixture pdf");
     path
 }
+
+/// A WIDE fixture for genuinely-mid-scan tests: `n` pages, a "dragon" hit
+/// on page 0 only. The first SearchHits arrives almost immediately while
+/// the scan still has n-1 pages to cover — long enough (at 200 pages,
+/// hundreds of ms) that a CancelSearch sent after that first hit reliably
+/// lands mid-scan. Object layout: 1 catalog, 2 pages, 3..3+n page objects,
+/// 3+n..3+2n content streams, 3+2n the font — contiguous ids, as
+/// serialize_pdf's xref builder requires.
+pub fn build_wide_text_pdf(n: u32) -> Vec<u8> {
+    fn stream_obj(content: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
+    }
+    let font_id = 3 + 2 * n;
+    let kids: String =
+        (0..n).map(|i| format!("{} 0 R", 3 + i)).collect::<Vec<_>>().join(" ");
+    let mut objs: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+        (2, format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>")),
+    ];
+    for i in 0..n {
+        objs.push((
+            3 + i,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R \
+                 /Resources << /Font << /F1 {font_id} 0 R >> >> >>",
+                3 + n + i
+            ),
+        ));
+    }
+    for i in 0..n {
+        let text =
+            if i == 0 { "Here be a dragon".to_string() } else { format!("Filler page {i}") };
+        objs.push((3 + n + i, stream_obj(&format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET"))));
+    }
+    objs.push((font_id, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()));
+    serialize_pdf(&objs)
+}
+
+/// Write the 200-page wide fixture to a temp file and return its path.
+pub fn wide_text_fixture_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("pppdf_wide_text_fixture.pdf");
+    std::fs::write(&path, build_wide_text_pdf(200)).expect("write wide text fixture pdf");
+    path
+}
 ```
 
 - [ ] **Step 2: Write the failing integration tests**
@@ -1421,7 +1507,13 @@ fn collect_hits(
 fn search_streams_hits_in_wrap_order_with_sane_rects() {
     let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
-    let cmd_tx = pdf::spawn(reply_tx, || {});
+    // Counting wake closure: every search reply must be followed by wake(),
+    // or the UI counter freezes until an unrelated message arrives.
+    let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = std::sync::Arc::clone(&wakes);
+    let cmd_tx = pdf::spawn(reply_tx, move || {
+        w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
     cmd_tx.send(PdfCmd::Load { path: common::text_fixture_path(), password: None }).unwrap();
     match reply_rx.recv_timeout(WAIT).unwrap() {
         PdfReply::Loaded { pages, .. } => assert_eq!(pages, 3),
@@ -1438,6 +1530,13 @@ fn search_streams_hits_in_wrap_order_with_sane_rects() {
         })
         .unwrap();
     let hits = collect_hits(&reply_rx, 1);
+    // 1 Loaded + 2 SearchHits + 1 SearchDone have been received: at least
+    // that many wakes must have fired (a missing Hits/Done wake shows here).
+    assert!(
+        wakes.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+        "every search reply must be sent with wake(): {} wakes",
+        wakes.load(std::sync::atomic::Ordering::Relaxed)
+    );
     let pages: Vec<u16> = hits.iter().map(|(p, _)| *p).collect();
     assert_eq!(pages, vec![0, 2]);
     assert_eq!(hits[0].1.len(), 2, "two 'dragon' hits on page 0");
@@ -1516,7 +1615,10 @@ fn search_honors_case_and_whole_word_options() {
 - [ ] **Step 3: Run to verify they fail**
 
 Run: `cargo test --test pdf_integration search_streams`
-Expected: FAIL — the worker never answers (`SearchDone` never arrives → "search reply before timeout" panic), since pdf.rs ignores the new commands. (If instead it fails to compile because pdf.rs's `match cmd` is non-exhaustive over the new variants — that is the same missing implementation.)
+Expected: FAIL — the worker's Task-1 placeholder arm silently swallows
+`Search`, so `SearchDone` never arrives and `collect_hits` panics on the
+20-second `WAIT` timeout ("search reply before timeout"). That timeout
+panic IS the expected red state.
 
 - [ ] **Step 4: Implement the scan engine in pdf.rs**
 
@@ -1623,7 +1725,8 @@ scans one page when no command is waiting:
         let mut queued_search: Option<ScanState> = None;
 ```
 
-— and two arms inside the `match cmd` (after the `Render { .., visible: false }` arm):
+— and **REPLACE the Task-1 placeholder arm**
+(`PdfCmd::Search { .. } | PdfCmd::CancelSearch => {}`) with these two arms:
 
 ```rust
                 PdfCmd::Search { id, query, options, start_page } => {
@@ -1772,10 +1875,14 @@ git commit -m "feat(search): streaming per-page scan on the pdf worker + text fi
 - Test: `tests/pdf_integration.rs` (additions only, plus any pdf.rs fixes they force)
 
 **Interfaces:**
-- Consumes: everything from Task 5. The "busy render" trick makes batch
-  grouping deterministic: a large visible render (1224×1584) takes long
-  enough that commands sent immediately after it are drained into ONE
-  later batch.
+- Consumes: everything from Task 5, plus `common::wide_text_fixture_path()`
+  (Task 5's 200-page fixture). The "busy render" trick makes batch grouping
+  deterministic: a large visible render (1224×1584) takes long enough that
+  commands sent immediately after it are drained into ONE later batch.
+  Note the coverage split: the burst tests exercise the ORDER-SENSITIVE
+  COALESCING of scans that are still queued; `cancel_lands_mid_scan_on_a_
+  wide_document` is the one that kills a scan which is provably ACTIVE
+  (streaming) — both paths of the spec's kill rules.
 
 - [ ] **Step 1: Write the tests**
 
@@ -1930,6 +2037,52 @@ fn load_kills_the_scan_without_a_done() {
 }
 
 #[test]
+fn cancel_lands_mid_scan_on_a_wide_document() {
+    // The burst tests above kill the scan while it is still QUEUED (one
+    // batch). This one cancels a scan that is provably ACTIVE: the wide
+    // fixture's only hit is on page 0, so the first SearchHits arrives
+    // while ~199 pages are still unscanned (hundreds of ms of work) — the
+    // CancelSearch sent after it reliably lands mid-scan and exercises the
+    // `active_search = None` path.
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::wide_text_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { pages, .. } => assert_eq!(pages, 200),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx.send(dragon_search(20)).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::SearchHits { id: 20, page: 0, .. } => {}
+        other => panic!("expected the page-0 hit first, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::CancelSearch).unwrap();
+    // Settle window: the cancelled scan must go silent — in particular, NO
+    // SearchDone{20} (a Done arriving here would mean the scan outran the
+    // cancel; if this ever flakes, widen the fixture, never add sleeps).
+    loop {
+        match reply_rx.recv_timeout(Duration::from_millis(600)) {
+            Err(_) => break, // silence: cancelled
+            Ok(PdfReply::SearchHits { .. }) | Ok(PdfReply::SearchDone { .. }) => {
+                panic!("cancelled ACTIVE scan must produce no further search replies")
+            }
+            Ok(_) => {}
+        }
+    }
+    // The worker is still alive and serving.
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { page: 0, .. } => {}
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
 fn renders_take_priority_over_an_active_scan() {
     let _pdfium = pdfium_lock();
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -1988,7 +2141,11 @@ There are no unit tests for this task (window.rs needs a real HWND); all
 logic already lives tested in search.rs/app.rs. Verification is: both
 editions compile, the full test suites stay green, and the Task 9 manual
 checklist covers the UX. Keep every branch THIN — anything conditional
-beyond routing belongs in search.rs/app.rs instead.
+beyond routing belongs in search.rs/app.rs instead. One conscious coverage
+decision: the spec's "stash-restore re-issue rule" names an app.rs unit
+test, but the re-issue lives here (`resync_open_search`, a two-line shim
+over tested code) — it is covered by the app.rs stash-survival test plus
+the password-stash manual row, not by a window.rs unit test.
 
 - [ ] **Step 1: Import VK_F3 and un-gate clipboard_text**
 
@@ -2103,6 +2260,12 @@ Add these methods to the second `impl Ui` block (after `form_paste`/`save_doc`, 
     /// load over an open doc) re-issues an open search with a fresh id: the
     /// Load that displaced the doc killed its scan WITHOUT a SearchDone, so
     /// the restored `scanning` flag would otherwise spin forever.
+    ///
+    /// password_take (Enter with a typed password) ALSO restores the stash,
+    /// but deliberately does NOT resync: the retry Load it sends right after
+    /// would kill the fresh scan immediately, and every continuation repairs
+    /// the stale flag anyway — Loaded rebuilds DocState, LoadFailed lands in
+    /// the resync below, NeedsPassword re-stashes until a cancel does.
     fn resync_open_search(&mut self) {
         if self.app.search_active() {
             self.sync_search();
@@ -2264,6 +2427,10 @@ owns the keyboard.)
 
 - [ ] **Step 5: Alt+C / Alt+W toggles in WM_SYSKEYDOWN**
 
+(The toast below is a deliberate house-convention addition beyond the spec
+— the 'F' field-indication cycle toasts its mode the same way; the spec's
+own feedback is the bar's lit `Aa`/`W` indicators, which Task 8 draws.)
+
 Extend the WM_SYSKEYDOWN handler's `if/else` chain — after the two
 Alt+arrow branches, before the final `else`:
 
@@ -2305,8 +2472,9 @@ Alt+arrow branches, before the final `else`:
 
 - [ ] **Step 6: Reply pumping and the restore-resync rule**
 
-1. In `pump_pdf_replies`, add two arms after the `RenderFailed` arm (shared,
-no cfg):
+1. In `pump_pdf_replies`, **REPLACE the Task-1 placeholder arm**
+(`PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {}`) with
+these two arms (shared, no cfg):
 
 ```rust
                 PdfReply::SearchHits { id, page, matches } => {
