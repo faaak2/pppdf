@@ -25,8 +25,8 @@ use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_BACK, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_F1, VK_F11, VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT,
-    VK_SPACE, VK_TAB, VK_UP,
+    VK_F1, VK_F11, VK_F3, VK_HOME, VK_LEFT, VK_NEXT, VK_NUMPAD0, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 // Pro-only VKs: typing mode forwards these to the form. Free build never
 // references them, so gate the import to keep it warning-free.
@@ -487,6 +487,18 @@ impl Ui {
                         self.invalidate();
                         return LRESULT(0);
                     }
+                    // Clicks on the find bar are a no-op (keyboard-only UI):
+                    // swallow them so they don't fall through to fields,
+                    // links, or a pan-drag underneath the bar.
+                    {
+                        let p = self.mouse_point(lparam);
+                        if self.app.search_active()
+                            && crate::search::bar_rect(self.app.client, self.dpi_scale())
+                                .contains(p)
+                        {
+                            return LRESULT(0);
+                        }
+                    }
                     // A click also abandons the go-to-page entry (then acts normally).
                     self.dismiss_goto_entry();
                     // Form fields win over links and window dragging.
@@ -884,6 +896,38 @@ impl Ui {
                     } else if alt && vk == VK_RIGHT.0 {
                         self.nav_forward();
                         LRESULT(0)
+                    } else if alt && (vk == 0x43 || vk == 0x57) && self.app.search_active() {
+                        // Alt+C / Alt+W: match-case / whole-word toggles.
+                        let eff = self.app.doc_mut().and_then(|d| d.search.as_mut()).map(|st| {
+                            if vk == 0x43 {
+                                st.toggle_case()
+                            } else {
+                                st.toggle_word()
+                            }
+                        });
+                        let on = self.app.doc().and_then(|d| d.search.as_ref()).map_or(
+                            false,
+                            |st| {
+                                if vk == 0x43 {
+                                    st.options.match_case
+                                } else {
+                                    st.options.whole_word
+                                }
+                            },
+                        );
+                        self.show_toast(
+                            match (vk, on) {
+                                (0x43, true) => "Match case: on",
+                                (0x43, false) => "Match case: off",
+                                (_, true) => "Whole words: on",
+                                (_, false) => "Whole words: off",
+                            }
+                            .into(),
+                        );
+                        if let Some(eff) = eff {
+                            self.apply_search_effect(eff);
+                        }
+                        LRESULT(0)
                     } else {
                         DefWindowProcW(self.hwnd, msg, wparam, lparam)
                     }
@@ -952,6 +996,29 @@ impl Ui {
                             _ => {}
                         }
                         self.invalidate();
+                    }
+                    // Find bar: the first shared-code WM_CHAR consumer. One
+                    // filter (`!ctrl && c >= 0x20`) drops Enter/Tab/Esc/
+                    // Backspace chars and the control BYTES Ctrl chords
+                    // produce (Ctrl+F=0x06 etc.); char::from_u32 rejects
+                    // unpaired surrogate halves, so input is BMP-only —
+                    // the password path's existing limitation.
+                    if self.app.search_active() {
+                        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                        let c32 = wparam.0 as u32;
+                        if !ctrl && c32 >= 0x20 {
+                            if let Some(c) = char::from_u32(c32) {
+                                let eff = self
+                                    .app
+                                    .doc_mut()
+                                    .and_then(|d| d.search.as_mut())
+                                    .map(|st| st.push_char(c));
+                                if let Some(eff) = eff {
+                                    self.apply_search_effect(eff);
+                                }
+                            }
+                        }
+                        return LRESULT(0);
                     }
                     LRESULT(0)
                 }
@@ -1036,6 +1103,11 @@ impl Ui {
             if self.app.field_at(p).is_some() {
                 return true; // form fields: pro types into them, free shows the hint
             }
+            if d.search.is_some()
+                && crate::search::bar_rect(self.app.client, self.dpi_scale()).contains(p)
+            {
+                return true; // clicks on the find bar must not drag the window
+            }
         }
         false
     }
@@ -1045,6 +1117,9 @@ impl Ui {
             if vk == VK_ESCAPE.0 {
                 // Restores the stashed doc if one was open, else Empty.
                 self.app.password_cancel();
+                // The Load that displaced the doc killed its scan without a
+                // SearchDone — re-issue so `scanning` can't spin forever.
+                self.resync_open_search();
                 self.sync_renders();
                 self.invalidate();
             }
@@ -1076,6 +1151,12 @@ impl Ui {
                 }
                 _ if (VK_NUMPAD0.0..=VK_NUMPAD0.0 + 9).contains(&vk) => {
                     self.app.goto_entry_char((b'0' + (vk - VK_NUMPAD0.0) as u8) as char);
+                }
+                _ if vk == 0x46 && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
+                    // Ctrl+F cancels the half-typed goto prompt and opens
+                    // the find bar (they must not stack).
+                    self.app.goto_entry_cancel();
+                    self.search_open_ui();
                 }
                 _ => {}
             }
@@ -1122,8 +1203,20 @@ impl Ui {
                 }
                 0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
                 0x53 if ctrl => self.save_doc(), // Ctrl+S
+                0x46 if ctrl => {
+                    // Ctrl+F leaves the field (commit) and opens the find bar.
+                    self.form_kill_focus();
+                    self.search_open_ui();
+                }
                 _ => {} // printable keys arrive via WM_CHAR
             }
+            return;
+        }
+        // Find bar (persistent, semi-modal): position matters — a clicked
+        // form field wins the keyboard (the rung above), and the bar
+        // shadows the global plain-key shortcuts below (G/R/F/0/Space type
+        // into the query via WM_CHAR).
+        if self.search_key(vk) {
             return;
         }
         if vk == VK_F1.0 {
@@ -1184,6 +1277,21 @@ impl Ui {
                     self.nav_back();
                 }
             }
+            _ if vk == VK_F3.0 => {
+                // F3 with the bar closed: reopen the last query and jump to
+                // its first hit when it arrives. With no remembered query
+                // this just opens an empty bar (no scan, no pending jump).
+                if self.app.doc().is_some() {
+                    self.search_open_ui();
+                    if let Some(st) = self.app.doc_mut().and_then(|d| d.search.as_mut()) {
+                        if st.legal() {
+                            // Set AFTER search_open_ui's sync_search reset.
+                            st.pending_jump = true;
+                        }
+                    }
+                    self.invalidate();
+                }
+            }
             _ if vk == 0x30 || vk == VK_NUMPAD0.0 => {
                 // '0': reset to fit
                 if self.app.reset_zoom() {
@@ -1209,6 +1317,7 @@ impl Ui {
                     self.invalidate();
                 }
             }
+            0x46 if ctrl => self.search_open_ui(), // Ctrl+F: find in the book
             // 'F': cycle how form widgets are marked (highlight / dotted
             // frames / off). Only meaningful on a form-bearing document —
             // on anything else the key stays inert (no confusing toast).
@@ -1723,6 +1832,173 @@ impl Ui {
         self.send_pdf(PdfCmd::SaveDoc);
     }
 
+    // --- text search (Ctrl+F find bar) ---
+
+    /// Open the find bar (Ctrl+F / F3): closes the TOC panel first — the
+    /// bar owns Enter/arrows while open, and a keyboard-dead panel is worse
+    /// than a closed one (same courtesy as cancelling the goto prompt).
+    /// Re-issues the remembered query's scan when the bar newly opens.
+    fn search_open_ui(&mut self) {
+        if self.app.doc().is_none() {
+            return;
+        }
+        if let Some(d) = self.app.doc_mut() {
+            d.overlay = None;
+        }
+        let was_active = self.app.search_active();
+        if self.app.search_open() {
+            if !was_active {
+                self.sync_search();
+            }
+            self.invalidate();
+        }
+    }
+
+    /// Close the bar, remembering the query (Esc path).
+    fn search_close_ui(&mut self) {
+        if self.app.search_close() {
+            self.send_pdf(PdfCmd::CancelSearch);
+            self.invalidate();
+        }
+    }
+
+    /// Issue the scan matching the bar's current query, or cancel when it
+    /// is illegal (< 2 chars). The single choke point every query mutation
+    /// funnels through — begin_scan's atomic reset is what keeps a new
+    /// query's results from merging with the old ones.
+    fn sync_search(&mut self) {
+        let Some((current, legal)) = self
+            .app
+            .doc()
+            .and_then(|d| d.search.as_ref().map(|st| (d.current, st.legal())))
+        else {
+            return;
+        };
+        if legal {
+            let id = self.app.next_search_id();
+            let payload = self.app.doc_mut().and_then(|d| d.search.as_mut()).map(|st| {
+                st.begin_scan(id);
+                (st.query.clone(), st.options)
+            });
+            if let Some((query, options)) = payload {
+                self.send_pdf(PdfCmd::Search { id, query, options, start_page: current });
+            }
+        } else {
+            if let Some(st) = self.app.doc_mut().and_then(|d| d.search.as_mut()) {
+                st.clear_results();
+            }
+            self.send_pdf(PdfCmd::CancelSearch);
+        }
+    }
+
+    /// Apply a QueryEffect returned by a bar edit/toggle.
+    fn apply_search_effect(&mut self, eff: crate::search::QueryEffect) {
+        match eff {
+            crate::search::QueryEffect::Rescan => self.sync_search(),
+            // clear_results already ran inside SearchState (edited()).
+            crate::search::QueryEffect::Cancel => self.send_pdf(PdfCmd::CancelSearch),
+            crate::search::QueryEffect::Nothing => {}
+        }
+        self.invalidate();
+    }
+
+    /// Enter / Shift+Enter / F3 / Shift+F3 while the bar is open.
+    fn search_step_ui(&mut self, backward: bool) {
+        let step = match self.app.doc_mut().and_then(|d| d.search.as_mut()) {
+            Some(st) => st.step(backward),
+            None => return,
+        };
+        match step {
+            crate::search::Step::Jump(page, idx) => self.search_jump(page, idx),
+            crate::search::Step::Armed | crate::search::Step::Nothing => self.invalidate(),
+        }
+    }
+
+    /// Land on a match: goto_match keeps zoom and reveals the union bbox;
+    /// a page change records history and badges like every jump source.
+    fn search_jump(&mut self, page: u16, idx: usize) {
+        let bbox = self
+            .app
+            .doc()
+            .and_then(|d| d.search.as_ref())
+            .and_then(|st| st.union_bbox(page, idx));
+        let Some(bbox) = bbox else { return };
+        let changed = self.app.goto_match(page, bbox);
+        self.sync_renders();
+        if changed {
+            self.show_badge();
+        }
+        self.invalidate();
+    }
+
+    /// Any path that restores a stashed DocState (password cancel, a failed
+    /// load over an open doc) re-issues an open search with a fresh id: the
+    /// Load that displaced the doc killed its scan WITHOUT a SearchDone, so
+    /// the restored `scanning` flag would otherwise spin forever.
+    ///
+    /// password_take (Enter with a typed password) ALSO restores the stash,
+    /// but deliberately does NOT resync: the retry Load it sends right after
+    /// would kill the fresh scan immediately, and every continuation repairs
+    /// the stale flag anyway — Loaded rebuilds DocState, LoadFailed lands in
+    /// the resync below, NeedsPassword re-stashes until a cancel does.
+    fn resync_open_search(&mut self) {
+        if self.app.search_active() {
+            self.sync_search();
+        }
+    }
+
+    /// Keys while the find bar is open. Returns true when consumed. The bar
+    /// is semi-modal: PgUp/PgDn still page the document, and every Ctrl
+    /// chord except Ctrl+V/Ctrl+F falls through (Ctrl+W quits, Ctrl+O/N
+    /// open, Ctrl+S saves — browser find-bar behavior).
+    fn search_key(&mut self, vk: u16) -> bool {
+        if !self.app.search_active() {
+            return false;
+        }
+        let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        match vk {
+            _ if vk == VK_ESCAPE.0 => self.search_close_ui(),
+            _ if vk == VK_RETURN.0 || vk == VK_F3.0 => self.search_step_ui(shift),
+            _ if vk == VK_BACK.0 && !ctrl => {
+                let eff =
+                    self.app.doc_mut().and_then(|d| d.search.as_mut()).map(|st| st.backspace());
+                if let Some(eff) = eff {
+                    self.apply_search_effect(eff);
+                }
+            }
+            0x56 if ctrl => {
+                // Ctrl+V: paste into the query.
+                if let Some(text) = clipboard_text(self.hwnd) {
+                    let eff = self
+                        .app
+                        .doc_mut()
+                        .and_then(|d| d.search.as_mut())
+                        .map(|st| st.paste(&text));
+                    if let Some(eff) = eff {
+                        self.apply_search_effect(eff);
+                    }
+                }
+            }
+            0x46 if ctrl => {
+                // Ctrl+F while open: re-arm select-all emulation.
+                self.app.search_open();
+                self.invalidate();
+            }
+            _ if ctrl => return false, // other Ctrl chords keep their global meaning
+            _ if vk == VK_NEXT.0 || vk == VK_PRIOR.0 => return false, // page the doc
+            _ if vk == VK_TAB.0
+                || vk == VK_LEFT.0
+                || vk == VK_RIGHT.0
+                || vk == VK_UP.0
+                || vk == VK_DOWN.0
+                || vk == VK_HOME.0
+                || vk == VK_END.0 => {} // swallowed: no caret model; no surprise jumps
+            _ => {} // printables arrive via WM_CHAR
+        }
+        true
+    }
+
     /// Ask the PDF thread for whatever the current state needs rendered.
     pub fn sync_renders(&mut self) {
         for req in self.app.wanted_renders() {
@@ -1807,8 +2083,26 @@ impl Ui {
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");
                 }
-                // Placeholder: replaced wholesale by the window-wiring task.
-                PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {}
+                PdfReply::SearchHits { id, page, matches } => {
+                    let target = self
+                        .app
+                        .doc_mut()
+                        .and_then(|d| d.search.as_mut())
+                        .and_then(|st| st.hits(id, page, matches));
+                    if let Some((page, idx)) = target {
+                        self.search_jump(page, idx); // a pending jump fired
+                    }
+                }
+                PdfReply::SearchDone { id } => {
+                    let target = self
+                        .app
+                        .doc_mut()
+                        .and_then(|d| d.search.as_mut())
+                        .and_then(|st| st.done(id));
+                    if let Some((page, idx)) = target {
+                        self.search_jump(page, idx); // frontier jump wrapped
+                    }
+                }
                 PdfReply::NeedsPassword { path } => {
                     // Stash a currently open document so Esc can restore it
                     // (the PDF thread kept it loaded, too — Task 4).
@@ -1838,6 +2132,10 @@ impl Ui {
                         // kept it); only fall back to Empty if nothing is open.
                         if matches!(self.app.mode, crate::app::Mode::Loading { .. }) {
                             self.app.mode = crate::app::Mode::Empty;
+                        } else {
+                            // The surviving open doc may have had its scan
+                            // killed by the failed Load — re-issue it.
+                            self.resync_open_search();
                         }
                     }
                 }
@@ -1978,8 +2276,8 @@ impl Ui {
     }
 }
 
-/// Plain-text clipboard contents (CF_UNICODETEXT), if any.
-#[cfg(feature = "pro")]
+/// Plain-text clipboard contents (CF_UNICODETEXT), if any. Used by Pro form
+/// paste and the find bar.
 fn clipboard_text(hwnd: HWND) -> Option<String> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
