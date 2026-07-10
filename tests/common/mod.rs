@@ -111,3 +111,95 @@ pub fn tall_fixture_path() -> std::path::PathBuf {
     std::fs::write(&path, build_tall_pdf()).expect("write tall fixture pdf");
     path
 }
+
+/// Three pages of real text for search tests (Helvetica, a standard-14
+/// font — nothing to embed). Ground truth for the query "dragon":
+///   page 0: "The dragon sleeps" / "Another dragon here"  -> 2 hits
+///   page 1: "Nothing to see here"                        -> 0 hits
+///   page 2: "Dragon rider" / "dragonfire burns"          -> case/word probes
+/// Totals: default (insensitive substring) = 4; match_case = 3 (drops
+/// "Dragon"); whole_word = 3 (drops "dragonfire"); both = 2.
+pub fn build_text_pdf() -> Vec<u8> {
+    fn stream_obj(content: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
+    }
+    let font = "/Resources << /Font << /F1 9 0 R >> >>";
+    let objs: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>".into()),
+        (3, format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R {font} >>")),
+        (4, format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 7 0 R {font} >>")),
+        (5, format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 8 0 R {font} >>")),
+        (
+            6,
+            stream_obj(
+                "BT /F1 24 Tf 72 700 Td (The dragon sleeps) Tj 0 -50 Td (Another dragon here) Tj ET",
+            ),
+        ),
+        (7, stream_obj("BT /F1 24 Tf 72 700 Td (Nothing to see here) Tj ET")),
+        (
+            8,
+            stream_obj(
+                "BT /F1 24 Tf 72 700 Td (Dragon rider) Tj 0 -50 Td (dragonfire burns) Tj ET",
+            ),
+        ),
+        (9, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()),
+    ];
+    serialize_pdf(&objs)
+}
+
+/// Write the text fixture to a temp file and return its path.
+pub fn text_fixture_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("pppdf_text_fixture.pdf");
+    std::fs::write(&path, build_text_pdf()).expect("write text fixture pdf");
+    path
+}
+
+/// A WIDE fixture for genuinely-mid-scan tests: `n` pages, a "dragon" hit
+/// on page 0 only. The first SearchHits arrives almost immediately while
+/// the scan still has n-1 pages to cover — long enough (at 200 pages,
+/// hundreds of ms) that a CancelSearch sent after that first hit reliably
+/// lands mid-scan. Object layout: 1 catalog, 2 pages, 3..3+n page objects,
+/// 3+n..3+2n content streams, 3+2n the font — contiguous ids, as
+/// serialize_pdf's xref builder requires.
+// Consumed by the mid-scan cancel tests of the next search task; the allow
+// keeps this task's build warning-free and should be dropped then.
+#[allow(dead_code)]
+pub fn build_wide_text_pdf(n: u32) -> Vec<u8> {
+    fn stream_obj(content: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
+    }
+    let font_id = 3 + 2 * n;
+    let kids: String =
+        (0..n).map(|i| format!("{} 0 R", 3 + i)).collect::<Vec<_>>().join(" ");
+    let mut objs: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".into()),
+        (2, format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>")),
+    ];
+    for i in 0..n {
+        objs.push((
+            3 + i,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {} 0 R \
+                 /Resources << /Font << /F1 {font_id} 0 R >> >> >>",
+                3 + n + i
+            ),
+        ));
+    }
+    for i in 0..n {
+        let text =
+            if i == 0 { "Here be a dragon".to_string() } else { format!("Filler page {i}") };
+        objs.push((3 + n + i, stream_obj(&format!("BT /F1 24 Tf 72 700 Td ({text}) Tj ET"))));
+    }
+    objs.push((font_id, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into()));
+    serialize_pdf(&objs)
+}
+
+/// Write the 200-page wide fixture to a temp file and return its path.
+// See build_wide_text_pdf's allow note.
+#[allow(dead_code)]
+pub fn wide_text_fixture_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("pppdf_wide_text_fixture.pdf");
+    std::fs::write(&path, build_wide_text_pdf(200)).expect("write wide text fixture pdf");
+    path
+}

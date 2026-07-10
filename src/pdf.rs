@@ -1,7 +1,10 @@
 //! The PDF thread: owns ALL pdfium state; speaks PdfCmd in, PdfReply out.
 
 use crate::layout::{RectF, SizeU};
-use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply};
+use crate::types::{
+    FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply, SearchMatch,
+    SearchOptions,
+};
 #[cfg(feature = "pro")]
 use crate::types::FormEvent;
 use pdfium_render::prelude::*;
@@ -27,6 +30,19 @@ const PDFIUM_DLL: &[u8] = include_bytes!("../assets/pdfium.dll");
 /// extracting at once (they never do today — pdfium binds once per process —
 /// but the guarantee is cheap) can't collide on the same temp path.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The in-progress streaming text scan (PdfCmd::Search). One page is
+/// scanned per main-loop pass so commands keep page-granularity latency,
+/// exactly like the render preempt point.
+struct ScanState {
+    id: u32,
+    query: String,
+    options: SearchOptions,
+    /// First page of the scan; it walks start..pages then wraps 0..start.
+    start: u16,
+    /// Pages covered so far; the scan is done when this reaches the count.
+    scanned: u16,
+}
 
 /// Locate pdfium and bind to it, in priority order:
 ///   1. pdfium.dll beside the exe, or up to two ancestors up — covers dev
@@ -153,6 +169,8 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     let mut doc: Option<PdfDocument<'static>> = None;
     // A command consumed by the preemption check below, carried into the next iteration.
     let mut carry: Option<PdfCmd> = None;
+    // The streaming text scan, advanced one page per idle loop pass.
+    let mut active_search: Option<ScanState> = None;
     // The last visible render request, re-issued when the form layer
     // invalidates (pro). Kept only in the pro build — the free build never
     // reads it, so gating it keeps that build's behavior byte-identical.
@@ -171,8 +189,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     let mut engine: Option<crate::pro::forms::FormEngine> = None;
 
     'outer: loop {
-        let first = match carry.take() {
-            Some(c) => c,
+        let first: Option<PdfCmd> = match carry.take() {
+            Some(c) => Some(c),
+            // A scan is active: never block — poll, and when nothing is
+            // queued, advance the scan one page instead.
+            None if active_search.is_some() => match cmd_rx.try_recv() {
+                Ok(c) => Some(c),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => break 'outer,
+            },
             None => {
                 #[cfg(feature = "pro")]
                 {
@@ -185,18 +210,39 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                         &reply_tx,
                         &wake,
                     ) {
-                        Some(c) => c,
-                        None => break,
+                        Some(c) => Some(c),
+                        None => break 'outer,
                     }
                 }
                 #[cfg(not(feature = "pro"))]
                 {
                     match cmd_rx.recv() {
-                        Ok(c) => c,
-                        Err(_) => break, // UI hung up
+                        Ok(c) => Some(c),
+                        Err(_) => break 'outer, // UI hung up
                     }
                 }
             }
+        };
+        let Some(first) = first else {
+            // Idle pass with an active scan: cover exactly one page.
+            scan_step(&mut active_search, &doc, &reply_tx, &wake);
+            // wait_cmd's timeout-arm duties must not starve while the scan
+            // spins outside it: keep form timers firing (caret blink) and
+            // flush throttle-deferred repaints. maybe_render_unsolicited is
+            // internally throttled (33 ms), so per-page calls are safe.
+            #[cfg(feature = "pro")]
+            if let Some(eng) = engine.as_mut() {
+                eng.fire_due_timers();
+                maybe_render_unsolicited(
+                    eng,
+                    &doc,
+                    last_visible,
+                    &mut last_unsolicited,
+                    &reply_tx,
+                    &wake,
+                );
+            }
+            continue 'outer;
         };
         let mut batch = vec![first];
         loop {
@@ -223,6 +269,7 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let mut form_events: Vec<(u16, FormEvent)> = Vec::new();
         #[cfg(feature = "pro")]
         let mut save_requested = false;
+        let mut queued_search: Option<ScanState> = None;
         for cmd in batch {
             match cmd {
                 PdfCmd::Shutdown => break 'outer,
@@ -239,8 +286,21 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     }
                 }
                 PdfCmd::Render { page, px, rot, visible: false } => prefetch.push((page, px, rot)),
-                // Placeholder: replaced wholesale by the scan-engine task.
-                PdfCmd::Search { .. } | PdfCmd::CancelSearch => {}
+                PdfCmd::Search { id, query, options, start_page } => {
+                    // Only the LAST queued Search survives (visible-render
+                    // semantics); earlier ones are superseded silently — the
+                    // UI already moved on when it issued the newer id.
+                    queued_search =
+                        Some(ScanState { id, query, options, start: start_page, scanned: 0 });
+                }
+                PdfCmd::CancelSearch => {
+                    // Order-sensitive, like Load: kills the active scan and
+                    // any Search queued BEFORE it in this batch; a Search
+                    // AFTER it in the same batch survives (Esc-then-Ctrl+F
+                    // burst must not strand the new scan).
+                    queued_search = None;
+                    active_search = None;
+                }
                 #[cfg(feature = "pro")]
                 PdfCmd::Form { page, ev } => form_events.push((page, ev)),
                 #[cfg(feature = "pro")]
@@ -263,6 +323,16 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let prefetch = kept;
         for page in superseded {
             let _ = reply_tx.send(PdfReply::RenderFailed { page, reason: "superseded".into() });
+        }
+        // A Load replaces the document: any scan (active or queued, either
+        // side of it in the batch) targets the OLD document and dies with
+        // it. The UI drops stale ids anyway; no reply is owed.
+        if load.is_some() {
+            active_search = None;
+            queued_search = None;
+        }
+        if let Some(s) = queued_search.take() {
+            active_search = Some(s);
         }
 
         if let Some((path, password)) = load {
@@ -557,6 +627,86 @@ fn describe(doc: &PdfDocument, path: &Path) -> PdfReply {
         outline,
         has_forms: doc.form().is_some(),
     }
+}
+
+/// Advance the streaming scan by exactly ONE page: send SearchHits for a
+/// page with hits, and SearchDone when every page has been covered. Every
+/// reply is followed by wake().
+fn scan_step(
+    scan: &mut Option<ScanState>,
+    doc: &Option<PdfDocument<'static>>,
+    reply_tx: &Sender<PdfReply>,
+    wake: &impl Fn(),
+) {
+    let Some(s) = scan.as_mut() else { return };
+    let Some(d) = doc else {
+        // Unreachable in practice (the UI only searches an open document
+        // and a Load kills the scan) — but never strand the UI's spinner.
+        let _ = reply_tx.send(PdfReply::SearchDone { id: s.id });
+        wake();
+        *scan = None;
+        return;
+    };
+    let pages = d.pages().len().clamp(0, u16::MAX as i32) as u16;
+    if pages == 0 || s.scanned >= pages {
+        let _ = reply_tx.send(PdfReply::SearchDone { id: s.id });
+        wake();
+        *scan = None;
+        return;
+    }
+    // Wrap order: start..end then 0..start — the hits nearest the reader
+    // stream in first, so Enter can jump almost immediately mid-scan.
+    let page = ((s.start as u32 + s.scanned as u32) % pages as u32) as u16;
+    s.scanned += 1;
+    let done = s.scanned >= pages;
+    let id = s.id;
+    let matches = search_page(d, page, &s.query, s.options);
+    if !matches.is_empty() {
+        let _ = reply_tx.send(PdfReply::SearchHits { id, page, matches });
+        wake();
+    }
+    if done {
+        let _ = reply_tx.send(PdfReply::SearchDone { id });
+        wake();
+        *scan = None;
+    }
+}
+
+/// All hits on one page, in document order, as plain rect lists (PDF
+/// points, bottom-left origin — the PageLink convention). A page whose
+/// text fails to load is skipped silently, per the corrupt-page policy.
+fn search_page(
+    doc: &PdfDocument,
+    page_idx: u16,
+    query: &str,
+    options: SearchOptions,
+) -> Vec<SearchMatch> {
+    let Ok(page) = doc.pages().get(page_idx as PdfPageIndex) else { return Vec::new() };
+    let Ok(text) = page.text() else { return Vec::new() };
+    let opts = PdfSearchOptions::new()
+        .match_case(options.match_case)
+        .match_whole_word(options.whole_word);
+    let Ok(search) = text.search(query, &opts) else { return Vec::new() };
+    let mut out = Vec::new();
+    while let Some(seg) = search.find_next() {
+        // One hit can span multiple rects (line wraps / font changes).
+        let mut rects = Vec::new();
+        for i in seg.as_range() {
+            if let Ok(segment) = seg.get(i) {
+                let b = segment.bounds();
+                rects.push(RectF {
+                    left: b.left().value,
+                    top: b.top().value,
+                    right: b.right().value,
+                    bottom: b.bottom().value,
+                });
+            }
+        }
+        if !rects.is_empty() {
+            out.push(SearchMatch { rects });
+        }
+    }
+    out
 }
 
 fn walk_bookmark(b: &PdfBookmark, depth: u8, out: &mut Vec<OutlineItem>) {

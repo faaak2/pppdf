@@ -5,7 +5,7 @@ mod common;
 
 use pppdf::layout::SizeU;
 use pppdf::pdf;
-use pppdf::types::{LinkTarget, PdfCmd, PdfReply};
+use pppdf::types::{LinkTarget, PdfCmd, PdfReply, SearchMatch, SearchOptions};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -901,6 +901,133 @@ fn load_failure_reports_reason() {
         PdfReply::LoadFailed { reason, .. } => assert!(!reason.is_empty()),
         other => panic!("expected LoadFailed, got {other:?}"),
     }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+/// Drain replies until SearchDone{want} arrives, returning that scan's
+/// SearchHits in ARRIVAL order. Skips unrelated replies. Panics on timeout.
+fn collect_hits(
+    reply_rx: &mpsc::Receiver<PdfReply>,
+    want: u32,
+) -> Vec<(u16, Vec<SearchMatch>)> {
+    let mut hits = Vec::new();
+    loop {
+        match reply_rx.recv_timeout(WAIT).expect("search reply before timeout") {
+            PdfReply::SearchHits { id, page, matches } if id == want => hits.push((page, matches)),
+            PdfReply::SearchDone { id } if id == want => return hits,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn search_streams_hits_in_wrap_order_with_sane_rects() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    // Counting wake closure: every search reply must be followed by wake(),
+    // or the UI counter freezes until an unrelated message arrives.
+    let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let w = std::sync::Arc::clone(&wakes);
+    let cmd_tx = pdf::spawn(reply_tx, move || {
+        w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    cmd_tx.send(PdfCmd::Load { path: common::text_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { pages, .. } => assert_eq!(pages, 3),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+
+    // From page 0: hits stream in page order 0, 2.
+    cmd_tx
+        .send(PdfCmd::Search {
+            id: 1,
+            query: "dragon".into(),
+            options: SearchOptions::default(),
+            start_page: 0,
+        })
+        .unwrap();
+    let hits = collect_hits(&reply_rx, 1);
+    let pages: Vec<u16> = hits.iter().map(|(p, _)| *p).collect();
+    assert_eq!(pages, vec![0, 2]);
+    assert_eq!(hits[0].1.len(), 2, "two 'dragon' hits on page 0");
+    assert_eq!(hits[1].1.len(), 2, "'Dragon' + 'dragonfire' on page 2");
+    for (_, matches) in &hits {
+        for m in matches {
+            assert!(!m.rects.is_empty(), "every hit ships at least one rect");
+            for r in &m.rects {
+                assert!(r.top > r.bottom, "PDF y-up convention: {r:?}");
+                assert!(r.right > r.left, "{r:?}");
+                assert!(
+                    r.left >= 0.0 && r.right <= 612.0 && r.bottom >= 0.0 && r.top <= 792.0,
+                    "rect must lie inside the page: {r:?}"
+                );
+            }
+        }
+    }
+
+    // From page 2: wrap order — page 2's hits arrive FIRST, then page 0's.
+    cmd_tx
+        .send(PdfCmd::Search {
+            id: 2,
+            query: "dragon".into(),
+            options: SearchOptions::default(),
+            start_page: 2,
+        })
+        .unwrap();
+    let hits = collect_hits(&reply_rx, 2);
+    let pages: Vec<u16> = hits.iter().map(|(p, _)| *p).collect();
+    assert_eq!(pages, vec![2, 0], "scan starts at start_page and wraps");
+
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+    // Assert wakes only AFTER the join: the worker sends each reply and
+    // THEN wakes, so a mid-stream count races that last wake. The joined
+    // thread proves every wake executed. Two scans ran:
+    // 1 Loaded + 2 × (2 SearchHits + 1 SearchDone) = 7 wakes minimum —
+    // a missing Hits or Done wake shows up as a shortfall here.
+    assert!(
+        wakes.load(std::sync::atomic::Ordering::Relaxed) >= 7,
+        "every search reply must be sent with wake(): {} wakes",
+        wakes.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[test]
+fn search_honors_case_and_whole_word_options() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::text_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { .. } => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    // (match_case, whole_word) -> expected total across the document.
+    for (id, case, word, want) in
+        [(10u32, false, false, 4usize), (11, true, false, 3), (12, false, true, 3), (13, true, true, 2)]
+    {
+        cmd_tx
+            .send(PdfCmd::Search {
+                id,
+                query: "dragon".into(),
+                options: SearchOptions { match_case: case, whole_word: word },
+                start_page: 0,
+            })
+            .unwrap();
+        let total: usize = collect_hits(&reply_rx, id).iter().map(|(_, m)| m.len()).sum();
+        assert_eq!(total, want, "case={case} word={word}");
+    }
+    // A term that is absent: no hits, but SearchDone still arrives.
+    cmd_tx
+        .send(PdfCmd::Search {
+            id: 14,
+            query: "wizard".into(),
+            options: SearchOptions::default(),
+            start_page: 0,
+        })
+        .unwrap();
+    assert!(collect_hits(&reply_rx, 14).is_empty());
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }
