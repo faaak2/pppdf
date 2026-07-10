@@ -1031,3 +1031,226 @@ fn search_honors_case_and_whole_word_options() {
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }
+
+/// A render big enough to keep the worker busy while a burst of commands
+/// queues up behind it — the burst then lands in one batch, making
+/// coalescing deterministic.
+const BUSY_PX: SizeU = SizeU { w: 1224, h: 1584 };
+
+fn load_text_fixture(cmd_tx: &mpsc::Sender<PdfCmd>, reply_rx: &mpsc::Receiver<PdfReply>) {
+    cmd_tx.send(PdfCmd::Load { path: common::text_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { pages, .. } => assert_eq!(pages, 3),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+fn dragon_search(id: u32) -> PdfCmd {
+    PdfCmd::Search {
+        id,
+        query: "dragon".into(),
+        options: SearchOptions::default(),
+        start_page: 0,
+    }
+}
+
+#[test]
+fn later_search_supersedes_queued_one_silently() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    load_text_fixture(&cmd_tx, &reply_rx);
+    cmd_tx.send(PdfCmd::Render { page: 0, px: BUSY_PX, rot: 0, visible: true }).unwrap();
+    cmd_tx.send(dragon_search(3)).unwrap();
+    cmd_tx.send(dragon_search(4)).unwrap();
+    // Drain to SearchDone{4}: id 3 must never produce a reply (it was
+    // superseded in-batch; the UI's id-check needs no supersede signal).
+    let mut saw_4_hits = 0;
+    loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::SearchHits { id, .. } => {
+                assert_ne!(id, 3, "superseded scan must be silent");
+                if id == 4 {
+                    saw_4_hits += 1;
+                }
+            }
+            PdfReply::SearchDone { id } => {
+                assert_ne!(id, 3, "superseded scan must send no Done");
+                if id == 4 {
+                    break;
+                }
+            }
+            _ => {} // Rendered / RenderFailed from the busy render
+        }
+    }
+    assert_eq!(saw_4_hits, 2, "the surviving scan runs to completion");
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+fn cancel_then_search_in_one_burst_keeps_the_later_scan() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    load_text_fixture(&cmd_tx, &reply_rx);
+    cmd_tx.send(PdfCmd::Render { page: 0, px: BUSY_PX, rot: 0, visible: true }).unwrap();
+    // Esc-then-Ctrl+F reflex: Search 5, Cancel, Search 6 in one batch.
+    cmd_tx.send(dragon_search(5)).unwrap();
+    cmd_tx.send(PdfCmd::CancelSearch).unwrap();
+    cmd_tx.send(dragon_search(6)).unwrap();
+    let mut pages_6 = Vec::new();
+    loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::SearchHits { id, page, .. } => {
+                assert_ne!(id, 5, "cancelled scan must be silent");
+                if id == 6 {
+                    pages_6.push(page);
+                }
+            }
+            PdfReply::SearchDone { id } => {
+                assert_ne!(id, 5);
+                if id == 6 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(pages_6, vec![0, 2], "the post-cancel scan is fully live");
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+fn cancel_mid_scan_stops_replies_but_worker_stays_live() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    load_text_fixture(&cmd_tx, &reply_rx);
+    cmd_tx.send(PdfCmd::Render { page: 0, px: BUSY_PX, rot: 0, visible: true }).unwrap();
+    cmd_tx.send(dragon_search(7)).unwrap();
+    cmd_tx.send(PdfCmd::CancelSearch).unwrap();
+    // The worker must still answer renders afterwards.
+    cmd_tx
+        .send(PdfCmd::Render { page: 1, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {
+                panic!("cancelled scan must produce no search replies")
+            }
+            PdfReply::Rendered { page: 1, .. } => break,
+            _ => {}
+        }
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+fn load_kills_the_scan_without_a_done() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    load_text_fixture(&cmd_tx, &reply_rx);
+    cmd_tx.send(PdfCmd::Render { page: 0, px: BUSY_PX, rot: 0, visible: true }).unwrap();
+    cmd_tx.send(dragon_search(8)).unwrap();
+    cmd_tx.send(PdfCmd::Load { path: common::fixture_path(), password: None }).unwrap();
+    // Drain to the second Loaded; no search reply may appear before OR
+    // after it (drain a settling window to be sure).
+    loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {
+                panic!("Load must kill the scan silently")
+            }
+            PdfReply::Loaded { .. } => break,
+            _ => {}
+        }
+    }
+    match reply_rx.recv_timeout(Duration::from_millis(500)) {
+        Err(_) => {} // silence: correct
+        Ok(PdfReply::SearchHits { .. }) | Ok(PdfReply::SearchDone { .. }) => {
+            panic!("no search replies may straggle after the Load")
+        }
+        Ok(_) => {} // e.g. a late RenderFailed{"superseded"} is fine
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+fn cancel_lands_mid_scan_on_a_wide_document() {
+    // The burst tests above kill the scan while it is still QUEUED (one
+    // batch). This one cancels a scan that is provably ACTIVE: the wide
+    // fixture's only hit is on page 0, so the first SearchHits arrives
+    // while ~199 pages are still unscanned (hundreds of ms of work) — the
+    // CancelSearch sent after it reliably lands mid-scan and exercises the
+    // `active_search = None` path.
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::wide_text_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { pages, .. } => assert_eq!(pages, 200),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx.send(dragon_search(20)).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::SearchHits { id: 20, page: 0, .. } => {}
+        other => panic!("expected the page-0 hit first, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::CancelSearch).unwrap();
+    // Settle window: the cancelled scan must go silent — in particular, NO
+    // SearchDone{20} (a Done arriving here would mean the scan outran the
+    // cancel; if this ever flakes, widen the fixture, never add sleeps).
+    loop {
+        match reply_rx.recv_timeout(Duration::from_millis(600)) {
+            Err(_) => break, // silence: cancelled
+            Ok(PdfReply::SearchHits { .. }) | Ok(PdfReply::SearchDone { .. }) => {
+                panic!("cancelled ACTIVE scan must produce no further search replies")
+            }
+            Ok(_) => {}
+        }
+    }
+    // The worker is still alive and serving.
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { page: 0, .. } => {}
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+fn renders_take_priority_over_an_active_scan() {
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    load_text_fixture(&cmd_tx, &reply_rx);
+    cmd_tx.send(PdfCmd::Render { page: 0, px: BUSY_PX, rot: 0, visible: true }).unwrap();
+    // Search and a page-flip render land in one batch: the render must be
+    // answered before ANY hit of that scan (renders run before the scan
+    // resumes).
+    cmd_tx.send(dragon_search(9)).unwrap();
+    cmd_tx
+        .send(PdfCmd::Render { page: 1, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let mut saw_page1_render = false;
+    loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::Rendered { page: 1, .. } => saw_page1_render = true,
+            PdfReply::SearchHits { id: 9, .. } => {
+                assert!(saw_page1_render, "hits must not precede the queued render");
+            }
+            PdfReply::SearchDone { id: 9 } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_page1_render);
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}

@@ -162,9 +162,6 @@ pub fn text_fixture_path() -> std::path::PathBuf {
 /// lands mid-scan. Object layout: 1 catalog, 2 pages, 3..3+n page objects,
 /// 3+n..3+2n content streams, 3+2n the font — contiguous ids, as
 /// serialize_pdf's xref builder requires.
-// Consumed by the mid-scan cancel tests of the next search task; the allow
-// keeps this task's build warning-free and should be dropped then.
-#[allow(dead_code)]
 pub fn build_wide_text_pdf(n: u32) -> Vec<u8> {
     fn stream_obj(content: &str) -> String {
         format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
@@ -196,8 +193,6 @@ pub fn build_wide_text_pdf(n: u32) -> Vec<u8> {
 }
 
 /// Write the 200-page wide fixture to a temp file and return its path.
-// See build_wide_text_pdf's allow note.
-#[allow(dead_code)]
 pub fn wide_text_fixture_path() -> std::path::PathBuf {
     let path = std::env::temp_dir().join("pppdf_wide_text_fixture.pdf");
     std::fs::write(&path, build_wide_text_pdf(200)).expect("write wide text fixture pdf");
