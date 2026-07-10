@@ -9,5 +9,6 @@ pub mod pdf;
 #[cfg(feature = "pro")]
 pub mod pro;
 pub mod register;
+pub mod search;
 pub mod types;
 pub mod window;
