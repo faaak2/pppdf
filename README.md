@@ -59,6 +59,8 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | PgUp / ← / Shift+Space / wheel up | Previous page |
 | Home / End | First / last page |
 | G, then a number, Enter | Go to a page |
+| Alt+← / Backspace / mouse back | Back to where you jumped from |
+| Alt+→ / Shift+Backspace / mouse forward | Forward again (re-do the jump) |
 | Tab (or right-click menu) | Table of contents overlay |
 | ↑ ↓ → ← / Enter / Esc | Navigate the open overlay |
 | Click a link | Follow it (web links open in your browser) |

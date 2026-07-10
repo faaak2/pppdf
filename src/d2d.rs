@@ -21,6 +21,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("PgUp / \u{2190} / Shift+Space / wheel up", "Previous page"),
     ("Home / End", "First / last page"),
     ("G, then a number, Enter", "Go to a page"),
+    ("Alt+\u{2190} / Backspace / mouse back", "Back to where you jumped from"),
+    ("Alt+\u{2192} / Shift+Backspace / mouse fwd", "Forward again (re-do the jump)"),
     ("Tab (or right-click menu)", "Table of contents overlay"),
     ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
     ("Click a link", "Follow it (web links open in your browser)"),

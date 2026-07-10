@@ -26,6 +26,15 @@ Document:
 - [ ] Open a new PDF (drop/menu) while the password prompt is showing: previously open doc keeps working
 - [ ] With a GPU-heavy app running (video playback + a hardware-accelerated browser session): launch and confirm content renders; if the window ever goes white, it must self-heal within ~1 s (device-loss recovery)
 
+Page history (both editions):
+- [ ] Click an internal link, then Alt+Left: returns to the origin page; Alt+Right re-does the jump
+- [ ] TOC jump, then the mouse back button: returns — including clicks over the draggable (unzoomed) page body
+- [ ] G-goto and Home/End create back stops; PgUp/PgDn/wheel paging never does
+- [ ] Backspace = back, Shift+Backspace = forward; in the G prompt Backspace still deletes a digit
+- [ ] Pro: Backspace inside a focused form field deletes text (never navigates); Alt+Left while typing leaves the field and navigates
+- [ ] Alt+F4 still closes (prompting if dirty); Alt+Space still opens the system menu
+- [ ] Open another document: history is empty (Backspace does nothing)
+
 Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Fields open with a pale blue highlight (in a fresh window); `F` cycles to dotted frames, then off, then back (toast names each mode); the marks track zoom and rotation; the chosen mode survives opening another PDF in the same window (viewer preference, not document state)
 - [ ] While typing in a field, `f` types the letter (must NOT cycle the indication)
