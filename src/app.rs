@@ -1,8 +1,8 @@
 //! Application state machine + page cache. Pure logic — no OS types.
 
 use crate::layout::{
-    clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size, unrotate_point,
-    zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
+    clamp_scroll, fit_scale, max_zoom, page_rect, pdf_rect_to_window, render_size, rotate_rect,
+    scroll_to_reveal, unrotate_point, zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
 use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink};
@@ -184,6 +184,11 @@ pub struct DocState {
     pub goto_entry: Option<String>,
     /// Jump history for back/forward navigation.
     pub history: History,
+    /// Some = the find bar is open (Ctrl+F).
+    pub search: Option<crate::search::SearchState>,
+    /// Last query/options, stashed when the bar closes so reopening
+    /// restores them. Per-document: dies with the DocState on doc load.
+    pub last_search: Option<(String, crate::types::SearchOptions)>,
 }
 
 impl DocState {
@@ -258,6 +263,9 @@ pub struct App {
     pub help_visible: bool,
     /// Source of `CachedPage::gen`; bumped on every render reply.
     render_gen: u64,
+    /// Source of search-scan ids; bumped per issued PdfCmd::Search. The
+    /// reply id-check drops in-flight stragglers from superseded scans.
+    search_gen: u32,
     /// Pro: a form field currently has keyboard focus (typing mode). The UI
     /// owns this state — it initiates every focus change (click, Tab, Esc).
     #[cfg(feature = "pro")]
@@ -300,6 +308,7 @@ impl App {
             dpi: 96,
             help_visible: false,
             render_gen: 0,
+            search_gen: 0,
             #[cfg(feature = "pro")]
             form_focus: false,
             #[cfg(feature = "pro")]
@@ -390,6 +399,8 @@ impl App {
             rot: 0,
             goto_entry: None,
             history: History::default(),
+            search: None,
+            last_search: None,
         });
     }
 
@@ -702,37 +713,14 @@ impl App {
     /// Window-space rects of the current page's form widgets under the
     /// current layout (zoom, scroll, rotation) — the drawing-side complement
     /// of `field_hit`: that one unrotates the probe POINT, this rotates the
-    /// RECTS into the displayed frame.
+    /// RECTS into the displayed frame. Keeps its cache gate: the rects
+    /// themselves live on the cache entry.
     #[cfg(feature = "pro")]
     pub fn field_rects_window(&self) -> Vec<RectF> {
         let Some(d) = self.doc() else { return Vec::new() };
         let Some(entry) = self.cache.get_any(d.current, d.rot) else { return Vec::new() };
-        let Some(pr) = self.current_page_rect() else { return Vec::new() };
-        let page_pt = d.page_pt();
-        let px_per_pt = fit_scale(d.page_pt_rot(), self.client) * d.zoom;
-        // Unrotated-bitmap frame, origin (0,0) — same frame field_hit tests
-        // in; the page offset is applied AFTER rotation, because pr is where
-        // the ROTATED bitmap sits.
-        let unrot = RectF {
-            left: 0.0,
-            top: 0.0,
-            right: page_pt.0 * px_per_pt,
-            bottom: page_pt.1 * px_per_pt,
-        };
-        entry
-            .fields
-            .iter()
-            .map(|f| {
-                let r = pdf_rect_to_window(f.rect_pt, page_pt.1, px_per_pt, unrot);
-                let rr = crate::layout::rotate_rect(r, unrot.right, unrot.bottom, d.rot);
-                RectF {
-                    left: pr.left + rr.left,
-                    top: pr.top + rr.top,
-                    right: pr.left + rr.right,
-                    bottom: pr.top + rr.bottom,
-                }
-            })
-            .collect()
+        let rects: Vec<RectF> = entry.fields.iter().map(|f| f.rect_pt).collect();
+        self.page_rects_window(&rects)
     }
 
     /// Window point -> PDF page coordinates (points, origin bottom-left,
@@ -854,6 +842,115 @@ impl App {
                 None => Mode::Empty,
             };
         }
+    }
+
+    // --- text search (Ctrl+F find bar) ---
+
+    /// Fresh id for a PdfCmd::Search. Monotonic per App (like render_gen).
+    pub fn next_search_id(&mut self) -> u32 {
+        self.search_gen = self.search_gen.wrapping_add(1);
+        self.search_gen
+    }
+
+    pub fn search_active(&self) -> bool {
+        self.doc().is_some_and(|d| d.search.is_some())
+    }
+
+    /// Open the find bar (restoring the remembered query), or re-arm
+    /// replace-on-type when it is already open (Ctrl+F while open).
+    /// Returns false without a document.
+    pub fn search_open(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        match &mut d.search {
+            Some(st) => st.replace_on_type = true,
+            None => d.search = Some(crate::search::SearchState::new(d.last_search.clone())),
+        }
+        true
+    }
+
+    /// Close the bar, remembering a non-empty query for the next open.
+    /// Returns true iff a bar was open (the caller then sends CancelSearch).
+    pub fn search_close(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        let Some(st) = d.search.take() else { return false };
+        if !st.query.is_empty() {
+            d.last_search = Some((st.query, st.options));
+        }
+        true
+    }
+
+    /// Window-space rects for PDF-point rects on the CURRENT page under the
+    /// current zoom/scroll/rotation. Pure geometry — deliberately NO
+    /// cache-presence gate (unlike its progenitor field_rects_window):
+    /// goto_match needs bboxes for pages that have never rendered, and
+    /// current_page_rect is pure. The bitmap gate belongs at highlight-DRAW
+    /// call sites only.
+    pub fn page_rects_window(&self, rects_pt: &[RectF]) -> Vec<RectF> {
+        let Some(d) = self.doc() else { return Vec::new() };
+        let Some(pr) = self.current_page_rect() else { return Vec::new() };
+        let page_pt = d.page_pt();
+        // Same scalar basis as render_size: zoom is clamped to max_zoom
+        // everywhere it is set, so fit_scale * zoom never exceeds the
+        // MAX_RENDER_DIM cap and highlights can't drift off the bitmap.
+        let px_per_pt = fit_scale(d.page_pt_rot(), self.client) * d.zoom;
+        let unrot = RectF {
+            left: 0.0,
+            top: 0.0,
+            right: page_pt.0 * px_per_pt,
+            bottom: page_pt.1 * px_per_pt,
+        };
+        rects_pt
+            .iter()
+            .map(|rect| {
+                let r = pdf_rect_to_window(*rect, page_pt.1, px_per_pt, unrot);
+                let rr = rotate_rect(r, unrot.right, unrot.bottom, d.rot);
+                RectF {
+                    left: pr.left + rr.left,
+                    top: pr.top + rr.top,
+                    right: pr.left + rr.right,
+                    bottom: pr.top + rr.bottom,
+                }
+            })
+            .collect()
+    }
+
+    /// Jump to a search match: shares goto's history contract (records iff
+    /// the page changes) but is the "landing variant" — zoom is PRESERVED
+    /// (clamped to the target page's max_zoom) and the match's union bbox is
+    /// scrolled into view instead of resetting to fit. Cross-page landings
+    /// compute the reveal from a zero-scroll baseline (the old page's scroll
+    /// is meaningless in the new page's overhang range); same-page steps
+    /// reveal from the live scroll. Returns true iff the page changed.
+    pub fn goto_match(&mut self, page: u16, bbox_pt: RectF) -> bool {
+        let client = self.client;
+        let margin = 48.0 * (self.dpi as f32 / 96.0);
+        let changed = {
+            let Some(d) = self.doc_mut() else { return false };
+            if d.pages == 0 {
+                return false;
+            }
+            let page = page.min(d.pages - 1);
+            let from = d.current;
+            let changed = page != from;
+            if changed {
+                d.history.record_jump(from);
+                d.current = page;
+                d.zoom = d.zoom.clamp(1.0, max_zoom(d.page_pt_rot(), client));
+                d.scroll = PointF::default();
+            }
+            changed
+        };
+        let Some(target) = self.page_rects_window(&[bbox_pt]).into_iter().next() else {
+            return changed;
+        };
+        let page_px = match self.doc() {
+            Some(d) => render_size(d.page_pt_rot(), client, d.zoom),
+            None => return changed,
+        };
+        if let Some(d) = self.doc_mut() {
+            d.scroll = scroll_to_reveal(d.scroll, target, page_px, client, margin);
+        }
+        changed
     }
 }
 
@@ -1579,6 +1676,172 @@ mod tests {
         b.mode = Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev: None };
         b.password_cancel();
         assert!(matches!(b.mode, Mode::Empty));
+    }
+
+    // --- text search: goto_match / page_rects_window / open-close ---
+
+    #[test]
+    fn goto_match_records_history_iff_page_changes() {
+        let mut a = app_with_doc(10);
+        let bbox = RectF { left: 100.0, top: 700.0, right: 200.0, bottom: 688.0 };
+        assert!(a.goto_match(5, bbox), "cross-page jump");
+        assert_eq!(a.doc().unwrap().current, 5);
+        assert!(!a.goto_match(5, bbox), "same-page step: no page change");
+        assert!(a.back(), "the cross-page jump was recorded");
+        assert_eq!(a.doc().unwrap().current, 0);
+        assert!(!a.back(), "the same-page step was NOT recorded");
+    }
+
+    #[test]
+    fn goto_match_preserves_zoom_clamped_to_target_page() {
+        let mut a = app_with_doc(3);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 3.0);
+        let z = a.doc().unwrap().zoom;
+        assert!(z > 1.0);
+        let bbox = RectF { left: 300.0, top: 400.0, right: 350.0, bottom: 390.0 };
+        a.goto_match(2, bbox);
+        let d = a.doc().unwrap();
+        assert_eq!(d.current, 2);
+        assert!((d.zoom - z).abs() < 1e-4, "zoom carried across the jump");
+        let mz = max_zoom(LETTER, a.client);
+        assert!(d.zoom <= mz + 1e-4, "and clamped to the target page's max");
+    }
+
+    #[test]
+    fn goto_match_cross_page_reveals_from_zero_baseline() {
+        let mut a = app_with_doc(3);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 4.0);
+        // Scroll far into page 0 so a stale-baseline bug would be visible.
+        a.doc_mut().unwrap().scroll = PointF { x: 900.0, y: 1500.0 };
+        // Match near the TOP-LEFT of page 2 (PDF y-up: top ~ 780).
+        let bbox = RectF { left: 20.0, top: 780.0, right: 90.0, bottom: 770.0 };
+        a.goto_match(2, bbox);
+        let d = a.doc().unwrap();
+        // A top-left match from a zero baseline needs (near-)zero scroll;
+        // the old page's scroll must not leak in.
+        assert!(d.scroll.x < 100.0, "x: {}", d.scroll.x);
+        assert!(d.scroll.y < 100.0, "y: {}", d.scroll.y);
+        // And the match must actually be inside the viewport now.
+        let pr = a.current_page_rect().unwrap();
+        let w = a.page_rects_window(&[bbox]);
+        let r = w[0];
+        assert!(r.left >= 0.0 && r.right <= a.client.w as f32, "{r:?} vs client");
+        assert!(r.top >= 0.0 && r.bottom <= a.client.h as f32, "{r:?} in {pr:?}");
+    }
+
+    #[test]
+    fn goto_match_same_page_scrolls_match_into_view() {
+        let mut a = app_with_doc(1);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 4.0);
+        a.doc_mut().unwrap().scroll = PointF { x: 0.0, y: 0.0 };
+        // A match near the BOTTOM of the page (PDF y-up: bottom area ~ y=50).
+        let bbox = RectF { left: 300.0, top: 60.0, right: 380.0, bottom: 50.0 };
+        assert!(!a.goto_match(0, bbox), "same page");
+        let r = a.page_rects_window(&[bbox])[0];
+        assert!(
+            r.bottom <= a.client.h as f32 && r.top >= 0.0,
+            "match must be scrolled into the viewport: {r:?}"
+        );
+        assert!(a.doc().unwrap().zoom > 1.0, "zoom untouched");
+    }
+
+    #[test]
+    fn goto_match_works_with_an_empty_cache() {
+        // No rendered() calls at all: the bbox transform must be pure
+        // geometry (its progenitor field_rects_window gates on the cache).
+        let mut a = app_with_doc(5);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 2.0);
+        let bbox = RectF { left: 500.0, top: 100.0, right: 560.0, bottom: 90.0 };
+        assert!(a.goto_match(4, bbox));
+        assert_eq!(a.doc().unwrap().current, 4);
+        let r = a.page_rects_window(&[bbox])[0];
+        assert!(r.left >= 0.0 && r.right <= a.client.w as f32, "{r:?}");
+    }
+
+    #[test]
+    fn page_rects_window_matches_field_pipeline_under_rotation() {
+        // page_rects_window must agree with the hit-test inverse the same
+        // way field_rects_window does (see the pro test of the same shape).
+        let mut a = app_with_doc(1);
+        let rect_pt = RectF { left: 100.0, top: 700.0, right: 300.0, bottom: 650.0 };
+        for _ in 0..4 {
+            let req = a.wanted_renders()[0];
+            a.rendered(CachedPage {
+                page: 0,
+                px: req.px,
+                rot: req.rot,
+                bgra: vec![0; 4],
+                links: vec![],
+                fields: vec![],
+                gen: 0,
+            });
+            let rects = a.page_rects_window(&[rect_pt]);
+            assert_eq!(rects.len(), 1);
+            let r = rects[0];
+            assert!(r.left < r.right && r.top < r.bottom, "normalized at rot {}", a.doc().unwrap().rot);
+            let c = PointF { x: (r.left + r.right) / 2.0, y: (r.top + r.bottom) / 2.0 };
+            let pdf = a.pdf_point_at(c).unwrap();
+            assert!((pdf.x - 200.0).abs() < 2.0, "rot {}: x {}", a.doc().unwrap().rot, pdf.x);
+            assert!((pdf.y - 675.0).abs() < 2.0, "rot {}: y {}", a.doc().unwrap().rot, pdf.y);
+            a.rotate_cw();
+        }
+    }
+
+    #[test]
+    fn search_state_survives_password_stash() {
+        let mut a = app_with_doc(5);
+        assert!(a.search_open());
+        a.doc_mut().unwrap().search.as_mut().unwrap().push_char('d');
+        a.doc_mut().unwrap().search.as_mut().unwrap().push_char('r');
+        let prev = match std::mem::replace(&mut a.mode, Mode::Empty) {
+            Mode::Doc(d) => Some(Box::new(d)),
+            _ => None,
+        };
+        a.mode = Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
+        assert!(!a.search_active(), "no doc mode: not active");
+        a.password_cancel();
+        assert!(a.search_active(), "search state came back with the stashed doc");
+        assert_eq!(a.doc().unwrap().search.as_ref().unwrap().query, "dr");
+    }
+
+    #[test]
+    fn search_open_close_stashes_and_restores_the_query() {
+        let mut a = app_with_doc(5);
+        assert!(!App::new().search_open(), "no doc: refuses");
+        assert!(a.search_open());
+        {
+            let st = a.doc_mut().unwrap().search.as_mut().unwrap();
+            st.push_char('o');
+            st.push_char('r');
+            st.push_char('c');
+            assert!(!st.replace_on_type, "typing disarmed it");
+        }
+        assert!(a.search_close());
+        assert!(!a.search_active());
+        assert_eq!(
+            a.doc().unwrap().last_search,
+            Some(("orc".into(), crate::types::SearchOptions::default()))
+        );
+        assert!(a.search_open(), "reopen restores");
+        let st = a.doc().unwrap().search.as_ref().unwrap();
+        assert_eq!(st.query, "orc");
+        assert!(st.replace_on_type, "restored query arms replace-on-type");
+        // Ctrl+F while already open re-arms (search_open on an open bar).
+        a.doc_mut().unwrap().search.as_mut().unwrap().replace_on_type = false;
+        assert!(a.search_open());
+        assert!(a.doc().unwrap().search.as_ref().unwrap().replace_on_type);
+        // A fresh document has neither bar nor memory.
+        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false);
+        assert!(!a.search_active());
+        assert_eq!(a.doc().unwrap().last_search, None);
+    }
+
+    #[test]
+    fn next_search_id_is_monotonic() {
+        let mut a = App::new();
+        let a1 = a.next_search_id();
+        let a2 = a.next_search_id();
+        assert!(a1 >= 1 && a2 > a1);
     }
 
     #[cfg(feature = "pro")]
