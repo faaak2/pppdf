@@ -131,6 +131,40 @@ impl PageCache {
     }
 }
 
+/// Jump history: pages left via jumps (links, TOC, `G`, Home/End — anything
+/// through `App::goto`) — never via adjacent flips. Browser semantics: a new
+/// jump after going back drops the forward branch. In-memory only; lives in
+/// `DocState`, so it is per-document and survives the password stash like
+/// the rest of the view state.
+#[derive(Default)]
+pub struct History {
+    /// Pages jumped away from, oldest first. Capped at `HISTORY_CAP`.
+    back: Vec<u16>,
+    /// Pages gone back from — forward targets, nearest last. Bounded by
+    /// construction: entries only arrive by popping `back`.
+    fwd: Vec<u16>,
+}
+
+/// Upper bound on remembered jump origins; the oldest entry is dropped.
+const HISTORY_CAP: usize = 100;
+
+impl History {
+    /// A new jump away from `from` landed on a different page: remember the
+    /// origin, drop the forward branch.
+    fn record_jump(&mut self, from: u16) {
+        self.fwd.clear();
+        self.push_back(from);
+    }
+
+    /// Capped push onto the back stack (oldest dropped).
+    fn push_back(&mut self, page: u16) {
+        if self.back.len() >= HISTORY_CAP {
+            self.back.remove(0);
+        }
+        self.back.push(page);
+    }
+}
+
 pub struct DocState {
     pub path: PathBuf,
     pub pages: u16,
@@ -148,6 +182,8 @@ pub struct DocState {
     pub rot: u8,
     /// Some = the "G" go-to-page prompt is open, holding the typed digits.
     pub goto_entry: Option<String>,
+    /// Jump history for back/forward navigation.
+    pub history: History,
 }
 
 impl DocState {
@@ -165,6 +201,14 @@ impl DocState {
     fn page_pt_rot(&self) -> (f32, f32) {
         let (w, h) = self.page_pt();
         if self.rot % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// Land on `page`: the post-navigation state every page change shares
+    /// (fit zoom, zero scroll).
+    fn land(&mut self, page: u16) {
+        self.current = page;
+        self.zoom = 1.0;
+        self.scroll = PointF::default();
     }
 }
 
@@ -345,10 +389,12 @@ impl App {
             overlay: None,
             rot: 0,
             goto_entry: None,
+            history: History::default(),
         });
     }
 
     /// Change page by delta; returns true if the page changed. Resets zoom/scroll.
+    /// Adjacent paging — never recorded in the jump history.
     pub fn flip(&mut self, delta: i32) -> bool {
         let Some(d) = self.doc_mut() else { return false };
         if d.pages == 0 {
@@ -358,16 +404,54 @@ impl App {
         if target == d.current {
             return false;
         }
-        d.current = target;
-        d.zoom = 1.0;
-        d.scroll = PointF::default();
+        d.land(target);
         true
     }
 
+    /// Jump to `page` (clamped), recording the departure point in the jump
+    /// history — all jump sources (links, TOC, `G` prompt, Home/End) come
+    /// through here. Only an actual page change records: a jump to the
+    /// current page leaves the history (including the forward branch) alone.
     pub fn goto(&mut self, page: u16) -> bool {
         let Some(d) = self.doc() else { return false };
+        let from = d.current;
         let delta = page.min(d.pages.saturating_sub(1)) as i32 - d.current as i32;
-        self.flip(delta)
+        if !self.flip(delta) {
+            return false;
+        }
+        if let Some(d) = self.doc_mut() {
+            d.history.record_jump(from);
+        }
+        true
+    }
+
+    /// Return to the most recent jump origin. Consumes the entry even when
+    /// it equals the current page (the user may have paged back by hand —
+    /// a navigation is a navigation: the view resets, the badge shows, and
+    /// the stack can't jam on stale entries). The traversal itself is never
+    /// recorded as a jump. Returns true iff an entry was consumed.
+    pub fn back(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        let Some(target) = d.history.back.pop() else { return false };
+        let from = d.current;
+        d.history.fwd.push(from);
+        // Belt and braces — page counts can't change mid-session.
+        let target = target.min(d.pages.saturating_sub(1));
+        d.land(target);
+        true
+    }
+
+    /// Re-do a jump undone by `back`. Mirror of `back`: the departure page
+    /// moves onto the back stack WITHOUT clearing the remaining forward
+    /// entries (history traversal, not a new jump).
+    pub fn forward(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        let Some(target) = d.history.fwd.pop() else { return false };
+        let from = d.current;
+        d.history.push_back(from);
+        let target = target.min(d.pages.saturating_sub(1));
+        d.land(target);
+        true
     }
 
     /// notches > 0 = wheel down (toward the next page).
@@ -1307,6 +1391,153 @@ mod tests {
         }
         assert_eq!(a.doc().unwrap().goto_entry.as_deref(), Some("123456"));
         a.goto_entry_cancel();
+    }
+
+    // --- page history (jump back / forward) ---
+
+    #[test]
+    fn goto_records_history_flip_does_not() {
+        let mut a = app_with_doc(10);
+        a.flip(1); // adjacent paging: not recorded
+        a.flip(1); // current = 2
+        assert!(!a.back(), "flips alone never create history");
+        assert!(a.goto(7), "jump");
+        assert_eq!(a.doc().unwrap().current, 7);
+        assert!(a.back(), "back returns to the jump origin");
+        assert_eq!(a.doc().unwrap().current, 2);
+    }
+
+    #[test]
+    fn back_forward_round_trip() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        a.goto(9);
+        assert!(a.back());
+        assert_eq!(a.doc().unwrap().current, 5);
+        assert!(a.back());
+        assert_eq!(a.doc().unwrap().current, 0);
+        assert!(!a.back(), "history exhausted");
+        assert!(a.forward());
+        assert_eq!(a.doc().unwrap().current, 5);
+        assert!(a.forward());
+        assert_eq!(a.doc().unwrap().current, 9);
+        assert!(!a.forward(), "forward exhausted");
+    }
+
+    #[test]
+    fn new_jump_truncates_forward() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        assert!(a.back()); // at 0, forward = [5]
+        assert!(a.goto(3), "new jump");
+        assert!(!a.forward(), "forward branch dropped by the new jump");
+        assert!(a.back());
+        assert_eq!(a.doc().unwrap().current, 0);
+    }
+
+    #[test]
+    fn jump_to_current_page_is_not_recorded() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        assert!(a.back()); // at 0, forward = [5]
+        assert!(!a.goto(0), "already there: no navigation");
+        assert!(a.forward(), "a same-page 'jump' must not clear the forward branch");
+        assert_eq!(a.doc().unwrap().current, 5);
+    }
+
+    #[test]
+    fn back_cap_drops_oldest() {
+        let mut a = app_with_doc(300);
+        for i in 1..=150u16 {
+            assert!(a.goto(i));
+        }
+        let mut steps = 0;
+        while a.back() {
+            steps += 1;
+            assert!(steps <= 100, "cap must bound the walk");
+        }
+        assert_eq!(steps, 100, "exactly HISTORY_CAP entries survive");
+        assert_eq!(a.doc().unwrap().current, 50, "the oldest 50 entries were dropped");
+    }
+
+    #[test]
+    fn empty_history_noops() {
+        let mut a = app_with_doc(3);
+        assert!(!a.back());
+        assert!(!a.forward());
+        assert_eq!(a.doc().unwrap().current, 0);
+        assert!(!App::new().back(), "no doc: no-op");
+        assert!(!App::new().forward(), "no doc: no-op");
+    }
+
+    #[test]
+    fn back_navigation_resets_zoom_and_is_not_rerecorded() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 2.0);
+        assert!(a.back());
+        let d = a.doc().unwrap();
+        assert_eq!(d.current, 0);
+        assert_eq!(d.zoom, 1.0, "back lands at fit");
+        assert_eq!(d.scroll, PointF::default());
+        assert!(!a.back(), "the back-navigation itself is never recorded");
+    }
+
+    #[test]
+    fn back_to_manually_revisited_page_still_consumes() {
+        let mut a = app_with_doc(10);
+        a.goto(5); // back = [0]
+        for _ in 0..5 {
+            a.flip(-1); // page back to the origin by hand (not recorded)
+        }
+        assert_eq!(a.doc().unwrap().current, 0);
+        a.zoom_by(PointF { x: 500.0, y: 500.0 }, 2.0);
+        // The stale entry (page 0 == current) is consumed and the view resets.
+        assert!(a.back(), "entry consumed even when it targets the current page");
+        assert_eq!(a.doc().unwrap().current, 0);
+        assert_eq!(a.doc().unwrap().zoom, 1.0);
+        assert!(!a.back(), "stack drained — no jam on stale entries");
+    }
+
+    #[test]
+    fn goto_entry_commit_records_history() {
+        let mut a = app_with_doc(9);
+        a.goto_entry_start();
+        a.goto_entry_char('7');
+        assert!(a.goto_entry_commit()); // 1-based -> index 6
+        assert_eq!(a.doc().unwrap().current, 6);
+        assert!(a.back());
+        assert_eq!(a.doc().unwrap().current, 0);
+    }
+
+    #[test]
+    fn wheel_edge_flip_is_not_recorded() {
+        let mut a = app_with_doc(3);
+        assert_eq!(a.wheel(1), WheelOutcome::Flipped);
+        assert!(!a.back(), "wheel flips are adjacent paging, not jumps");
+    }
+
+    #[test]
+    fn history_survives_password_stash_restore() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        let prev = match std::mem::replace(&mut a.mode, Mode::Empty) {
+            Mode::Doc(d) => Some(Box::new(d)),
+            _ => None,
+        };
+        a.mode =
+            Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
+        a.password_cancel();
+        assert!(a.back(), "history came back with the stashed doc");
+        assert_eq!(a.doc().unwrap().current, 0);
+    }
+
+    #[test]
+    fn new_document_starts_with_empty_history() {
+        let mut a = app_with_doc(10);
+        a.goto(5);
+        a.doc_loaded(PathBuf::from("y.pdf"), 10, vec![LETTER; 10], vec![], false);
+        assert!(!a.back(), "history dies with the document");
     }
 
     // --- password mode ---
