@@ -99,9 +99,10 @@ impl Renderer {
         self.formats.clear();
     }
 
-    /// Forget the memoized device bitmap. MUST be called when a new document
-    /// loads — a same-sized page 0 of the new document would otherwise show
-    /// the old document's pixels.
+    /// Forget the memoized device bitmap. Called when a new document loads.
+    /// The memo key's `gen` already rules out serving the old document's
+    /// pixels (generations are never reset across loads), so this is
+    /// defense-in-depth that also frees the old GPU bitmap promptly.
     pub fn clear_page_cache(&mut self) {
         self.page_bitmap = None;
     }

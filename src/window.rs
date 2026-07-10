@@ -1784,9 +1784,9 @@ impl Ui {
             match reply {
                 PdfReply::Loaded { path, pages, page_sizes, outline, has_forms } => {
                     self.app.doc_loaded(path, pages, page_sizes, outline, has_forms);
-                    // The renderer memoizes a device bitmap keyed (page, px);
-                    // a new same-sized document would otherwise show the OLD
-                    // document's page. Drop the memo with the document.
+                    // Drop the renderer's memoized device bitmap with the
+                    // document. Its `gen` key already prevents stale pixels;
+                    // this releases the old document's GPU bitmap promptly.
                     if let Some(r) = &mut self.renderer {
                         r.clear_page_cache();
                     }
