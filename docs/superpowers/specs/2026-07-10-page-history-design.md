@@ -105,7 +105,7 @@ philosophy (the fading page badge is the only feedback).
 ## Edge cases
 
 - Pro typing mode: Alt+arrows and mouse X-buttons kill form focus, then
-  navigate (same policy as PgDn today). Backspace inside a focused field
+  navigate (same policy as the mouse wheel today). Backspace inside a focused field
   arrives via the form layer / WM_CHAR and edits text, never history.
 - Double-click on a link fires exactly one navigation (existing manual
   test) → exactly one history entry.
