@@ -35,6 +35,21 @@ Page history (both editions):
 - [ ] Alt+F4 still closes (prompting if dirty); Alt+Space still opens the system menu
 - [ ] Open another document: history is empty (Backspace does nothing)
 
+Text search (both editions):
+- [ ] Ctrl+F opens the bar top-right; typing live-highlights from the 2nd character; counter counts up with "…" while scanning, then settles
+- [ ] Enter reveals the current match first, then steps; Shift+Enter / Shift+F3 step back; both directions wrap around
+- [ ] Match on another page: the jump keeps the zoom level and scrolls the match into view; page badge shows; Alt+Left returns to the origin
+- [ ] Wheel, page flips, clicks, and zooming all leave the bar open; PgUp/PgDn page the document while the bar has focus
+- [ ] Esc closes the bar (highlights vanish); Ctrl+F reopens with the last query — the first keystroke replaces it wholesale, Backspace clears it
+- [ ] F3 with the bar closed reopens the last query and jumps to its first hit as it arrives
+- [ ] Alt+C / Alt+W flip the Aa / W indicators, re-run the search, and change the counts ("Dragon" vs "dragonfire" style probes)
+- [ ] A term not in the document: "0 / 0" in red once the scan finishes; a 1-char query shows no counter and no highlights
+- [ ] R rotation and Ctrl+wheel zoom with highlights showing: the washes track the text exactly
+- [ ] 200-DIP window: the bar clamps inside; clicks ON it don't drag the window, clicks beside it still do
+- [ ] Pro: the dirty dot stays visible above the bar's corner; Ctrl+F while typing in a form field leaves the field and opens the bar; clicking a field while the bar is open types into the field (bar stays); Esc leaves the field, second Esc closes the bar
+- [ ] Open a password-protected PDF over a live search, Esc back to the document: the search re-runs (counter live again — never stuck on "…")
+- [ ] With the bar open: Ctrl+W still quits, Ctrl+O still opens, Ctrl+N still spawns, Ctrl+S (Pro) still saves
+
 Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Fields open with a pale blue highlight (in a fresh window); `F` cycles to dotted frames, then off, then back (toast names each mode); the marks track zoom and rotation; the chosen mode survives opening another PDF in the same window (viewer preference, not document state)
 - [ ] While typing in a field, `f` types the letter (must NOT cycle the indication)

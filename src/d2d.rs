@@ -23,6 +23,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("G, then a number, Enter", "Go to a page"),
     ("Alt+\u{2190} / Backspace / mouse back", "Back to where you jumped from"),
     ("Alt+\u{2192} / Shift+Backspace / mouse forward", "Forward again (re-do the jump)"),
+    ("Ctrl+F", "Find text in the book (Esc closes the bar)"),
+    ("Enter / F3 \u{b7} Shift steps back", "Next / previous match"),
+    ("Alt+C / Alt+W", "Match case / whole words while finding"),
     ("Tab (or right-click menu)", "Table of contents overlay"),
     ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
     ("Click a link", "Follow it (web links open in your browser)"),
@@ -35,7 +38,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl+N", "Open a new empty window"),
     ("Ctrl+Shift+O", "Open a file in a new window"),
     ("F11", "Fill the screen (work area) / restore"),
-    ("F1", "Show / hide this help"),
+    ("F1", "Show / hide the help overlay"),
     ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
 ];
 

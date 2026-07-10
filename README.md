@@ -61,6 +61,9 @@ Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 | G, then a number, Enter | Go to a page |
 | Alt+← / Backspace / mouse back | Back to where you jumped from |
 | Alt+→ / Shift+Backspace / mouse forward | Forward again (re-do the jump) |
+| Ctrl+F | Find text in the book (Esc closes the bar) |
+| Enter / F3 · Shift steps back | Next / previous match |
+| Alt+C / Alt+W | Match case / whole words while finding |
 | Tab (or right-click menu) | Table of contents overlay |
 | ↑ ↓ → ← / Enter / Esc | Navigate the open overlay |
 | Click a link | Follow it (web links open in your browser) |
