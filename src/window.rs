@@ -1807,6 +1807,8 @@ impl Ui {
                 PdfReply::RenderFailed { page, reason } => {
                     self.app.render_failed(page, reason == "superseded");
                 }
+                // Placeholder: replaced wholesale by the window-wiring task.
+                PdfReply::SearchHits { .. } | PdfReply::SearchDone { .. } => {}
                 PdfReply::NeedsPassword { path } => {
                     // Stash a currently open document so Esc can restore it
                     // (the PDF thread kept it loaded, too — Task 4).

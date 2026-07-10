@@ -239,6 +239,8 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     }
                 }
                 PdfCmd::Render { page, px, rot, visible: false } => prefetch.push((page, px, rot)),
+                // Placeholder: replaced wholesale by the scan-engine task.
+                PdfCmd::Search { .. } | PdfCmd::CancelSearch => {}
                 #[cfg(feature = "pro")]
                 PdfCmd::Form { page, ev } => form_events.push((page, ev)),
                 #[cfg(feature = "pro")]
