@@ -3,6 +3,7 @@
 ## Both editions
 
 - [ ] Full text search
+- [ ] Page history — let users navigate back through the page view history
 
 ## Pro edition
 
