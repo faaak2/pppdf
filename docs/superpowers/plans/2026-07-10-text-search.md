@@ -1530,13 +1530,6 @@ fn search_streams_hits_in_wrap_order_with_sane_rects() {
         })
         .unwrap();
     let hits = collect_hits(&reply_rx, 1);
-    // 1 Loaded + 2 SearchHits + 1 SearchDone have been received: at least
-    // that many wakes must have fired (a missing Hits/Done wake shows here).
-    assert!(
-        wakes.load(std::sync::atomic::Ordering::Relaxed) >= 4,
-        "every search reply must be sent with wake(): {} wakes",
-        wakes.load(std::sync::atomic::Ordering::Relaxed)
-    );
     let pages: Vec<u16> = hits.iter().map(|(p, _)| *p).collect();
     assert_eq!(pages, vec![0, 2]);
     assert_eq!(hits[0].1.len(), 2, "two 'dragon' hits on page 0");
@@ -1570,6 +1563,16 @@ fn search_streams_hits_in_wrap_order_with_sane_rects() {
 
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
+    // Assert wakes only AFTER the join: the worker sends each reply and
+    // THEN wakes, so a mid-stream count races that last wake. The joined
+    // thread proves every wake executed. Two scans ran:
+    // 1 Loaded + 2 × (2 SearchHits + 1 SearchDone) = 7 wakes minimum —
+    // a missing Hits or Done wake shows up as a shortfall here.
+    assert!(
+        wakes.load(std::sync::atomic::Ordering::Relaxed) >= 7,
+        "every search reply must be sent with wake(): {} wakes",
+        wakes.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 #[test]
