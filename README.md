@@ -7,6 +7,7 @@ rulebook next to your VTT and it looks like a page lying on the desktop.
 - Full PDF rendering (PDFium — the same engine Chrome uses, as a plain DLL;
   no browser, no web runtime)
 - Clickable in-document links; table of contents from the PDF outline
+- Full-text search (Ctrl+F) with live match highlighting
 - Single page, always crisp, fit-to-window; Ctrl+wheel zoom for maps
 - One window per book — run several instances side by side
 - A single self-contained ~8 MB exe, no installation, nothing persisted
