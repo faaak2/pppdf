@@ -50,6 +50,12 @@ pub const CMD_OPEN_NEW_WINDOW: usize = 7;
 pub const CMD_HELP: usize = 8;
 pub const CMD_ALWAYS_ON_TOP: usize = 9;
 
+/// WM_APPCOMMAND commands (winuser.h) — sent by the mouse back/forward
+/// X-buttons (DefWindowProc synthesizes them from unhandled X-button
+/// clicks, client and non-client alike) and keyboard browser keys.
+const APPCOMMAND_BROWSER_BACKWARD: u32 = 1;
+const APPCOMMAND_BROWSER_FORWARD: u32 = 2;
+
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
 
@@ -863,6 +869,45 @@ impl Ui {
                     self.on_key(wparam.0 as u16);
                     LRESULT(0)
                 }
+                WM_SYSKEYDOWN => {
+                    // Alt+Left / Alt+Right = history back / forward. Bit 29
+                    // of lparam is the Alt (context) flag: set for real
+                    // Alt+key chords, clear for the F10 family. ONLY the two
+                    // arrows are claimed — everything else falls through so
+                    // Alt+F4 (close) and Alt+Space (system menu) keep their
+                    // DefWindowProc meaning.
+                    let alt = (lparam.0 >> 29) & 1 == 1;
+                    let vk = wparam.0 as u16;
+                    if alt && vk == VK_LEFT.0 {
+                        self.nav_back();
+                        LRESULT(0)
+                    } else if alt && vk == VK_RIGHT.0 {
+                        self.nav_forward();
+                        LRESULT(0)
+                    } else {
+                        DefWindowProcW(self.hwnd, msg, wparam, lparam)
+                    }
+                }
+                WM_APPCOMMAND => {
+                    // Mouse back/forward buttons. Handled here (not
+                    // WM_XBUTTONDOWN) because the unzoomed page body
+                    // hit-tests as HTCAPTION, so client X-clicks arrive as
+                    // non-client messages — DefWindowProc converts BOTH
+                    // client and non-client X-button releases into this one
+                    // message. Return TRUE (1) when handled, per the docs.
+                    let cmd = ((lparam.0 as u32) >> 16) & !0xF000; // GET_APPCOMMAND_LPARAM
+                    match cmd {
+                        APPCOMMAND_BROWSER_BACKWARD => {
+                            self.nav_back();
+                            LRESULT(1)
+                        }
+                        APPCOMMAND_BROWSER_FORWARD => {
+                            self.nav_forward();
+                            LRESULT(1)
+                        }
+                        _ => DefWindowProcW(self.hwnd, msg, wparam, lparam),
+                    }
+                }
                 WM_CHAR => {
                     #[cfg(feature = "pro")]
                     crate::dlog!(
@@ -1126,6 +1171,17 @@ impl Ui {
                     self.sync_renders();
                     self.show_badge();
                     self.invalidate();
+                }
+            }
+            _ if vk == VK_BACK.0 && !ctrl => {
+                // Backspace = back, Shift+Backspace = forward (browser
+                // reflexes; Ctrl+Backspace stays free). The modal layers
+                // above already own Backspace where it means "delete"
+                // (go-to-page entry, password prompt, Pro form fields).
+                if shift {
+                    self.nav_forward();
+                } else {
+                    self.nav_back();
                 }
             }
             _ if vk == 0x30 || vk == VK_NUMPAD0.0 => {
@@ -1874,6 +1930,45 @@ impl Ui {
         #[cfg(feature = "pro")]
         self.form_kill_focus();
         if self.app.flip(delta) {
+            self.sync_renders();
+            self.show_badge();
+            self.invalidate();
+        }
+    }
+
+    /// True while a modal layer owns the keyboard (password prompt, F1
+    /// help, go-to-page entry) — history navigation must not fire
+    /// underneath. The TOC overlay is deliberately NOT modal here (it
+    /// falls through unhandled keys already); Pro typing mode is handled
+    /// by nav_back/nav_forward killing form focus, like the wheel does.
+    fn modal_active(&self) -> bool {
+        matches!(self.app.mode, crate::app::Mode::Password { .. })
+            || self.app.help_visible
+            || self.app.goto_entry_active()
+    }
+
+    /// Alt+Left / Backspace / mouse back: return to the last jump origin.
+    fn nav_back(&mut self) {
+        if self.modal_active() {
+            return;
+        }
+        #[cfg(feature = "pro")]
+        self.form_kill_focus();
+        if self.app.back() {
+            self.sync_renders();
+            self.show_badge();
+            self.invalidate();
+        }
+    }
+
+    /// Alt+Right / Shift+Backspace / mouse forward: re-do the jump.
+    fn nav_forward(&mut self) {
+        if self.modal_active() {
+            return;
+        }
+        #[cfg(feature = "pro")]
+        self.form_kill_focus();
+        if self.app.forward() {
             self.sync_renders();
             self.show_badge();
             self.invalidate();
