@@ -707,6 +707,19 @@ impl Ui {
                         }
                         self.form_kill_focus();
                     }
+                    // Double-clicks on the find bar are swallowed too —
+                    // without this, dblclk falls through to reset_zoom and
+                    // throws away the zoom (WM_LBUTTONDOWN's swallow has no
+                    // effect on the separate DBLCLK message).
+                    {
+                        let p = self.mouse_point(lparam);
+                        if self.app.search_active()
+                            && crate::search::bar_rect(self.app.client, self.dpi_scale())
+                                .contains(p)
+                        {
+                            return LRESULT(0);
+                        }
+                    }
                     self.dismiss_goto_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
