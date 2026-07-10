@@ -313,6 +313,11 @@ impl Renderer {
                             // a render-cache invalidation.
                             #[cfg(feature = "pro")]
                             self.draw_field_indication(rt, app)?;
+                            // Search-match highlights: client-side over the
+                            // cached bitmap (toggling/retyping is a repaint,
+                            // never a render), only when the page bitmap is
+                            // present — same gating as field indication.
+                            self.draw_search_highlights(rt, app)?;
                         }
                     }
                     if let Some(ov) = &d.overlay {
@@ -323,6 +328,9 @@ impl Renderer {
                     }
                     if let Some(buf) = &d.goto_entry {
                         self.draw_goto(rt, buf, d.pages, client)?;
+                    }
+                    if let Some(st) = &d.search {
+                        self.draw_search_bar(rt, st, client)?;
                     }
                 }
             }
@@ -406,6 +414,101 @@ impl Renderer {
         let s = unsafe { self.factory.CreateStrokeStyle(&props, None)? };
         self.dot_stroke = Some(s.clone());
         Ok(s)
+    }
+
+    /// Translucent washes over the current page's search matches — yellow
+    /// for every match, a stronger orange for the current one (Chromium's
+    /// scheme, distinct from Pro's pale-blue field wash).
+    fn draw_search_highlights(&mut self, rt: &ID2D1HwndRenderTarget, app: &App) -> Result<()> {
+        let Some(d) = app.doc() else { return Ok(()) };
+        let Some(st) = &d.search else { return Ok(()) };
+        let Some(pm) = st.matches_on(d.current) else { return Ok(()) };
+        unsafe {
+            let all = rt.CreateSolidColorBrush(&color(1.0, 0.85, 0.2, 0.28), None)?;
+            let cur = rt.CreateSolidColorBrush(&color(1.0, 0.55, 0.1, 0.45), None)?;
+            for (i, m) in pm.matches.iter().enumerate() {
+                let brush = if st.current == Some((d.current, i)) { &cur } else { &all };
+                // Every rect of a multi-rect (line-wrapped) match is painted.
+                for r in app.page_rects_window(&m.rects) {
+                    rt.FillRectangle(&rectf(r), brush);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The Ctrl+F find bar: a top-right rounded pill (goto-pill family)
+    /// showing the query (head-elided so the tail stays visible), the
+    /// "n / m" counter (ellipsis while scanning, red for a finished no-hit
+    /// scan, hidden while the query is under 2 chars), and Aa / W option
+    /// indicators (lit when active).
+    fn draw_search_bar(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        st: &crate::search::SearchState,
+        client: SizeU,
+    ) -> Result<()> {
+        let s = self.scale();
+        let r = crate::search::bar_rect(client, s);
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT { rect: rectf(r), radiusX: 8.0 * s, radiusY: 8.0 * s };
+            let bg = rt.CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 0.85), None)?;
+            rt.FillRoundedRectangle(&rr, &bg);
+            let border = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.25), None)?;
+            rt.DrawRoundedRectangle(&rr, &border, 1.0 * s, None);
+        }
+        let fmt = self.text_format(14.0, false)?;
+        let pad = 12.0 * s;
+        // Right zone: counter + Aa/W indicators; the query gets the rest.
+        let right_w = (150.0 * s).min(r.width() * 0.5);
+        let query_rect =
+            RectF { left: r.left + pad, top: r.top, right: r.right - right_w, bottom: r.bottom };
+        // Head-elide the query so its TAIL stays visible (~7 px per char at
+        // 14 DIP; exactness doesn't matter, NO_WRAP clips the rest).
+        let budget = ((query_rect.width() / s - 45.0) / 7.0).max(4.0) as usize;
+        let n = st.query.chars().count();
+        let shown: String = if n > budget {
+            format!("…{}", st.query.chars().skip(n - budget).collect::<String>())
+        } else {
+            st.query.clone()
+        };
+        self.draw_text(rt, &format!("Find: {shown}_"), &fmt, query_rect, color(1.0, 1.0, 1.0, 0.92))?;
+        // Counter — hidden while the query is illegal (< 2 chars).
+        if st.legal() {
+            let text = format!(
+                "{} / {}{}",
+                st.ordinal().unwrap_or(0),
+                st.total(),
+                if st.scanning { "…" } else { "" }
+            );
+            let col = if !st.scanning && st.total() == 0 {
+                color(1.0, 0.45, 0.45, 0.95) // scan finished with no hits
+            } else {
+                color(1.0, 1.0, 1.0, 0.7)
+            };
+            let counter_rect = RectF {
+                left: r.right - right_w,
+                top: r.top,
+                right: r.right - pad - 44.0 * s,
+                bottom: r.bottom,
+            };
+            self.draw_text(rt, &text, &fmt, counter_rect, col)?;
+        }
+        // Aa / W indicators: lit when the option is on, dim when off.
+        let ind_fmt = self.text_format(12.0, false)?;
+        let lit = color(1.0, 0.85, 0.2, 0.95);
+        let dim = color(1.0, 1.0, 1.0, 0.3);
+        let aa_rect = RectF {
+            left: r.right - pad - 40.0 * s,
+            top: r.top,
+            right: r.right - pad - 16.0 * s,
+            bottom: r.bottom,
+        };
+        let w_rect =
+            RectF { left: r.right - pad - 14.0 * s, top: r.top, right: r.right - pad, bottom: r.bottom };
+        self.draw_text(rt, "Aa", &ind_fmt, aa_rect, if st.options.match_case { lit } else { dim })?;
+        self.draw_text(rt, "W", &ind_fmt, w_rect, if st.options.whole_word { lit } else { dim })?;
+        Ok(())
     }
 
     /// Full-window F1 help: a dimmed backdrop with a centered two-column table
