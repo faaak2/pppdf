@@ -120,7 +120,8 @@ window.rs:1309-1321). The find bar's `_ if ctrl => return false` fall-through
 code. Gated on Doc mode with pages > 0.
 
 - Page already bookmarked → remove, `SaveBookmarks`, toast *"Bookmark
-  removed"*.
+  removed"* — the same bottom-right badge pill the goto-page navigation
+  shows (`show_toast` → `draw_badge`, hold-then-fade timing, no new UI).
 - Not bookmarked → open the **name prompt**: `DocState.bookmark_entry:
   Option<String>` (pro-gated), modeled exactly on the goto-entry pattern
   (start/active/char/backspace/cancel/commit on `App`, own modal rung beside
