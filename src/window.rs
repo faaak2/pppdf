@@ -1335,6 +1335,7 @@ impl Ui {
                 }
                 0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
                 0x53 if ctrl => self.save_doc(), // Ctrl+S
+                0x42 if ctrl => self.bookmark_toggle_ui(), // Ctrl+B (commits the field first)
                 0x46 if ctrl => {
                     // Ctrl+F leaves the field (commit) and opens the find bar.
                     self.form_kill_focus();
@@ -2042,6 +2043,9 @@ impl Ui {
         }
         if self.app.bookmark_on_current().is_some() {
             if self.app.bookmark_remove_current().is_some() {
+                if let Some(d) = self.app.doc_mut() {
+                    d.overlay = None; // panel would show the removed bookmark
+                }
                 self.send_bookmarks();
                 self.show_toast_centered("Bookmark removed".into());
                 self.invalidate();

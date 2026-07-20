@@ -207,6 +207,8 @@ mod tests {
         assert_eq!(natural_name_cmp("ch2", "ch2b"), Ordering::Less, "prefix sorts first");
         assert_eq!(natural_name_cmp("a10b2", "a10b10"), Ordering::Less);
         assert_eq!(natural_name_cmp("12", "abc"), Ordering::Less, "digit < letter (ASCII)");
+        // Non-ASCII digits deliberately compare as text, per the doc comment.
+        assert_eq!(natural_name_cmp("٢", "١٠"), Ordering::Greater, "Arabic-Indic digits are text");
     }
 
     #[test]

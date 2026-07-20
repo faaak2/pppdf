@@ -91,4 +91,5 @@ Custom bookmarks (Pro) — any multi-page PDF in a writable folder:
 - [ ] Encrypted PDF: bookmark an open password-protected file, close, reopen (re-enter the password) — bookmark intact
 - [ ] While the prompt is open: mouse wheel / click / right-click menu dismiss it; Ctrl+F cancels it and opens the find bar; mouse back/forward do nothing
 - [ ] G goto prompt open: Ctrl+B is swallowed (no prompt stacking); find bar open: Ctrl+B closes the bar before opening the prompt
+- [ ] Ctrl+B while typing in a form field: commits the field (focus leaves) and opens the prompt; Ctrl+B on a bookmarked page while typing removes the bookmark (typing mode may stay); with the TOC panel open, Ctrl+B removal closes the panel (no stale row)
 - [ ] Free edition: Ctrl+B toasts "Custom bookmarks are a pppdf Pro feature" (bottom-right) on EVERY press; Pro-created bookmarks still display in the free TOC and navigate

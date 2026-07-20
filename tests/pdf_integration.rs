@@ -1393,11 +1393,14 @@ fn bookmark_save_excludes_unsaved_form_edits() {
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 
-    // Disk: the typed text must NOT be there...
+    // Disk: the typed text must NOT be there — FullName must read exactly as
+    // it does in the pristine fixture (a != "Ab" oracle would also pass on an
+    // unrelated lookup failure).
     let values = pppdf::pro::forms::read_field_values(&work).unwrap();
-    assert_ne!(
+    let pristine = pppdf::pro::forms::read_field_values(&src).unwrap();
+    assert_eq!(
         values.get("FullName"),
-        Some(&Some("Ab".to_string())),
+        pristine.get("FullName"),
         "bookmark save leaked an unsaved form edit to disk"
     );
     // ...but the bookmark must be.

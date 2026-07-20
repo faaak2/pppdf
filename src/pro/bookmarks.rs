@@ -11,6 +11,11 @@ use std::path::Path;
 /// one in-memory document. The caller decides what gets saved where.
 fn set_attachment(doc: &mut PdfDocument, bookmarks: &[Bookmark]) -> Result<(), String> {
     let atts = doc.attachments_mut();
+    // Delete-then-create is not transactional: if the create below fails
+    // after the delete, the LIVE doc is left attachment-less while DocState
+    // still holds the set — a later Ctrl+S would persist without bookmarks
+    // until the next successful toggle rewrites them (self-healing, and the
+    // attachment API failing on an open doc is an extreme edge).
     // Delete every existing pppdf.bookmarks entry, scanning backwards —
     // deletion shifts the indices above the deleted slot.
     let mut i = atts.len();

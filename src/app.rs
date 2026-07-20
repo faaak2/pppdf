@@ -860,6 +860,9 @@ impl App {
 
     /// Open the name prompt. Refused without a document or on a
     /// zero-page document (the flip/goto guard).
+    ///
+    /// Calling it again while a prompt is open resets the buffer (currently
+    /// unreachable: the entry rung swallows a second Ctrl+B).
     #[cfg(feature = "pro")]
     pub fn bookmark_entry_start(&mut self) -> bool {
         let Some(d) = self.doc_mut() else { return false };
@@ -2140,6 +2143,29 @@ mod tests {
             assert_eq!(a.bookmark_remove_current(), Some("Lai".to_string()));
             assert!(a.doc().unwrap().bookmarks.is_empty());
             assert_eq!(a.bookmark_remove_current(), None, "nothing left to remove");
+        }
+
+        #[test]
+        fn bookmark_activation_records_history() {
+            // The spec routes bookmark navigation through App::goto — the
+            // overlay's activate() yields the page, goto records the origin.
+            let mut a = app_with_doc(10);
+            a.flip(2); // current = 2
+            a.bookmark_entry_start();
+            a.bookmark_entry_commit(); // "Page 3" on page 2
+            a.goto(7); // move away (records 2)
+            a.toggle_overlay();
+            let page = {
+                let ov = a.doc().unwrap().overlay.as_ref().unwrap();
+                // Row 0 = "Bookmarks" header, row 1 = the bookmark.
+                assert_eq!(ov.items[1].page, Some(2));
+                ov.items[1].page.unwrap()
+            };
+            a.toggle_overlay(); // close (window.rs closes it on activate)
+            assert!(a.goto(page), "activation navigates via goto");
+            assert_eq!(a.doc().unwrap().current, 2);
+            assert!(a.back(), "the jump was recorded");
+            assert_eq!(a.doc().unwrap().current, 7);
         }
 
         #[test]
