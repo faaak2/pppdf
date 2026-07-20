@@ -36,7 +36,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl+O", "Open file \u{b7} drop a PDF works too"),
     ("Ctrl+N", "Open a new empty window"),
     ("Ctrl+Shift+O", "Open a file in a new window"),
-    ("F11", "Fill the screen (work area) / restore"),
+    ("F11", "Fit screen height / fill / restore"),
     ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
 ];
 

@@ -80,7 +80,7 @@ same rows minus a handful of self-evident ones, to stay readable.
 | Ctrl+O | Open file · drop a PDF works too |
 | Ctrl+N | Open a new empty window |
 | Ctrl+Shift+O | Open a file in a new window |
-| F11 | Fill the screen (work area) / restore |
+| F11 | Fit screen height / fill / restore |
 | F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
 | Click a form field | Fill it · Tab/Shift+Tab next/previous · Esc leaves (Pro) |

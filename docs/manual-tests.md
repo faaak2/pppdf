@@ -9,7 +9,11 @@ Window (the flagship — test every release):
 - [ ] Double-click page never maximizes (resets zoom instead)
 - [ ] Minimize/restore via taskbar + Win+Down: animations play
 - [ ] Drag between two monitors with different DPI: crisp re-render, correct size (WM_DPICHANGED)
-- [ ] F11 fill + restore on both monitors
+- [ ] F11 cycle on a portrait PDF: height-fit (work-area height, page aspect, nearest edge) → fill → restore; on both monitors
+- [ ] F11 height-fit snaps left when the window sits in the left half of the screen, right in the right half
+- [ ] F11 height-fit after rotating to landscape (R): wider window, clamped to the work width if it would overflow
+- [ ] F11 with no document open: two-state fill ↔ restore, no height-fit stage
+- [ ] Taskbar stays visible and usable in both the height-fit and fill stages
 - [ ] Two instances side by side (one window per book)
 - [ ] F1 overlay: table fits and stays readable from ~600 px tall up to maximized; any click dismisses it
 - [ ] Right-click → About: names the running edition (pppdf / pppdf Pro) and Cargo.toml's version
