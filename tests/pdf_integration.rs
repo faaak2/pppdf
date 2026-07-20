@@ -245,13 +245,13 @@ fn form_events_mark_dirty_and_rerender() {
     let (cx, cy) = center(text);
     let (bx, by) = center(checkbox);
     // Toggle the checkbox: its value change fires FFI_OnChange -> FormDirty.
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: bx, y: by, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: bx, y: by, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x: bx, y: by, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x: bx, y: by, modifiers: 0 } }).unwrap();
     // Click into the text field and type 'A': focusing it starts the caret
     // blink, whose FFI_Invalidate drives an unsolicited visible re-render.
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'A' as u16, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::Char { c: 'A' as u16, modifiers: 0 } }).unwrap();
     // Expect FormDirty and at least one unsolicited Rendered within the batch replies.
     let (mut dirty, mut rerendered) = (false, false);
     let deadline = std::time::Instant::now() + WAIT;
@@ -265,7 +265,7 @@ fn form_events_mark_dirty_and_rerender() {
     }
     assert!(dirty, "form input must produce FormDirty");
     assert!(rerendered, "form input must trigger an unsolicited visible re-render");
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }
@@ -364,7 +364,7 @@ fn fill_save_reload_roundtrip() {
         FormEvent::Char { c: 'A' as u16, modifiers: 0 },
         FormEvent::Char { c: 'b' as u16, modifiers: 0 },
     ] {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev }).unwrap();
     }
     // Kill focus before moving to a different widget: this both commits
     // FullName's typed text (matching how save() itself force-kills focus)
@@ -374,12 +374,12 @@ fn fill_save_reload_roundtrip() {
     // multi-minute run pegging a CPU core with continuous re-renders) —
     // i.e. a real hazard when switching focus between widgets without an
     // intervening commit, not just test flakiness. See task-4-report.md.
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::KillFocus }).unwrap();
     for ev in [
         FormEvent::MouseDown { x: mx, y: my, modifiers: 0 },
         FormEvent::MouseUp { x: mx, y: my, modifiers: 0 },
     ] {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev }).unwrap();
     }
 
     cmd_tx.send(PdfCmd::SaveDoc).unwrap();
@@ -484,13 +484,13 @@ fn focus_transition_without_killfocus_does_not_flood_renders() {
     let (ox, oy) = center(other_widget);
 
     // Focus the text field: starts PDFium's caret-blink timer.
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: tx, y: ty, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: tx, y: ty, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x: tx, y: ty, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x: tx, y: ty, modifiers: 0 } }).unwrap();
     // Click straight into the Other widget WITHOUT an intervening
     // KillFocus — the natural trigger for the flood (a widget click alone
     // does not kill the caret timer per the investigation).
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: ox, y: oy, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: ox, y: oy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x: ox, y: oy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x: ox, y: oy, modifiers: 0 } }).unwrap();
 
     // Drain replies for a bounded window, counting Rendered messages.
     let drain_window = Duration::from_secs(2);
@@ -514,7 +514,7 @@ fn focus_transition_without_killfocus_does_not_flood_renders() {
          bounded ceiling is 80 for a 2s window at the ~30/s throttle)"
     );
 
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }
@@ -599,8 +599,8 @@ fn throttled_invalidate_flushes_after_save_kills_timers() {
 
     // Toggle the checkbox: FFI_Invalidate -> an unsolicited render that
     // arms the 33ms throttle window.
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 } }).unwrap();
     let deadline = std::time::Instant::now() + WAIT;
     let mut rendered = false;
     while std::time::Instant::now() < deadline && !rendered {
@@ -743,8 +743,8 @@ fn typing_repaints_only_with_mouse_enter_before_click() {
         n
     };
     let bare_click = |x: f32, y: f32| {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseDown { x, y, modifiers: 0 } }).unwrap();
-        cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseUp { x, y, modifiers: 0 } }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseDown { x, y, modifiers: 0 } }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseUp { x, y, modifiers: 0 } }).unwrap();
     };
 
     // --- Phase A: checkbox holds focus; movement-free click into the text
@@ -753,7 +753,7 @@ fn typing_repaints_only_with_mouse_enter_before_click() {
     drain_rendered(Duration::from_millis(500)); // settle the toggle repaint
     bare_click(cx, cy);
     drain_rendered(Duration::from_millis(500)); // settle whatever the click repaints
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'Z' as u16, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::Char { c: 'Z' as u16, modifiers: 0 } }).unwrap();
     let bare = drain_rendered(Duration::from_millis(700));
     assert_eq!(
         bare, 0,
@@ -767,10 +767,10 @@ fn typing_repaints_only_with_mouse_enter_before_click() {
     // enter, click, type. ---
     bare_click(mx, my); // toggle Married back; checkbox regains focus
     drain_rendered(Duration::from_millis(500));
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 } }).unwrap();
     bare_click(cx, cy);
     drain_rendered(Duration::from_millis(500)); // settle focus-ring/caret repaints
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::Char { c: 'X' as u16, modifiers: 0 } }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::Char { c: 'X' as u16, modifiers: 0 } }).unwrap();
     let entered = drain_rendered(Duration::from_secs(2));
     assert!(
         entered > 0,
@@ -779,7 +779,7 @@ fn typing_repaints_only_with_mouse_enter_before_click() {
          window.rs relies on"
     );
 
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }
@@ -859,7 +859,7 @@ fn focused_text_edit_pixels_are_rendered() {
         FormEvent::Char { c: 'W' as u16, modifiers: 0 },
         FormEvent::Char { c: 'W' as u16, modifiers: 0 },
     ] {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev }).unwrap();
     }
     // Explicit visible render AFTER the edits; its reply must contain the
     // in-edit glyphs (field still focused — value NOT committed).
@@ -887,9 +887,101 @@ fn focused_text_edit_pixels_are_rendered() {
          through the form engine's page handle, not a private page load"
     );
 
-    cmd_tx.send(PdfCmd::Form { page: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev: FormEvent::KillFocus }).unwrap();
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
+}
+
+/// Regression: typing into a form field on a page reached by a cache-hit
+/// flip must re-render THAT page at the size it's displayed, not the page
+/// (or size) we came from. The PDF thread's visible-page memo is refreshed
+/// only by explicit visible Render commands; a cache-hit flip sends none, so
+/// a form invalidation would repaint the stale view and the edit would never
+/// appear on screen (STA Captain's Log repro: fields fillable on page 1,
+/// dead on pages 2+). Exercised with page 2 the SAME size as page 1 (stale
+/// page index) and a DIFFERENT size (stale page index AND px).
+#[cfg(feature = "pro")]
+fn form_edit_on_cache_hit_page_rerenders_that_page(second_h: u32) {
+    use pppdf::types::FormEvent;
+
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx
+        .send(PdfCmd::Load { path: common::two_page_form_fixture_path(second_h), password: None })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, pages, .. } => {
+            assert!(has_forms, "fixture must report a form");
+            assert_eq!(pages, 2);
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    // Establish the visible page as page 0 (the only place last_visible is
+    // set). We never send a visible Render for page 1 — that models the
+    // instant cache-hit flip that leaves last_visible pointing at page 0.
+    cmd_tx.send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { page, .. } => assert_eq!(page, 0),
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+
+    // Interact with page 1's field (rect [100 (h-80) 500 (h-40)] -> center
+    // x=300, y=h-60), tagging the events with page 1's own fit view — this
+    // is what send_form does from the live layout.
+    let p1_px = SizeU { w: 612, h: second_h };
+    let fy = second_h as f32 - 60.0;
+    for ev in [
+        FormEvent::MouseMove { x: 300.0, y: fy, modifiers: 0 },
+        FormEvent::MouseDown { x: 300.0, y: fy, modifiers: 0 },
+        FormEvent::MouseUp { x: 300.0, y: fy, modifiers: 0 },
+        FormEvent::Char { c: 'W' as u16, modifiers: 0 },
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 1, px: p1_px, rot: 0, ev }).unwrap();
+    }
+
+    // The unsolicited re-render the form invalidation triggers must target
+    // page 1 at page 1's size. Before the fix it renders page 0 (stale memo),
+    // so a page-1 render never arrives and this times out.
+    let mut rendered = Vec::new();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut hit = false;
+    while std::time::Instant::now() < deadline && !hit {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Rendered { page, px, .. }) => {
+                rendered.push((page, px));
+                if page == 1 && px == p1_px {
+                    hit = true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        hit,
+        "form edit on page 1 must re-render page 1 at {p1_px:?}; instead the thread rendered \
+         {rendered:?} (stale memo repainted the page/size we flipped away from)"
+    );
+
+    cmd_tx.send(PdfCmd::Form { page: 1, px: p1_px, rot: 0, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+#[test]
+#[cfg(feature = "pro")]
+fn form_edit_on_same_size_cache_hit_page_rerenders_it() {
+    form_edit_on_cache_hit_page_rerenders_that_page(792);
+}
+
+/// The mixed-size case: page 2 is taller, so the stale memo carries the wrong
+/// px too — a page-index-only fix would still render at page 1's size and the
+/// correctly-sized cached prefetch would win, leaving the edit invisible.
+#[test]
+#[cfg(feature = "pro")]
+fn form_edit_on_diff_size_cache_hit_page_rerenders_it() {
+    form_edit_on_cache_hit_page_rerenders_that_page(1008);
 }
 
 #[test]
@@ -1367,7 +1459,7 @@ fn bookmark_save_excludes_unsaved_form_edits() {
         // Commit the value into the LIVE doc's field — but never save it.
         FormEvent::KillFocus,
     ] {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev }).unwrap();
     }
     cmd_tx
         .send(PdfCmd::SaveBookmarks {
@@ -1475,7 +1567,7 @@ fn form_save_preserves_bookmarks() {
         FormEvent::Char { c: 'b' as u16, modifiers: 0 },
         FormEvent::KillFocus,
     ] {
-        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+        cmd_tx.send(PdfCmd::Form { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, ev }).unwrap();
     }
     cmd_tx.send(PdfCmd::SaveDoc).unwrap();
     let deadline = std::time::Instant::now() + WAIT;

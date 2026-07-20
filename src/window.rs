@@ -2069,10 +2069,14 @@ impl Ui {
 
     #[cfg(feature = "pro")]
     fn send_form(&self, ev: crate::types::FormEvent) {
-        if let Some(d) = self.app.doc() {
-            let page = d.current;
-            crate::dlog!("ui: send_form page={page} ev={ev:?}");
-            self.send_pdf(PdfCmd::Form { page, ev });
+        // Tag the event with the page's live view (current_px already folds
+        // in zoom and rotation) so the PDF thread re-renders exactly what is
+        // displayed. Without the px/rot, a form edit on a page reached by a
+        // cache-hit flip repaints the wrong page (or the wrong size).
+        if let (Some(d), Some(px)) = (self.app.doc(), self.app.current_px()) {
+            let (page, rot) = (d.current, d.rot);
+            crate::dlog!("ui: send_form page={page} px={px:?} rot={rot} ev={ev:?}");
+            self.send_pdf(PdfCmd::Form { page, px, rot, ev });
         }
     }
 

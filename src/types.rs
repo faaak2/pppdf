@@ -105,9 +105,14 @@ pub enum PdfCmd {
     Search { id: u32, query: String, options: SearchOptions, start_page: u16 },
     /// Kill the active scan and any `Search` queued before this command.
     CancelSearch,
-    /// One interactive form event targeting `page`.
+    /// One interactive form event targeting `page`, tagged with the view
+    /// (`px` output size + `rot`) the page is displayed at right now. The
+    /// PDF thread adopts this as its visible-page memo so the re-render the
+    /// event triggers repaints exactly what's on screen — even when the page
+    /// was reached by a cache-hit flip that sent no visible `Render` (see
+    /// `last_visible` in pdf.rs). `px`/`rot` match `Render`'s fields.
     #[cfg(feature = "pro")]
-    Form { page: u16, ev: FormEvent },
+    Form { page: u16, px: SizeU, rot: u8, ev: FormEvent },
     /// Save the current document back to its source path.
     #[cfg(feature = "pro")]
     SaveDoc,
