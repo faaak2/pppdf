@@ -590,5 +590,13 @@ mod tests {
     #[test]
     fn height_fit_degenerate_aspect_falls_back_to_work_width() {
         assert_eq!(height_fit_rect((0, 0, 1920, 1040), 0.0, 500), (0, 0, 1920, 1040));
+        assert_eq!(height_fit_rect((0, 0, 1920, 1040), f32::NAN, 500), (0, 0, 1920, 1040));
+    }
+
+    #[test]
+    fn height_fit_tie_boundary_on_odd_work_width() {
+        let a = 612.0 / 792.0;
+        assert_eq!(height_fit_rect((0, 0, 1921, 1040), a, 960), (0, 0, 804, 1040));
+        assert_eq!(height_fit_rect((0, 0, 1921, 1040), a, 961), (1117, 0, 1921, 1040));
     }
 }
