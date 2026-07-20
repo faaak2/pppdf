@@ -2187,6 +2187,7 @@ mod tests {
         #[test]
         fn bookmark_entry_guards_zero_pages_and_no_doc() {
             assert!(!App::new().bookmark_entry_start());
+            assert_eq!(App::new().bookmark_remove_current(), None, "doc-less remove guard");
             let mut a = App::new();
             a.set_client(SizeU { w: 1000, h: 1000 });
             a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false, vec![]);
@@ -2210,6 +2211,34 @@ mod tests {
             assert_eq!(a.doc().unwrap().bookmarks.len(), 1, "came back with the stash");
             a.doc_loaded(PathBuf::from("y.pdf"), 5, vec![LETTER; 5], vec![], false, vec![]);
             assert!(a.doc().unwrap().bookmarks.is_empty());
+        }
+
+        #[test]
+        fn bookmark_commit_refuses_duplicate_page() {
+            let mut a = app_with_doc(10);
+            // First commit on page 3: "First"
+            a.goto(3);
+            a.bookmark_entry_start();
+            a.bookmark_entry_char('F');
+            a.bookmark_entry_char('i');
+            a.bookmark_entry_char('r');
+            a.bookmark_entry_char('s');
+            a.bookmark_entry_char('t');
+            assert_eq!(a.bookmark_entry_commit(), Some("First".to_string()));
+            assert_eq!(a.doc().unwrap().bookmarks.len(), 1);
+            assert_eq!(a.doc().unwrap().bookmarks[0].name, "First");
+            // Try to commit again on same page: should refuse
+            assert!(a.bookmark_entry_start());
+            a.bookmark_entry_char('S');
+            a.bookmark_entry_char('e');
+            a.bookmark_entry_char('c');
+            a.bookmark_entry_char('o');
+            a.bookmark_entry_char('n');
+            a.bookmark_entry_char('d');
+            assert_eq!(a.bookmark_entry_commit(), None, "duplicate page refuses commit");
+            assert!(!a.bookmark_entry_active(), "prompt closes on duplicate refusal");
+            assert_eq!(a.doc().unwrap().bookmarks.len(), 1, "original entry unchanged");
+            assert_eq!(a.doc().unwrap().bookmarks[0].name, "First");
         }
     }
 }
