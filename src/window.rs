@@ -1431,12 +1431,20 @@ impl Ui {
             _ if vk == VK_RIGHT.0 => ov.expand_selected(),
             _ if vk == VK_LEFT.0 => ov.collapse_selected(),
             _ if vk == VK_RETURN.0 => {
-                let page = ov.activate();
-                d.overlay = None;
-                if let Some(page) = page {
-                    if self.app.goto(page) {
-                        self.sync_renders();
-                        self.show_badge();
+                match ov.activate() {
+                    Some(page) => {
+                        d.overlay = None;
+                        if self.app.goto(page) {
+                            self.sync_renders();
+                            self.show_badge();
+                        }
+                    }
+                    // A row with no page target (the Bookmarks header, or an
+                    // outline entry whose destination didn't resolve): toggle
+                    // its children instead of uselessly closing the panel.
+                    None => {
+                        let sel = ov.selected;
+                        ov.toggle(sel);
                     }
                 }
             }
@@ -1680,13 +1688,15 @@ impl Ui {
                 ov.toggle(idx);
             } else {
                 ov.select(idx);
-                let page = ov.activate();
-                d.overlay = None; // jump closes the panel
-                if let Some(page) = page {
-                    if self.app.goto(page) {
-                        self.sync_renders();
-                        self.show_badge();
+                match ov.activate() {
+                    Some(page) => {
+                        d.overlay = None; // jump closes the panel
+                        if self.app.goto(page) {
+                            self.sync_renders();
+                            self.show_badge();
+                        }
                     }
+                    None => ov.toggle(idx), // header row: click toggles, panel stays
                 }
             }
             self.invalidate();

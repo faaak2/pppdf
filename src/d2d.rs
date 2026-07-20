@@ -644,7 +644,12 @@ impl Renderer {
                 right: PANEL_W * s - 8.0 * s,
                 bottom: row.bottom,
             };
-            self.draw_text(rt, &it.title, &fmt, title_rect, color(1.0, 1.0, 1.0, 0.9))?;
+            let ink = if ov.header_idx == Some(idx) {
+                color(0.74, 0.78, 0.96, 1.0) // section header: the help accent
+            } else {
+                color(1.0, 1.0, 1.0, 0.9)
+            };
+            self.draw_text(rt, &it.title, &fmt, title_rect, ink)?;
         }
         Ok(())
     }

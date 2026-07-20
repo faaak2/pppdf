@@ -538,7 +538,35 @@ impl App {
         let Some(d) = self.doc_mut() else { return };
         d.overlay = match d.overlay.take() {
             Some(_) => None,
-            None => Some(OutlineState::new(d.outline.clone())),
+            None => {
+                // User bookmarks first (name-sorted, natural order), under a
+                // section-header row; the document outline follows unchanged.
+                // Built fresh on every open, so bookmark edits while the
+                // panel is closed need no invalidation anywhere.
+                let mut items: Vec<OutlineItem> = Vec::new();
+                let mut header_idx = None;
+                if !d.bookmarks.is_empty() {
+                    header_idx = Some(0);
+                    items.push(OutlineItem {
+                        title: "Bookmarks".into(),
+                        page: None,
+                        depth: 0,
+                        has_children: true,
+                    });
+                    let mut sorted: Vec<&crate::types::Bookmark> = d.bookmarks.iter().collect();
+                    sorted.sort_by(|a, b| crate::bookmarks::display_cmp(a, b));
+                    items.extend(sorted.into_iter().map(|b| OutlineItem {
+                        title: b.name.clone(),
+                        page: Some(b.page),
+                        depth: 1,
+                        has_children: false,
+                    }));
+                }
+                items.extend(d.outline.iter().cloned());
+                let mut ov = OutlineState::new(items);
+                ov.header_idx = header_idx;
+                Some(ov)
+            }
         };
     }
 
@@ -1658,6 +1686,44 @@ mod tests {
         assert_eq!(a.doc().unwrap().bookmarks, vec![Bookmark { page: 3, name: "Camp".into() }]);
         a.doc_loaded(PathBuf::from("y.pdf"), 10, vec![LETTER; 10], vec![], false, vec![]);
         assert!(a.doc().unwrap().bookmarks.is_empty(), "bookmarks die with the document");
+    }
+
+    #[test]
+    fn toggle_overlay_prepends_name_sorted_bookmarks_with_header() {
+        let mut a = App::new();
+        a.set_client(SizeU { w: 1000, h: 1000 });
+        a.doc_loaded(
+            PathBuf::from("x.pdf"),
+            20,
+            vec![LETTER; 20],
+            vec![OutlineItem { title: "Ch 1".into(), page: Some(0), depth: 0, has_children: false }],
+            false,
+            vec![
+                Bookmark { page: 3, name: "10 - Appendix".into() },
+                Bookmark { page: 5, name: "2 - Maps".into() },
+            ],
+        );
+        a.toggle_overlay();
+        let d = a.doc().unwrap();
+        let ov = d.overlay.as_ref().unwrap();
+        let titles: Vec<&str> = ov.items.iter().map(|it| it.title.as_str()).collect();
+        // Header, bookmarks in NATURAL name order (2 before 10), then the
+        // document outline unchanged.
+        assert_eq!(titles, vec!["Bookmarks", "2 - Maps", "10 - Appendix", "Ch 1"]);
+        assert_eq!(ov.header_idx, Some(0));
+        assert_eq!(ov.items[0].page, None);
+        assert!(ov.items[0].has_children);
+        assert_eq!((ov.items[1].page, ov.items[1].depth), (Some(5), 1));
+        assert_eq!(ov.visible(), vec![0, 1, 2, 3], "header auto-expands (depth-0 rule)");
+        // DocState's own vec stays page-sorted — display order is derived.
+        assert_eq!(d.bookmarks[0].page, 3);
+        // Without bookmarks: no header, outline only, empty-message case intact.
+        a.toggle_overlay(); // close
+        a.doc_mut().unwrap().bookmarks.clear();
+        a.toggle_overlay();
+        let ov2 = a.doc().unwrap().overlay.as_ref().unwrap();
+        assert_eq!(ov2.items.len(), 1);
+        assert_eq!(ov2.header_idx, None);
     }
 
     // --- password mode ---
