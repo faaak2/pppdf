@@ -120,8 +120,10 @@ window.rs:1309-1321). The find bar's `_ if ctrl => return false` fall-through
 code. Gated on Doc mode with pages > 0.
 
 - Page already bookmarked → remove, `SaveBookmarks`, toast *"Bookmark
-  removed"* — the same bottom-right badge pill the goto-page navigation
-  shows (`show_toast` → `draw_badge`, hold-then-fade timing, no new UI).
+  removed"* — drawn as a **bottom-center** pill, in the same spot as the
+  goto-page prompt pill (`draw_goto`), reusing the existing badge's
+  hold-then-fade timing. A positional variant of the toast, not new
+  machinery; both bookmark toasts (add and remove) use it.
 - Not bookmarked → open the **name prompt**: `DocState.bookmark_entry:
   Option<String>` (pro-gated), modeled exactly on the goto-entry pattern
   (start/active/char/backspace/cancel/commit on `App`, own modal rung beside
@@ -131,14 +133,16 @@ code. Gated on Doc mode with pages > 0.
 - Enter commits; **empty buffer commits the default name "Page N"** (1-based,
   shown as placeholder in the prompt). Esc cancels — no bookmark. Ctrl+F
   inside the prompt cancels it and opens find (the goto precedent).
-- Commit → insert page-sorted, `SaveBookmarks`, toast *"Bookmarked: {name}"*.
+- Commit → insert page-sorted, `SaveBookmarks`, toast *"Bookmarked: {name}"*
+  (same bottom-center pill as the removal toast).
 - Drawn as a bottom-center pill like `draw_goto` (`draw_bookmark_entry`,
   pro-gated).
 
 **Free — Ctrl+B** toasts *"Custom bookmarks are a pppdf Pro feature"* —
 **every press**, not one-shot (a deliberate chord deserves feedback each
 time, unlike the incidental form-field click hint). `#[cfg(not(feature =
-"pro"))]` arm; no new state.
+"pro"))]` arm; no new state. Stays on the existing bottom-right badge pill,
+matching the forms hint.
 
 ## TOC integration (shared code)
 
