@@ -132,6 +132,11 @@ pub struct Ui {
     /// Active drag-pan state while the left button is held over a zoomed page.
     pub drag: Option<Drag>,
     pub suppress_click: bool,
+    /// A click just dismissed a modal surface (F1 help) or activated a TOC
+    /// entry, closing the panel. If that click turns out to be the first of
+    /// a double-click, the second one hit-tests as HTCAPTION against the
+    /// now-bare page and would cycle the window — swallow it once.
+    pub swallow_dblclk: bool,
     /// Pre-F11 window rect, so the cycle's final press restores it exactly.
     pub saved_rect: Option<RECT>,
     /// F11 cycle stage: Normal -> HeightFit -> Filled -> Normal.
@@ -215,6 +220,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             badge: None,
             drag: None,
             suppress_click: false,
+            swallow_dblclk: false,
             saved_rect: None,
             fill_stage: FillStage::Normal,
             wheel_residual: 0,
@@ -403,6 +409,9 @@ impl Ui {
                     LRESULT(hit as isize)
                 }
                 WM_NCLBUTTONDOWN => {
+                    // A fresh press is never the second click of a
+                    // double-click, so this self-corrects a stale latch.
+                    self.swallow_dblclk = false;
                     // Unzoomed page background hit-tests as HTCAPTION (that's
                     // what makes the borderless window draggable), so a
                     // click-off-field there never reaches WM_LBUTTONDOWN's
@@ -420,30 +429,37 @@ impl Ui {
                     // DefWindowProc would toggle maximize on caption dbl-click.
                     // Swallow it: on the caption-draggable page body a
                     // double-click resets zoom, or — already at fit — advances
-                    // the F11 fill cycle. HTCAPTION is only reported where
-                    // wants_client_mouse() said no (no link, field, panel,
-                    // find bar or help overlay under the pointer, and not
-                    // zoomed), so this arm never overrides those handlers.
+                    // the F11 fill cycle. HTCAPTION means the pointer is over
+                    // plain unzoomed page background: it says nothing about
+                    // whether the TOC panel or find bar is open, only that
+                    // they aren't under the pointer.
                     if wparam.0 as u32 == HTCAPTION {
-                        // An open prompt is abandoned by the gesture and
-                        // nothing else — resizing the window out from under
-                        // someone who was typing would be a surprise.
-                        // Split by edition rather than `let mut` + `|=`: the
-                        // free build would never mutate it (unused_mut).
-                        #[cfg(feature = "pro")]
-                        let prompt_open =
-                            self.app.goto_entry_active() || self.app.bookmark_entry_active();
-                        #[cfg(not(feature = "pro"))]
-                        let prompt_open = self.app.goto_entry_active();
+                        // The click that opened this gesture may itself have
+                        // torn down the surface it landed on (F1 help, a TOC
+                        // entry), leaving this second click over bare page.
+                        if core::mem::take(&mut self.swallow_dblclk) {
+                            return LRESULT(0);
+                        }
+                        // A modal layer owning the keyboard is dismissed
+                        // where dismissible, and nothing else — resizing the
+                        // window out from under someone who was typing would
+                        // be a surprise. Password mode has no dismissal at
+                        // all: the gesture must stay wholly inert there, as
+                        // F11 already is.
+                        let modal_open = self.modal_active();
                         self.dismiss_goto_entry();
                         #[cfg(feature = "pro")]
                         self.dismiss_bookmark_entry();
-                        if prompt_open {
+                        if modal_open {
                             return LRESULT(0);
                         }
-                        // reset_zoom compares against exactly 1.0 while the
-                        // hit test allows a 1e-4 epsilon, so a hair of
-                        // residual zoom still resets instead of resizing.
+                        // Nearly always false: zoom_by clamps to >= 1.0 and
+                        // snaps anything within 1e-4 down to exactly 1.0, so
+                        // zoom sits either at 1.0 or above the hit test's
+                        // epsilon. The one writer that can land inside the
+                        // band is goto's clamp(1.0, max_zoom(..)). Kept so a
+                        // future zoom writer breaking that invariant degrades
+                        // to "reset" rather than an unexpected resize.
                         if self.app.reset_zoom() {
                             self.sync_renders();
                             self.invalidate();
@@ -589,10 +605,16 @@ impl Ui {
                     LRESULT(0)
                 }
                 WM_LBUTTONDOWN => {
+                    // A fresh press is never the second click of a
+                    // double-click, so this self-corrects a stale latch.
+                    self.swallow_dblclk = false;
                     // A click anywhere dismisses the help overlay (it's modal).
                     if self.app.help_visible {
                         self.app.toggle_help();
                         self.invalidate();
+                        // This click removed the overlay; if it was click 1 of
+                        // a double-click, don't let click 2 cycle the window.
+                        self.swallow_dblclk = true;
                         return LRESULT(0);
                     }
                     // Clicks on the find bar are a no-op (keyboard-only UI):
@@ -1605,6 +1627,16 @@ impl Ui {
     /// old two-state fill/restore. Independent of native maximize (Win+Up).
     fn toggle_fill(&mut self) {
         unsafe {
+            // Win+Up leaves WS_MAXIMIZE set, and SetWindowPos does not clear
+            // it: the window would take the cycle's geometry while hit_test
+            // still suppresses all 8 grips and WM_NCCALCSIZE still clamps to
+            // the work area — visibly normal, silently unresizable. Drop
+            // maximize first so the cycle owns plain geometry. Ordering
+            // matters: this runs before GetWindowRect so saved_rect captures
+            // the restored rect, not the maximized one.
+            if self.maximized() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
             if self.fill_stage == FillStage::Filled {
                 self.fill_stage = FillStage::Normal;
                 if let Some(saved) = self.saved_rect.take() {
@@ -1833,6 +1865,10 @@ impl Ui {
                 match ov.activate() {
                     Some(page) => {
                         d.overlay = None; // jump closes the panel
+                        // The panel is gone, so a second click of a
+                        // double-click would land on bare page background and
+                        // cycle the window. Swallow that one.
+                        self.swallow_dblclk = true;
                         if self.app.goto(page) {
                             self.sync_renders();
                             self.show_badge();

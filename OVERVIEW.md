@@ -173,7 +173,10 @@ load-bearing for native Aero Snap and animations — but:
 The `HTCAPTION` trick has consequences elsewhere: clicks on the unzoomed page
 body never arrive as client mouse messages. That is why mouse X-buttons
 (back/forward) are handled via `WM_APPCOMMAND` rather than `WM_XBUTTONDOWN`,
-and why Pro must kill form focus in `WM_NCLBUTTONDOWN`.
+and why Pro must kill form focus in `WM_NCLBUTTONDOWN`. It also puts the F11
+fill cycle within reach of the mouse: `WM_NCLBUTTONDBLCLK` on that same
+caption-hit-tested background advances the cycle instead of letting
+`DefWindowProc` toggle native maximize.
 
 ### Coordinate systems
 
