@@ -228,26 +228,7 @@ impl FormEngine {
         }
         CB.with(|s| s.borrow_mut().invalidated = true); // caret/focus ring gone
         let bytes = doc.save_to_bytes().map_err(|e| format!("{e:?}"))?;
-        let dir = path.parent().ok_or("path has no parent directory")?;
-        let tmp = dir.join(format!(".pppdf-save-{}.tmp", std::process::id()));
-        if let Err(e) = std::fs::write(&tmp, &bytes) {
-            // Don't leave a partial temp file behind (disk full etc.) —
-            // mirrors the retry-exhaustion cleanup below.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.to_string());
-        }
-        let mut last = None;
-        for attempt in 0..5u64 {
-            match std::fs::rename(&tmp, path) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&tmp);
-        Err(last.map(|e| e.to_string()).unwrap_or_else(|| "rename failed".into()))
+        crate::pro::atomic_write(path, &bytes)
     }
 
     pub fn take_invalidated(&mut self) -> bool {
