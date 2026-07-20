@@ -111,6 +111,15 @@ pub struct Drag {
     moved: bool,
 }
 
+/// Where the F11 cycle currently stands. `saved_rect` (the pre-cycle window
+/// rect) is written on leaving Normal and taken on returning to it.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FillStage {
+    Normal,
+    HeightFit,
+    Filled,
+}
+
 pub struct Ui {
     pub hwnd: HWND,
     pub app: App,
@@ -123,8 +132,10 @@ pub struct Ui {
     /// Active drag-pan state while the left button is held over a zoomed page.
     pub drag: Option<Drag>,
     pub suppress_click: bool,
-    /// Pre-F11 window rect, so a second F11 restores it exactly.
+    /// Pre-F11 window rect, so the cycle's final press restores it exactly.
     pub saved_rect: Option<RECT>,
+    /// F11 cycle stage: Normal -> HeightFit -> Filled -> Normal.
+    pub fill_stage: FillStage,
     /// Leftover sub-notch WM_MOUSEWHEEL delta (precision touchpads send many
     /// small deltas instead of whole 120-unit notches); accumulated across
     /// events so they aren't truncated to zero forever.
@@ -205,6 +216,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             drag: None,
             suppress_click: false,
             saved_rect: None,
+            fill_stage: FillStage::Normal,
             wheel_residual: 0,
             always_on_top: false,
             #[cfg(feature = "pro")]
@@ -1563,21 +1575,27 @@ impl Ui {
         }
     }
 
-    /// F11: fill the current monitor's work area edge to edge (taskbar stays
-    /// visible); a second press restores the previous size/position.
-    /// Independent of native maximize (Win+Up).
+    /// F11 cycles the window through three stages: height-fit (work-area
+    /// height at the current page's rotated aspect, flush at the nearest
+    /// screen edge), fill (work area edge to edge, taskbar visible), then
+    /// back to the size/position saved when the cycle started. Without a
+    /// document there is no aspect: height-fit is skipped and F11 stays the
+    /// old two-state fill/restore. Independent of native maximize (Win+Up).
     fn toggle_fill(&mut self) {
         unsafe {
-            if let Some(saved) = self.saved_rect.take() {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    saved.left,
-                    saved.top,
-                    saved.right - saved.left,
-                    saved.bottom - saved.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            if self.fill_stage == FillStage::Filled {
+                self.fill_stage = FillStage::Normal;
+                if let Some(saved) = self.saved_rect.take() {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        saved.left,
+                        saved.top,
+                        saved.right - saved.left,
+                        saved.bottom - saved.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
                 return;
             }
             let mut rc = RECT::default();
@@ -1587,19 +1605,42 @@ impl Ui {
                 cbSize: core::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
-            if GetMonitorInfoW(monitor, &mut mi).as_bool() {
-                self.saved_rect = Some(rc);
-                let w = mi.rcWork;
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    w.left,
-                    w.top,
-                    w.right - w.left,
-                    w.bottom - w.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                return; // no monitor info: stay in the current stage
             }
+            let w = mi.rcWork;
+            if self.fill_stage == FillStage::Normal {
+                self.saved_rect = Some(rc);
+                if let Some(aspect) = self.app.page_aspect() {
+                    let (l, t, r, b) = crate::layout::height_fit_rect(
+                        (w.left, w.top, w.right, w.bottom),
+                        aspect,
+                        rc.left + (rc.right - rc.left) / 2,
+                    );
+                    self.fill_stage = FillStage::HeightFit;
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        l,
+                        t,
+                        r - l,
+                        b - t,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    return;
+                }
+                // No document: skip height-fit, fall through to fill.
+            }
+            self.fill_stage = FillStage::Filled;
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                w.left,
+                w.top,
+                w.right - w.left,
+                w.bottom - w.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
     }
 
