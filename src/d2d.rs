@@ -46,6 +46,7 @@ const PRO_HELP_ROWS: &[(&str, &str)] = &[
     ("Click a form field", "Fill it \u{b7} Tab/Shift+Tab next/previous \u{b7} Esc leaves"),
     ("F", "Mark form fields: highlight / frames / off"),
     ("Ctrl+S", "Save filled form in place"),
+    ("Ctrl+B", "Add / remove a bookmark on this page"),
 ];
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {

@@ -50,7 +50,7 @@ Text search (both editions):
 - [ ] 200-DIP window: the bar clamps inside; clicks ON it don't drag the window, clicks beside it still do
 - [ ] Pro: the dirty dot stays visible above the bar's corner; Ctrl+F while typing in a form field leaves the field and opens the bar; clicking a field while the bar is open types into the field (bar stays); Esc leaves the field, second Esc closes the bar
 - [ ] Open a password-protected PDF over a live search, Esc back to the document: the search re-runs (counter live again — never stuck on "…")
-- [ ] With the bar open: Ctrl+W still quits, Ctrl+O still opens, Ctrl+N still spawns, Ctrl+S (Pro) still saves
+- [ ] With the bar open: Ctrl+W still quits, Ctrl+O still opens, Ctrl+N still spawns, Ctrl+S (Pro) still saves, Ctrl+B (Pro) still toggles a bookmark
 
 Form filling (Pro) — run the Pro build against `tests/fixtures/form.pdf`:
 - [ ] Fields open with a pale blue highlight (in a fresh window); `F` cycles to dotted frames, then off, then back (toast names each mode); the marks track zoom and rotation; the chosen mode survives opening another PDF in the same window (viewer preference, not document state)
@@ -79,3 +79,16 @@ Save UX (Pro) — same `tests/fixtures/form.pdf`:
 - [ ] Yes: saves then closes — verify via `pro::forms::read_field_values` or by reopening the file
 - [ ] Ctrl+S on a document with no form fields (e.g. a plain PDF) is a silent no-op (no toast, no save)
 - [ ] Quitting with no unsaved changes (fresh open, or right after a successful save) closes immediately with no prompt
+
+Custom bookmarks (Pro) — any multi-page PDF in a writable folder:
+- [ ] Ctrl+B on an unbookmarked page: bottom-center prompt pill appears showing `Bookmark: _ (Enter = "Page N")`; typing fills it; Backspace deletes; Esc cancels (no bookmark)
+- [ ] Enter commits: "Bookmarked: {name}" toast bottom-center; empty Enter commits the default "Page N"
+- [ ] Ctrl+B on a bookmarked page removes it: "Bookmark removed" toast bottom-center (both toasts fade like the page badge)
+- [ ] Tab: TOC shows a "Bookmarks" header (accent-colored) above the outline; entries sorted by name with numeric awareness ("2 - x" above "10 - x"); Enter/click on the header collapses/expands without closing the panel; Enter/click on a bookmark jumps, closes the panel, records history (Alt+Left returns)
+- [ ] Bookmarks persist: close the window, reopen the same file — bookmarks intact; remove all, reopen — gone
+- [ ] Only bookmarks are saved: type into a form field (no Ctrl+S), Ctrl+B, reopen the file — bookmark present, the typed text NOT saved; then re-type and Ctrl+S — both present after reopen
+- [ ] Read-only target (mark the file read-only): Ctrl+B toasts "Couldn't save bookmarks"; the bookmark still shows in this session's TOC
+- [ ] Encrypted PDF: bookmark an open password-protected file, close, reopen (re-enter the password) — bookmark intact
+- [ ] While the prompt is open: mouse wheel / click / right-click menu dismiss it; Ctrl+F cancels it and opens the find bar; mouse back/forward do nothing
+- [ ] G goto prompt open: Ctrl+B is swallowed (no prompt stacking); find bar open: Ctrl+B closes the bar before opening the prompt
+- [ ] Free edition: Ctrl+B toasts "Custom bookmarks are a pppdf Pro feature" (bottom-right) on EVERY press; Pro-created bookmarks still display in the free TOC and navigate
