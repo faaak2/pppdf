@@ -185,6 +185,10 @@ pub struct DocState {
     pub rot: u8,
     /// Some = the "G" go-to-page prompt is open, holding the typed digits.
     pub goto_entry: Option<String>,
+    /// Pro: Some = the Ctrl+B bookmark-name prompt is open, holding the
+    /// typed name.
+    #[cfg(feature = "pro")]
+    pub bookmark_entry: Option<String>,
     /// Jump history for back/forward navigation.
     pub history: History,
     /// Some = the find bar is open (Ctrl+F).
@@ -403,6 +407,8 @@ impl App {
             overlay: None,
             rot: 0,
             goto_entry: None,
+            #[cfg(feature = "pro")]
+            bookmark_entry: None,
             history: History::default(),
             search: None,
             last_search: None,
@@ -834,6 +840,87 @@ impl App {
         let Ok(n) = buf.parse::<u32>() else { return false };
         let page_1 = n.clamp(1, d.pages.max(1) as u32) as u16;
         self.goto(page_1 - 1)
+    }
+
+    // --- custom bookmarks (Pro: Ctrl+B toggle + name entry prompt) ---
+
+    /// Index into `bookmarks` of the current page's bookmark, if any.
+    #[cfg(feature = "pro")]
+    pub fn bookmark_on_current(&self) -> Option<usize> {
+        let d = self.doc()?;
+        d.bookmarks.iter().position(|b| b.page == d.current)
+    }
+
+    /// Remove the current page's bookmark, returning its name.
+    #[cfg(feature = "pro")]
+    pub fn bookmark_remove_current(&mut self) -> Option<String> {
+        let idx = self.bookmark_on_current()?;
+        Some(self.doc_mut()?.bookmarks.remove(idx).name)
+    }
+
+    /// Open the name prompt. Refused without a document or on a
+    /// zero-page document (the flip/goto guard).
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_start(&mut self) -> bool {
+        let Some(d) = self.doc_mut() else { return false };
+        if d.pages == 0 {
+            return false;
+        }
+        d.bookmark_entry = Some(String::new());
+        true
+    }
+
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_active(&self) -> bool {
+        self.doc().is_some_and(|d| d.bookmark_entry.is_some())
+    }
+
+    /// Append a typed char (control chars ignored — the WM_CHAR filter
+    /// catches them first, this is belt-and-braces; capped at NAME_CAP).
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_char(&mut self, c: char) {
+        if let Some(buf) = self.doc_mut().and_then(|d| d.bookmark_entry.as_mut()) {
+            if !c.is_control() && buf.chars().count() < crate::bookmarks::NAME_CAP {
+                buf.push(c);
+            }
+        }
+    }
+
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_backspace(&mut self) {
+        if let Some(buf) = self.doc_mut().and_then(|d| d.bookmark_entry.as_mut()) {
+            buf.pop();
+        }
+    }
+
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_cancel(&mut self) {
+        if let Some(d) = self.doc_mut() {
+            d.bookmark_entry = None;
+        }
+    }
+
+    /// Enter: add the bookmark on the current page and close the prompt.
+    /// An empty (or whitespace) buffer commits the default name
+    /// ("Page N", 1-based). Returns the committed name for the toast;
+    /// None when no prompt was open (or the page raced into a bookmark).
+    #[cfg(feature = "pro")]
+    pub fn bookmark_entry_commit(&mut self) -> Option<String> {
+        let d = self.doc_mut()?;
+        let buf = d.bookmark_entry.take()?;
+        let page = d.current;
+        if d.bookmarks.iter().any(|b| b.page == page) {
+            return None; // already bookmarked: toggle semantics say no dupes
+        }
+        let trimmed = buf.trim();
+        let name = if trimmed.is_empty() {
+            crate::bookmarks::default_name(page)
+        } else {
+            trimmed.to_string()
+        };
+        let pos = d.bookmarks.iter().position(|b| b.page > page).unwrap_or(d.bookmarks.len());
+        d.bookmarks.insert(pos, crate::types::Bookmark { page, name: name.clone() });
+        Some(name)
     }
 
     // --- password entry (typed straight into the borderless window) ---
@@ -2030,6 +2117,99 @@ mod tests {
             assert!((p4.y - 710.0).abs() < 1.0, "wraps to top");
             let p5 = a.form_tab_target(true).unwrap();
             assert!((p5.y - 310.0).abs() < 1.0, "shift-tab goes back (wraps to bottom)");
+        }
+
+        #[test]
+        fn bookmark_toggle_and_entry_flow() {
+            let mut a = app_with_doc(10);
+            a.flip(3); // current = 3
+            assert_eq!(a.bookmark_on_current(), None);
+            assert!(a.bookmark_entry_start());
+            assert!(a.bookmark_entry_active());
+            for c in "Lair".chars() {
+                a.bookmark_entry_char(c);
+            }
+            a.bookmark_entry_char('\u{7}'); // control chars ignored
+            a.bookmark_entry_backspace();
+            assert_eq!(a.doc().unwrap().bookmark_entry.as_deref(), Some("Lai"));
+            assert_eq!(a.bookmark_entry_commit(), Some("Lai".to_string()));
+            assert!(!a.bookmark_entry_active(), "commit closes the prompt");
+            assert_eq!(a.doc().unwrap().bookmarks, vec![Bookmark { page: 3, name: "Lai".into() }]);
+            assert_eq!(a.bookmark_on_current(), Some(0));
+            // Toggle off: remove returns the name.
+            assert_eq!(a.bookmark_remove_current(), Some("Lai".to_string()));
+            assert!(a.doc().unwrap().bookmarks.is_empty());
+            assert_eq!(a.bookmark_remove_current(), None, "nothing left to remove");
+        }
+
+        #[test]
+        fn bookmark_entry_empty_commit_uses_default_name() {
+            let mut a = app_with_doc(50);
+            a.flip(41); // current = 41 -> "Page 42"
+            a.bookmark_entry_start();
+            assert_eq!(a.bookmark_entry_commit(), Some("Page 42".to_string()));
+            assert_eq!(a.doc().unwrap().bookmarks[0].name, "Page 42");
+            // Whitespace-only counts as empty too. flip(1): 41 -> 42.
+            a.flip(1);
+            a.bookmark_entry_start();
+            a.bookmark_entry_char(' ');
+            assert_eq!(a.bookmark_entry_commit(), Some("Page 43".to_string()));
+        }
+
+        #[test]
+        fn bookmark_entry_caps_at_64_chars() {
+            let mut a = app_with_doc(3);
+            a.bookmark_entry_start();
+            for _ in 0..100 {
+                a.bookmark_entry_char('x');
+            }
+            assert_eq!(
+                a.doc().unwrap().bookmark_entry.as_ref().unwrap().chars().count(),
+                crate::bookmarks::NAME_CAP
+            );
+            a.bookmark_entry_cancel();
+            assert!(!a.bookmark_entry_active());
+            assert!(a.doc().unwrap().bookmarks.is_empty(), "cancel adds nothing");
+        }
+
+        #[test]
+        fn bookmark_commit_inserts_page_sorted() {
+            let mut a = app_with_doc(10);
+            for page in [7u16, 2, 5] {
+                a.goto(page);
+                a.bookmark_entry_start();
+                a.bookmark_entry_commit();
+            }
+            let pages: Vec<u16> = a.doc().unwrap().bookmarks.iter().map(|b| b.page).collect();
+            assert_eq!(pages, vec![2, 5, 7], "DocState vec stays page-sorted");
+        }
+
+        #[test]
+        fn bookmark_entry_guards_zero_pages_and_no_doc() {
+            assert!(!App::new().bookmark_entry_start());
+            let mut a = App::new();
+            a.set_client(SizeU { w: 1000, h: 1000 });
+            a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false, vec![]);
+            assert!(!a.bookmark_entry_start(), "zero-page doc refuses");
+            assert_eq!(a.bookmark_remove_current(), None);
+        }
+
+        #[test]
+        fn bookmarks_survive_password_stash_and_die_with_doc() {
+            let mut a = app_with_doc(10);
+            a.bookmark_entry_start();
+            a.bookmark_entry_commit(); // "Page 1" on page 0
+            let prev = match std::mem::replace(&mut a.mode, Mode::Empty) {
+                Mode::Doc(d) => Some(Box::new(d)),
+                _ => None,
+            };
+            a.mode =
+                Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
+            assert_eq!(a.bookmark_on_current(), None, "no doc mode: inert");
+            a.password_cancel();
+            assert_eq!(a.doc().unwrap().bookmarks.len(), 1, "came back with the stash");
+            a.doc_loaded(PathBuf::from("y.pdf"), 5, vec![LETTER; 5], vec![], false, vec![]);
+            assert!(a.doc().unwrap().bookmarks.is_empty());
         }
     }
 }
