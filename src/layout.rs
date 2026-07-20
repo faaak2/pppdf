@@ -70,6 +70,27 @@ pub fn max_zoom(page_pt: (f32, f32), client: SizeU) -> f32 {
     MAX_ZOOM.min(cap_w).min(cap_h).max(1.0)
 }
 
+/// F11 height-fit: the work-area-height rect at `aspect` (page w/h, rotation
+/// already applied), flush against the work-area edge nearest to
+/// `cur_center_x` (tie: left). Width clamps to the work width; aspect <= 0
+/// (no page) degenerates the same way. No width floor here — the window's
+/// WM_GETMINMAXINFO guard covers the narrow end. Tuples are
+/// (left, top, right, bottom) in physical px.
+pub fn height_fit_rect(
+    work: (i32, i32, i32, i32),
+    aspect: f32,
+    cur_center_x: i32,
+) -> (i32, i32, i32, i32) {
+    let (wl, wt, wr, wb) = work;
+    let work_w = (wr - wl).max(0);
+    let h = (wb - wt).max(0);
+    let want = if aspect > 0.0 { (h as f32 * aspect).round() as i32 } else { work_w };
+    let w = want.min(work_w);
+    let mid = wl + work_w / 2;
+    let left = if cur_center_x <= mid { wl } else { wr - w };
+    (left, wt, left + w, wb)
+}
+
 /// Clamp scroll to the page's overhang; axes where the page fits snap to 0.
 pub fn clamp_scroll(page_px: SizeU, client: SizeU, scroll: PointF) -> PointF {
     let mx = (page_px.w as f32 - client.w as f32).max(0.0);
@@ -531,5 +552,43 @@ mod tests {
         );
         assert_eq!(s.x, 0.0);
         assert!(s.y > 0.0);
+    }
+
+    // --- F11 height-fit ---
+
+    #[test]
+    fn height_fit_uses_work_height_at_page_aspect() {
+        // US Letter on a 1920x1040 work area (40 px taskbar): 1040 * 612/792
+        // = 803.6 -> 804 wide, flush left when the window sits in the left half.
+        let r = height_fit_rect((0, 0, 1920, 1040), 612.0 / 792.0, 500);
+        assert_eq!(r, (0, 0, 804, 1040));
+    }
+
+    #[test]
+    fn height_fit_snaps_to_the_nearest_edge() {
+        let a = 612.0 / 792.0;
+        assert_eq!(height_fit_rect((0, 0, 1920, 1040), a, 1500), (1116, 0, 1920, 1040));
+        // Center exactly at the midpoint picks the LEFT edge.
+        assert_eq!(height_fit_rect((0, 0, 1920, 1040), a, 960), (0, 0, 804, 1040));
+    }
+
+    #[test]
+    fn height_fit_clamps_wide_pages_to_the_work_width() {
+        assert_eq!(height_fit_rect((0, 0, 1920, 1040), 3.0, 500), (0, 0, 1920, 1040));
+    }
+
+    #[test]
+    fn height_fit_respects_work_area_origin() {
+        let a = 612.0 / 792.0;
+        // Secondary monitor at negative coords.
+        assert_eq!(height_fit_rect((-1920, 0, 0, 1040), a, -1800), (-1920, 0, -1116, 1040));
+        assert_eq!(height_fit_rect((-1920, 0, 0, 1040), a, -100), (-804, 0, 0, 1040));
+        // Taskbar on top: work rect starts at y=40.
+        assert_eq!(height_fit_rect((0, 40, 1920, 1080), a, 100), (0, 40, 804, 1080));
+    }
+
+    #[test]
+    fn height_fit_degenerate_aspect_falls_back_to_work_width() {
+        assert_eq!(height_fit_rect((0, 0, 1920, 1040), 0.0, 500), (0, 0, 1920, 1040));
     }
 }
