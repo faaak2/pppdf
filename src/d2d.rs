@@ -251,7 +251,7 @@ impl Renderer {
     /// on its own (Empty/Password mode, or a Doc with no pending render reply)
     /// would keep the now-dropped target and leave the window permanently
     /// stale/white after a single transient loss.
-    pub fn draw(&mut self, hwnd: HWND, app: &App, badge: Option<(&str, f32)>) -> Result<bool> {
+    pub fn draw(&mut self, hwnd: HWND, app: &App, badge: Option<(&str, f32, bool)>) -> Result<bool> {
         let rt = self.ensure_rt(hwnd)?;
         let result = self.draw_inner(&rt, app, badge);
         match result {
@@ -269,7 +269,7 @@ impl Renderer {
         &mut self,
         rt: &ID2D1HwndRenderTarget,
         app: &App,
-        badge: Option<(&str, f32)>,
+        badge: Option<(&str, f32, bool)>,
     ) -> Result<()> {
         unsafe {
             rt.BeginDraw();
@@ -324,11 +324,15 @@ impl Renderer {
                     if let Some(ov) = &d.overlay {
                         self.draw_overlay(rt, ov, client)?;
                     }
-                    if let Some((text, alpha)) = badge {
-                        self.draw_badge(rt, text, alpha, client)?;
+                    if let Some((text, alpha, centered)) = badge {
+                        self.draw_badge(rt, text, alpha, centered, client)?;
                     }
                     if let Some(buf) = &d.goto_entry {
                         self.draw_goto(rt, buf, d.pages, client)?;
+                    }
+                    #[cfg(feature = "pro")]
+                    if let Some(buf) = &d.bookmark_entry {
+                        self.draw_bookmark_entry(rt, buf, d.current as u32 + 1, client)?;
                     }
                     if let Some(st) = &d.search {
                         self.draw_search_bar(rt, st, client)?;
@@ -687,11 +691,50 @@ impl Renderer {
         self.draw_text(rt, &text, &fmt, r, color(1.0, 1.0, 1.0, 0.92))
     }
 
+    /// The Ctrl+B bookmark-name prompt: the goto pill's twin, bottom-
+    /// center. An empty buffer shows the default name Enter would commit.
+    #[cfg(feature = "pro")]
+    fn draw_bookmark_entry(
+        &mut self,
+        rt: &ID2D1HwndRenderTarget,
+        buf: &str,
+        page_1: u32,
+        client: SizeU,
+    ) -> Result<()> {
+        let s = self.scale();
+        let text = if buf.is_empty() {
+            format!("Bookmark: _ (Enter = \"Page {page_1}\")")
+        } else {
+            format!("Bookmark: {buf}_")
+        };
+        let bw = ((text.chars().count() as f32 * 8.0 + 44.0) * s)
+            .max(240.0 * s)
+            .min(client.w as f32 - 16.0 * s);
+        let (bh, m) = (36.0 * s, 24.0 * s);
+        let cx = client.w as f32 / 2.0;
+        let r = RectF {
+            left: cx - bw / 2.0,
+            top: client.h as f32 - bh - m,
+            right: cx + bw / 2.0,
+            bottom: client.h as f32 - m,
+        };
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT { rect: rectf(r), radiusX: bh / 2.0, radiusY: bh / 2.0 };
+            let bg = rt.CreateSolidColorBrush(&color(0.0, 0.0, 0.0, 0.8), None)?;
+            rt.FillRoundedRectangle(&rr, &bg);
+            let border = rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.25), None)?;
+            rt.DrawRoundedRectangle(&rr, &border, 1.0 * s, None);
+        }
+        let fmt = self.text_format(14.0, true)?;
+        self.draw_text(rt, &text, &fmt, r, color(1.0, 1.0, 1.0, 0.92))
+    }
+
     fn draw_badge(
         &mut self,
         rt: &ID2D1HwndRenderTarget,
         text: &str,
         alpha: f32,
+        centered: bool,
         client: SizeU,
     ) -> Result<()> {
         if alpha <= 0.0 {
@@ -704,11 +747,23 @@ impl Renderer {
             .max(110.0 * s)
             .min(client.w as f32 - 16.0 * s);
         let (bh, m) = (36.0 * s, 24.0 * s);
-        let r = RectF {
-            left: client.w as f32 - bw - m,
-            top: client.h as f32 - bh - m,
-            right: client.w as f32 - m,
-            bottom: client.h as f32 - m,
+        // Bottom-right by default; bottom-center for the bookmark toasts
+        // (the goto-pill spot).
+        let r = if centered {
+            let cx = client.w as f32 / 2.0;
+            RectF {
+                left: cx - bw / 2.0,
+                top: client.h as f32 - bh - m,
+                right: cx + bw / 2.0,
+                bottom: client.h as f32 - m,
+            }
+        } else {
+            RectF {
+                left: client.w as f32 - bw - m,
+                top: client.h as f32 - bh - m,
+                right: client.w as f32 - m,
+                bottom: client.h as f32 - m,
+            }
         };
         unsafe {
             let rr = D2D1_ROUNDED_RECT { rect: rectf(r), radiusX: bh / 2.0, radiusY: bh / 2.0 };
