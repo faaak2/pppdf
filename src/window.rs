@@ -418,15 +418,37 @@ impl Ui {
                 }
                 WM_NCLBUTTONDBLCLK => {
                     // DefWindowProc would toggle maximize on caption dbl-click.
-                    // Swallow it, resetting zoom instead (double-click on the
-                    // caption-draggable page body resets to fit).
+                    // Swallow it: on the caption-draggable page body a
+                    // double-click resets zoom, or — already at fit — advances
+                    // the F11 fill cycle. HTCAPTION is only reported where
+                    // wants_client_mouse() said no (no link, field, panel,
+                    // find bar or help overlay under the pointer, and not
+                    // zoomed), so this arm never overrides those handlers.
                     if wparam.0 as u32 == HTCAPTION {
+                        // An open prompt is abandoned by the gesture and
+                        // nothing else — resizing the window out from under
+                        // someone who was typing would be a surprise.
+                        // Split by edition rather than `let mut` + `|=`: the
+                        // free build would never mutate it (unused_mut).
+                        #[cfg(feature = "pro")]
+                        let prompt_open =
+                            self.app.goto_entry_active() || self.app.bookmark_entry_active();
+                        #[cfg(not(feature = "pro"))]
+                        let prompt_open = self.app.goto_entry_active();
                         self.dismiss_goto_entry();
                         #[cfg(feature = "pro")]
                         self.dismiss_bookmark_entry();
+                        if prompt_open {
+                            return LRESULT(0);
+                        }
+                        // reset_zoom compares against exactly 1.0 while the
+                        // hit test allows a 1e-4 epsilon, so a hair of
+                        // residual zoom still resets instead of resizing.
                         if self.app.reset_zoom() {
                             self.sync_renders();
                             self.invalidate();
+                        } else {
+                            self.toggle_fill();
                         }
                         return LRESULT(0); // never let DefWindowProc maximize
                     }
