@@ -457,9 +457,9 @@ impl Ui {
                         // snaps anything within 1e-4 down to exactly 1.0, so
                         // zoom sits either at 1.0 or above the hit test's
                         // epsilon. The one writer that can land inside the
-                        // band is goto's clamp(1.0, max_zoom(..)). Kept so a
-                        // future zoom writer breaking that invariant degrades
-                        // to "reset" rather than an unexpected resize.
+                        // band is goto_match's clamp(1.0, max_zoom(..)). Kept
+                        // so a future zoom writer breaking that invariant
+                        // degrades to "reset" rather than an unexpected resize.
                         if self.app.reset_zoom() {
                             self.sync_renders();
                             self.invalidate();
@@ -865,6 +865,10 @@ impl Ui {
                     // on_click() again against the just-reset page geometry
                     // (spurious link navigation).
                     self.suppress_click = true;
+                    // The gesture ended here, on the client path, so a latch
+                    // set by click 1 has no second click left to swallow and
+                    // must not outlive it.
+                    self.swallow_dblclk = false;
                     LRESULT(0)
                 }
                 WM_LBUTTONUP => {
@@ -1807,6 +1811,10 @@ impl Ui {
         match target {
             LinkTarget::Page(p) => {
                 if self.app.goto(p) {
+                    // The link is gone from under the pointer; if this was
+                    // click 1 of a double-click, click 2 would hit bare page
+                    // background and cycle the window. Swallow that one.
+                    self.swallow_dblclk = true;
                     self.sync_renders();
                     self.show_badge();
                     self.invalidate();
