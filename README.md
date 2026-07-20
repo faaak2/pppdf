@@ -74,7 +74,7 @@ same rows minus a handful of self-evident ones, to stay readable.
 | Click a link | Follow it (web links open in your browser) |
 | Ctrl+wheel | Zoom at the cursor |
 | Drag (zoomed) | Pan · Ctrl+drag moves the window |
-| 0 · double-click when zoomed | Back to fit |
+| 0 · double-click a zoomed page | Back to fit |
 | R | Rotate 90° clockwise |
 | Wheel (zoomed) | Scroll; one more notch at the edge flips the page |
 | Ctrl+O | Open file · drop a PDF works too |
