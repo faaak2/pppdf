@@ -11,6 +11,8 @@ Window (the flagship — test every release):
 - [ ] Drag between two monitors with different DPI: crisp re-render, correct size (WM_DPICHANGED)
 - [ ] F11 fill + restore on both monitors
 - [ ] Two instances side by side (one window per book)
+- [ ] F1 overlay: table fits and stays readable from ~600 px tall up to maximized; any click dismisses it
+- [ ] Right-click → About: names the running edition (pppdf / pppdf Pro) and Cargo.toml's version
 
 Document:
 - [ ] Open via argument, Ctrl+O, right-click menu, drag-and-drop, "Open with"

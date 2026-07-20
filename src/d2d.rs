@@ -12,11 +12,12 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 const BG: D2D1_COLOR_F = D2D1_COLOR_F { r: 0.102, g: 0.102, b: 0.102, a: 1.0 }; // #1a1a1a
 
-/// F1 help: the full input reference, drawn as a two-column table. Order and
-/// wording mirror the README key map so the two never drift.
+/// F1 help: the input reference, drawn as a two-column table. Order and
+/// wording mirror the README key map so the two never drift — but the overlay
+/// is a *subset* of it. Rows a user finds without being told (drag to move or
+/// resize, clicking a link, wheel-scrolling when zoomed, F1 itself) are left
+/// to the README, so the ones worth reading get the room.
 const HELP_ROWS: &[(&str, &str)] = &[
-    ("Drag anywhere", "Move the window (Aero Snap works)"),
-    ("Drag near an edge (8 px)", "Resize"),
     ("PgDn / \u{2192} / Space / wheel", "Next page"),
     ("PgUp / \u{2190} / Shift+Space / wheel up", "Previous page"),
     ("Home / End", "First / last page"),
@@ -28,17 +29,14 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Alt+C / Alt+W", "Match case / whole words while finding"),
     ("Tab (or right-click menu)", "Table of contents overlay"),
     ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
-    ("Click a link", "Follow it (web links open in your browser)"),
     ("Ctrl+wheel", "Zoom at the cursor"),
     ("Drag (zoomed)", "Pan \u{b7} Ctrl+drag moves the window"),
     ("Double-click or 0", "Back to fit"),
     ("R", "Rotate 90\u{b0} clockwise"),
-    ("Wheel (zoomed)", "Scroll; one more notch at the edge flips the page"),
     ("Ctrl+O", "Open file \u{b7} drop a PDF works too"),
     ("Ctrl+N", "Open a new empty window"),
     ("Ctrl+Shift+O", "Open a file in a new window"),
     ("F11", "Fill the screen (work area) / restore"),
-    ("F1", "Show / hide the help overlay"),
     ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
 ];
 
@@ -515,8 +513,11 @@ impl Renderer {
     }
 
     /// Full-window F1 help: a dimmed backdrop with a centered two-column table
-    /// of every input binding. Laid out in physical px and clamped so the whole
-    /// table always fits the window (rows shrink before they'd overflow).
+    /// of the bindings worth surfacing (see `HELP_ROWS` — it is a subset of the
+    /// README key map). Laid out in physical px; the table box is clamped to
+    /// the window, rows shrinking before they'd overflow. Note the shrink has a
+    /// floor: `font_dip` bottoms out at 9 DIP, so below roughly 500 px of height
+    /// the glyphs outgrow their rows and the longer strings run past the border.
     fn draw_help(&mut self, rt: &ID2D1HwndRenderTarget, client: SizeU) -> Result<()> {
         let s = self.scale();
         let (cw, ch) = (client.w as f32, client.h as f32);

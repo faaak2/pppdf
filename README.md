@@ -50,7 +50,11 @@ right-click a PDF → Open with → choose pppdf.exe.
 `pppdf.exe book.pdf` — or start it empty and right-click / drop a PDF on it.
 Each window is one document; open more with Ctrl+N (empty) or Ctrl+Shift+O
 (pick a file), each in its own window. The right-click menu also has an
-**Always on Top** toggle to pin a window above everything else.
+**Always on Top** toggle to pin a window above everything else, and an
+**About** entry naming the edition and version you are running.
+
+The table below is the complete input reference; the F1 overlay shows the
+same rows minus a handful of self-evident ones, to stay readable.
 
 | Input | Action |
 |---|---|

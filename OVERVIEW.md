@@ -161,6 +161,14 @@ load-bearing for native Aero Snap and animations — but:
   what makes "drag anywhere moves the window" work via the OS move loop.
 - DWM: square corners (`DWMWCP_DONOTROUND`) and a 1 px
   `DwmExtendFrameIntoClientArea` margin to restore the drop shadow.
+- Startup size is relative, not fixed: `default_size_for_screen` takes 75 % of
+  the screen's height and derives the width from the 850:1100 page aspect, so
+  the window is the same share of the display at any resolution or DPI (the
+  process is per-monitor DPI aware, so the metrics are physical px). A rotated
+  monitor trades height away to keep the ratio on screen. `CreateWindowExW`
+  needs a size before there is an HWND, so it is sized against the primary
+  monitor and then re-derived from the monitor `CW_USEDEFAULT` actually chose —
+  while still hidden, so the correction never flickers.
 
 The `HTCAPTION` trick has consequences elsewhere: clicks on the unzoomed page
 body never arrive as client mouse messages. That is why mouse X-buttons
@@ -220,7 +228,8 @@ pure compile-time switch). The rules (from CLAUDE.md, enforced in review):
   contains no Pro code (not even strings — e.g. the Pro F1 help rows are a
   separate `cfg`'d const).
 - `src/edition.rs` is the single source of truth for branding: `IS_PRO`,
-  `NAME`, `NAME_W`. The name literal exists in **three** places — `NAME`,
+  `NAME`, `NAME_W`, `EDITION` (the "Free edition"/"Pro edition" label the
+  About box states outright). The name literal exists in **three** places — `NAME`,
   `NAME_W` (the `w!` macro needs a literal), and `build.rs` (build scripts
   can't see the crate; feeds the exe's version resources). A unit test guards
   the first two against drift; `build.rs` is by convention only.
@@ -364,7 +373,10 @@ only by the checklist in `docs/manual-tests.md`.
 - `README.md` — user-facing behavior contract; its keybinding table and the
   F1 help overlay in `d2d.rs` are kept in **exact-wording sync**, and
   `docs/manual-tests.md` covers the same inputs — any input change touches
-  all three.
+  all three. The overlay is deliberately a *subset*: the README table is the
+  full reference, `HELP_ROWS` drops the rows nobody needs told (drag to move
+  or resize, click a link, wheel-scroll when zoomed, F1 itself) to keep the
+  panel readable. Rows present in both must still match byte for byte.
 - `docs/superpowers/specs/` + `plans/` — date-prefixed design-spec /
   implementation-plan pairs per feature (viewer 2026-07-08, Pro forms
   2026-07-09, page history 2026-07-10). These are *snapshots*, not current

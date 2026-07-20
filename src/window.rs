@@ -49,6 +49,7 @@ pub const CMD_NEW_WINDOW: usize = 6;
 pub const CMD_OPEN_NEW_WINDOW: usize = 7;
 pub const CMD_HELP: usize = 8;
 pub const CMD_ALWAYS_ON_TOP: usize = 9;
+pub const CMD_ABOUT: usize = 10;
 
 /// WM_APPCOMMAND commands (winuser.h) — sent by the mouse back/forward
 /// X-buttons (DefWindowProc synthesizes them from unhandled X-button
@@ -58,6 +59,43 @@ const APPCOMMAND_BROWSER_FORWARD: u32 = 2;
 
 const GRIP_DIP: f32 = 8.0;
 const MIN_SIZE_DIP: i32 = 200;
+
+/// Page-shaped default window (w:h), the proportions pppdf has always opened
+/// at. Startup keeps this ratio whatever the screen is.
+const DEFAULT_ASPECT: f32 = 850.0 / 1100.0;
+/// Startup height as a share of the screen: tall enough to read a page, short
+/// enough to leave the desktop visible around it.
+const DEFAULT_SCREEN_SHARE: f32 = 0.75;
+
+/// Startup size in physical px from a screen size in physical px. Height is
+/// [`DEFAULT_SCREEN_SHARE`] of the screen, width follows [`DEFAULT_ASPECT`].
+/// Split out from the Win32 metrics call so the arithmetic is testable.
+fn default_size_for_screen(sw: i32, sh: i32) -> (i32, i32) {
+    // No usable metrics (headless/odd session): the historical fixed size.
+    if sw <= 0 || sh <= 0 {
+        return (850, 1100);
+    }
+    let mut h = sh as f32 * DEFAULT_SCREEN_SHARE;
+    let mut w = h * DEFAULT_ASPECT;
+    // A rotated (portrait) monitor is narrow enough that a page-shaped window
+    // this tall would hang off both sides — give up height to keep the ratio.
+    let max_w = sw as f32 * DEFAULT_SCREEN_SHARE;
+    if w > max_w {
+        w = max_w;
+        h = w / DEFAULT_ASPECT;
+    }
+    let floor = MIN_SIZE_DIP as f32;
+    (w.max(floor).round() as i32, h.max(floor).round() as i32)
+}
+
+/// Startup size for the primary monitor — where `CW_USEDEFAULT` puts a window.
+/// The manifest makes the process per-monitor DPI aware from the first line of
+/// `main`, so these metrics are physical pixels and need no DPI scaling: the
+/// window comes out the same share of the screen at any DPI or resolution.
+fn default_window_size() -> (i32, i32) {
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    default_size_for_screen(sw, sh)
+}
 
 pub const TIMER_RESIZE: usize = 1;
 pub const TIMER_BADGE: usize = 2;
@@ -181,6 +219,7 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
         // caption never shows because WM_NCCALCSIZE claims the whole rect.
         let style =
             WS_POPUP | WS_THICKFRAME | WS_CAPTION | WS_SYSMENU | WS_MAXIMIZEBOX | WS_MINIMIZEBOX;
+        let (win_w, win_h) = default_window_size();
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
@@ -188,13 +227,38 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            850,
-            1100,
+            win_w,
+            win_h,
             None,
             None,
             Some(instance),
             Some(&mut *ui as *mut Ui as *const core::ffi::c_void),
         )?;
+
+        // We sized against the primary monitor, but CW_USEDEFAULT can land the
+        // window on another one (multi-monitor cascade). Re-derive from the
+        // monitor it actually reached, so "75 % of the screen" means the screen
+        // the window is on — a 4K-primary/1080p-secondary setup would otherwise
+        // open a window taller than the display. Still hidden at this point, so
+        // the correction costs nothing visible and precedes the first paint.
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi =
+            MONITORINFO { cbSize: core::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            let m = mi.rcMonitor;
+            let (w, h) = default_size_for_screen(m.right - m.left, m.bottom - m.top);
+            if (w, h) != (win_w, win_h) {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    w,
+                    h,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
 
         // Spec: square corners — the page is a perfect rectangle.
         let pref = DWMWCP_DONOTROUND;
@@ -1512,6 +1576,7 @@ impl Ui {
             let aot = MF_STRING | if self.always_on_top { MF_CHECKED } else { MF_UNCHECKED };
             let _ = AppendMenuW(menu, aot, CMD_ALWAYS_ON_TOP, w!("Always on Top"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_HELP, w!("Help\tF1"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_ABOUT, w!("About"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, CMD_MINIMIZE, w!("Minimize"));
             let _ = AppendMenuW(menu, MF_STRING, CMD_CLOSE, w!("Close\tEsc"));
@@ -1545,6 +1610,7 @@ impl Ui {
                 self.app.help_visible = true;
                 self.invalidate();
             }
+            CMD_ABOUT => self.about_box(),
             CMD_NEW_WINDOW => self.spawn_new_window(None),
             CMD_OPEN_NEW_WINDOW => {
                 if let Some(path) = self.pick_pdf() {
@@ -1735,6 +1801,36 @@ impl Ui {
         }
         if let Err(e) = cmd.spawn() {
             self.error_box(&format!("Couldn't start a new window:\n{e}"));
+        }
+    }
+
+    /// The imprint shown by About. Branding comes from `edition` and the
+    /// version straight from Cargo, making this the one place in the UI that
+    /// answers "which build is this?" — hence the explicit edition line.
+    /// Pure so the answer can be pinned by a test in both editions.
+    fn about_text() -> String {
+        format!(
+            "{} {}\n{}\n{}\n\n\
+             Created by Sebastian K\u{e4}stner\n\
+             seka@digital-distributions.com\n\n\
+             Renders with PDFium.",
+            crate::edition::NAME,
+            env!("CARGO_PKG_VERSION"),
+            crate::edition::EDITION,
+            env!("CARGO_PKG_DESCRIPTION"),
+        )
+    }
+
+    /// Right-click → About.
+    fn about_box(&self) {
+        let wide: Vec<u16> = format!("{}\0", Self::about_text()).encode_utf16().collect();
+        unsafe {
+            MessageBoxW(
+                Some(self.hwnd),
+                PCWSTR(wide.as_ptr()),
+                crate::edition::NAME_W,
+                MB_OK | MB_ICONINFORMATION,
+            );
         }
     }
 
@@ -2350,5 +2446,62 @@ fn apply_autohide_taskbar_insets(rect: &mut RECT, mi: &MONITORINFO) {
         if has_bar(2) {
             rect.right -= 2;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Height tracks the screen and the page shape survives, at every
+    /// resolution — the point of sizing the window relative to the display.
+    #[test]
+    fn startup_size_is_three_quarters_of_screen_height() {
+        for (sw, sh) in [(1920, 1080), (2560, 1440), (3840, 2160), (1366, 768)] {
+            let (w, h) = default_size_for_screen(sw, sh);
+            assert_eq!(h, (sh as f32 * 0.75).round() as i32, "height on {sw}x{sh}");
+            let ratio = w as f32 / h as f32;
+            assert!((ratio - DEFAULT_ASPECT).abs() < 0.01, "aspect on {sw}x{sh}: {ratio}");
+            assert!(w < sw && h < sh, "must fit on {sw}x{sh}, got {w}x{h}");
+        }
+    }
+
+    /// A rotated monitor is narrower than the page shape wants; width leads
+    /// instead, and the ratio still holds.
+    #[test]
+    fn portrait_screen_gives_up_height_to_keep_the_ratio() {
+        let (sw, sh) = (1080, 1920);
+        let (w, h) = default_size_for_screen(sw, sh);
+        assert!(w <= (sw as f32 * 0.75).round() as i32, "width {w} must fit {sw}");
+        assert!(h < (sh as f32 * 0.75).round() as i32, "height should have been given up");
+        assert!((w as f32 / h as f32 - DEFAULT_ASPECT).abs() < 0.01);
+    }
+
+    /// About must name the edition outright in both builds — the free one
+    /// can't rely on "pppdf" lacking the word "Pro" to say what it is.
+    #[test]
+    fn about_names_the_edition_and_version() {
+        let t = Ui::about_text();
+        assert!(t.contains(crate::edition::NAME), "{t}");
+        assert!(t.contains(env!("CARGO_PKG_VERSION")), "{t}");
+        assert!(t.contains(crate::edition::EDITION), "{t}");
+        assert_eq!(t.contains("Pro edition"), crate::edition::IS_PRO, "{t}");
+        assert!(t.contains("Sebastian K\u{e4}stner"), "{t}");
+        assert!(t.contains("seka@digital-distributions.com"), "{t}");
+    }
+
+    /// No metrics (headless session) must not yield a degenerate window.
+    #[test]
+    fn missing_metrics_fall_back_to_the_fixed_size() {
+        assert_eq!(default_size_for_screen(0, 0), (850, 1100));
+        assert_eq!(default_size_for_screen(-1, -1), (850, 1100));
+    }
+
+    /// Even an absurdly small screen can't produce a window under the minimum
+    /// the resize clamp enforces.
+    #[test]
+    fn tiny_screen_still_clears_the_minimum() {
+        let (w, h) = default_size_for_screen(120, 100);
+        assert!(w >= MIN_SIZE_DIP && h >= MIN_SIZE_DIP, "got {w}x{h}");
     }
 }

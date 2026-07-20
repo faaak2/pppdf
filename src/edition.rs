@@ -16,6 +16,11 @@ pub const IS_PRO: bool = cfg!(feature = "pro");
 /// Product name for window title, dialogs, and log-ish text.
 pub const NAME: &str = if IS_PRO { "pppdf Pro" } else { "pppdf" };
 
+/// Which edition this build is, spelled out for the About box. `NAME` already
+/// carries "Pro", but only Pro's name does — a free user reading "pppdf" sees
+/// the *absence* of a word, which is not the same as being told what they have.
+pub const EDITION: &str = if IS_PRO { "Pro edition" } else { "Free edition" };
+
 /// `NAME` as a compile-time UTF-16 string for Win32 calls.
 /// Kept in sync with `NAME` by the test below.
 #[cfg(feature = "pro")]
@@ -31,6 +36,13 @@ mod tests {
     fn name_tracks_feature() {
         assert_eq!(IS_PRO, cfg!(feature = "pro"));
         assert_eq!(NAME.ends_with(" Pro"), IS_PRO);
+    }
+
+    #[test]
+    fn edition_label_states_which_build_this_is() {
+        assert_eq!(EDITION == "Pro edition", IS_PRO);
+        // Both editions must say something; neither may go unlabeled.
+        assert!(EDITION.ends_with(" edition"), "{EDITION}");
     }
 
     #[test]
