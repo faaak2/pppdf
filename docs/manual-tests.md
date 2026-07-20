@@ -6,7 +6,7 @@ Window (the flagship — test every release):
 - [ ] Maximized (Win+Up): fills work area exactly, taskbar usable, nothing off-screen
 - [ ] All 8 resize grips work at 100% and 150% DPI; none while maximized
 - [ ] Min size clamps at 200×200 (try to shrink below)
-- [ ] Double-click page never maximizes (resets zoom instead)
+- [ ] Double-click page never triggers native maximize (Win+Up state untouched; it drives the fill cycle instead)
 - [ ] Minimize/restore via taskbar + Win+Down: animations play
 - [ ] Drag between two monitors with different DPI: crisp re-render, correct size (WM_DPICHANGED)
 - [ ] F11 cycle on a portrait PDF: height-fit (work-area height, page aspect, nearest edge) → fill → restore; on both monitors
