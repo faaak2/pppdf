@@ -5,7 +5,7 @@ use crate::layout::{
     scroll_to_reveal, unrotate_point, zoom_scroll, PointF, RectF, SizeU, SCROLL_STEP,
 };
 use crate::overlay::OutlineState;
-use crate::types::{FieldKind, FormField, LinkTarget, OutlineItem, PageLink};
+use crate::types::{Bookmark, FieldKind, FormField, LinkTarget, OutlineItem, PageLink};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -171,6 +171,9 @@ pub struct DocState {
     pub page_sizes: Vec<(f32, f32)>,
     pub outline: Vec<OutlineItem>,
     pub has_forms: bool,
+    /// User bookmarks (page-sorted; page is unique). Both editions display
+    /// them in the TOC; only Pro mutates them (Ctrl+B).
+    pub bookmarks: Vec<Bookmark>,
     pub current: u16,
     /// 1.0 = fit-to-window.
     pub zoom: f32,
@@ -373,6 +376,7 @@ impl App {
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
         has_forms: bool,
+        bookmarks: Vec<Bookmark>,
     ) {
         self.cache.clear();
         self.pending.clear();
@@ -392,6 +396,7 @@ impl App {
             page_sizes,
             outline,
             has_forms,
+            bookmarks,
             current: 0,
             zoom: 1.0,
             scroll: PointF::default(),
@@ -969,6 +974,7 @@ mod tests {
             vec![LETTER; pages as usize],
             vec![],
             false,
+            vec![],
         );
         a
     }
@@ -1022,7 +1028,7 @@ mod tests {
     fn zero_page_doc_navigation_is_safe() {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
-        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false);
+        a.doc_loaded(PathBuf::from("empty.pdf"), 0, vec![], vec![], false, vec![]);
         assert!(!a.flip(1));
         assert!(!a.flip(-1));
         assert!(!a.goto(5));
@@ -1261,7 +1267,7 @@ mod tests {
         let mut a = App::new();
         a.set_client(SizeU { w: 1000, h: 1000 });
         a.cache = PageCache::with_budget(6, 100);
-        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![], false);
+        a.doc_loaded(PathBuf::from("x.pdf"), 3, vec![LETTER; 3], vec![], false, vec![]);
         a.flip(1); // current = 1; working set {0, 1, 2}
         let mut rounds = 0;
         loop {
@@ -1310,7 +1316,7 @@ mod tests {
         a.render_failed(1, false); // genuine pdfium failure on the prefetch page
         assert!(a.wanted_renders().iter().all(|r| r.page != 1), "failed page must not hot-loop");
         // A fresh document clears the failed set.
-        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false);
+        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false, vec![]);
         assert!(a.wanted_renders().iter().any(|r| r.page == 1));
     }
 
@@ -1633,8 +1639,25 @@ mod tests {
     fn new_document_starts_with_empty_history() {
         let mut a = app_with_doc(10);
         a.goto(5);
-        a.doc_loaded(PathBuf::from("y.pdf"), 10, vec![LETTER; 10], vec![], false);
+        a.doc_loaded(PathBuf::from("y.pdf"), 10, vec![LETTER; 10], vec![], false, vec![]);
         assert!(!a.back(), "history dies with the document");
+    }
+
+    #[test]
+    fn doc_loaded_stores_bookmarks_and_next_load_replaces_them() {
+        let mut a = App::new();
+        a.set_client(SizeU { w: 1000, h: 1000 });
+        a.doc_loaded(
+            PathBuf::from("x.pdf"),
+            10,
+            vec![LETTER; 10],
+            vec![],
+            false,
+            vec![Bookmark { page: 3, name: "Camp".into() }],
+        );
+        assert_eq!(a.doc().unwrap().bookmarks, vec![Bookmark { page: 3, name: "Camp".into() }]);
+        a.doc_loaded(PathBuf::from("y.pdf"), 10, vec![LETTER; 10], vec![], false, vec![]);
+        assert!(a.doc().unwrap().bookmarks.is_empty(), "bookmarks die with the document");
     }
 
     // --- password mode ---
@@ -1831,7 +1854,7 @@ mod tests {
         assert!(a.search_open());
         assert!(a.doc().unwrap().search.as_ref().unwrap().replace_on_type);
         // A fresh document has neither bar nor memory.
-        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false);
+        a.doc_loaded(PathBuf::from("y.pdf"), 2, vec![LETTER; 2], vec![], false, vec![]);
         assert!(!a.search_active());
         assert_eq!(a.doc().unwrap().last_search, None);
     }
@@ -1914,7 +1937,7 @@ mod tests {
                 Mode::Password { path: PathBuf::from("locked.pdf"), buf: String::new(), prev };
             assert!(a.dirty_dot_visible(), "mode changes alone never clear dirty");
             // A fresh document clears it.
-            a.doc_loaded(PathBuf::from("y.pdf"), 1, vec![LETTER], vec![], false);
+            a.doc_loaded(PathBuf::from("y.pdf"), 1, vec![LETTER], vec![], false, vec![]);
             assert!(!a.dirty_dot_visible());
         }
 

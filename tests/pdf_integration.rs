@@ -51,7 +51,10 @@ fn load_render_outline_links() {
         .send(PdfCmd::Load { path: common::fixture_path(), password: None })
         .unwrap();
     let (pages, page_sizes, outline) = match reply_rx.recv_timeout(WAIT).unwrap() {
-        PdfReply::Loaded { pages, page_sizes, outline, .. } => (pages, page_sizes, outline),
+        PdfReply::Loaded { pages, page_sizes, outline, bookmarks, .. } => {
+            assert!(bookmarks.is_empty(), "fixture has no bookmarks attachment");
+            (pages, page_sizes, outline)
+        }
         other => panic!("expected Loaded, got {other:?}"),
     };
     assert_eq!(pages, 3);

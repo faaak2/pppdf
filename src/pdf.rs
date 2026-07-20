@@ -2,8 +2,8 @@
 
 use crate::layout::{RectF, SizeU};
 use crate::types::{
-    FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply, SearchMatch,
-    SearchOptions,
+    Bookmark, FieldKind, FormField, LinkTarget, OutlineItem, PageLink, PdfCmd, PdfReply,
+    SearchMatch, SearchOptions,
 };
 #[cfg(feature = "pro")]
 use crate::types::FormEvent;
@@ -626,7 +626,22 @@ fn describe(doc: &PdfDocument, path: &Path) -> PdfReply {
         page_sizes,
         outline,
         has_forms: doc.form().is_some(),
+        bookmarks: read_bookmarks(doc, pages),
     }
+}
+
+/// The `pppdf.bookmarks` attachment parsed into user bookmarks. Shared by
+/// both editions — the free build displays them read-only; only Pro
+/// writes them (pro::bookmarks).
+fn read_bookmarks(doc: &PdfDocument, pages: u16) -> Vec<Bookmark> {
+    for att in doc.attachments().iter() {
+        if att.name() == crate::bookmarks::ATTACHMENT_NAME {
+            if let Ok(bytes) = att.save_to_bytes() {
+                return crate::bookmarks::parse(&bytes, pages);
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Advance the streaming scan by exactly ONE page: send SearchHits for a

@@ -123,6 +123,9 @@ pub enum PdfReply {
         page_sizes: Vec<(f32, f32)>,
         outline: Vec<OutlineItem>,
         has_forms: bool,
+        /// User bookmarks parsed from the `pppdf.bookmarks` attachment.
+        /// Unconditional: the free edition displays them read-only.
+        bookmarks: Vec<Bookmark>,
     },
     NeedsPassword {
         path: PathBuf,

@@ -2167,8 +2167,8 @@ impl Ui {
         let Some(rx) = self.reply_rx.take() else { return };
         while let Ok(reply) = rx.try_recv() {
             match reply {
-                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms } => {
-                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms);
+                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms, bookmarks } => {
+                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms, bookmarks);
                     // Drop the renderer's memoized device bitmap with the
                     // document. Its `gen` key already prevents stale pixels;
                     // this releases the old document's GPU bitmap promptly.
