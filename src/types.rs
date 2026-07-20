@@ -11,6 +11,16 @@ pub struct OutlineItem {
     pub has_children: bool,
 }
 
+/// One user-created bookmark (Pro creates them; both editions display
+/// them). Persisted inside the PDF as the `pppdf.bookmarks` attachment —
+/// see `crate::bookmarks` for the format.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bookmark {
+    /// 0-based page index.
+    pub page: u16,
+    pub name: String,
+}
+
 use crate::layout::{RectF, SizeU};
 use std::path::PathBuf;
 
