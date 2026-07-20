@@ -892,6 +892,77 @@ fn focused_text_edit_pixels_are_rendered() {
     join_pdf_thread(&reply_rx);
 }
 
+/// Regression: typing into a form field on a page reached by a cache-hit
+/// flip must re-render THAT page, not the page we came from. The PDF thread
+/// remembers the visible page only from explicit visible Render commands;
+/// flipping to an already-cached page sends none, so a form invalidation
+/// would repaint the stale page and the edit would never appear on screen
+/// (STA Captain's Log repro: fields fillable on page 1, dead on pages 2+).
+#[test]
+#[cfg(feature = "pro")]
+fn form_edit_on_cache_hit_page_rerenders_that_page() {
+    use pppdf::types::FormEvent;
+
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::two_page_form_fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, pages, .. } => {
+            assert!(has_forms, "fixture must report a form");
+            assert_eq!(pages, 2);
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    // Establish the visible page as page 0 (the only place last_visible is
+    // set). We never send a visible Render for page 1 — that models the
+    // instant cache-hit flip that leaves last_visible pointing at page 0.
+    let px = SizeU { w: 612, h: 792 };
+    cmd_tx.send(PdfCmd::Render { page: 0, px, rot: 0, visible: true }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { page, .. } => assert_eq!(page, 0),
+        other => panic!("expected Rendered, got {other:?}"),
+    }
+
+    // Interact with page 1's field (rect [100 600 500 640] -> center 300,620).
+    for ev in [
+        FormEvent::MouseMove { x: 300.0, y: 620.0, modifiers: 0 },
+        FormEvent::MouseDown { x: 300.0, y: 620.0, modifiers: 0 },
+        FormEvent::MouseUp { x: 300.0, y: 620.0, modifiers: 0 },
+        FormEvent::Char { c: 'W' as u16, modifiers: 0 },
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 1, ev }).unwrap();
+    }
+
+    // The unsolicited re-render the form invalidation triggers must target
+    // page 1. Before the fix it renders page 0 (stale last_visible), so a
+    // page-1 render never arrives and this times out.
+    let mut rendered_pages = Vec::new();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saw_page_1 = false;
+    while std::time::Instant::now() < deadline && !saw_page_1 {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Rendered { page, .. }) => {
+                rendered_pages.push(page);
+                if page == 1 {
+                    saw_page_1 = true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        saw_page_1,
+        "form edit on page 1 must re-render page 1; instead the thread rendered {rendered_pages:?} \
+         (stale last_visible repainted the page we flipped away from)"
+    );
+
+    cmd_tx.send(PdfCmd::Form { page: 1, ev: FormEvent::KillFocus }).unwrap();
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
 #[test]
 fn load_failure_reports_reason() {
     let _pdfium = pdfium_lock();

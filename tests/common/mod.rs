@@ -198,3 +198,58 @@ pub fn wide_text_fixture_path() -> std::path::PathBuf {
     std::fs::write(&path, build_wide_text_pdf(200)).expect("write wide text fixture pdf");
     path
 }
+
+/// A TWO-page AcroForm, each page one identical-size text field ("f0"/"f1")
+/// at the same rect. Both pages the same 612x792 size on purpose: that is
+/// what makes a flip to page 2 a pure cache hit (identical fit px), the
+/// precondition for the stale-`last_visible` render bug. `NeedAppearances`
+/// forces PDFium to regenerate the field appearance so typed glyphs render.
+pub fn build_two_page_form_pdf() -> Vec<u8> {
+    fn stream_obj(content: &str) -> String {
+        format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
+    }
+    let widget = |id: u32, name: &str, page_ref: u32| {
+        (
+            id,
+            format!(
+                "<< /Type /Annot /Subtype /Widget /FT /Tx /T ({name}) /Ff 0 \
+                 /Rect [100 600 500 640] /P {page_ref} 0 R /DA (/Helv 12 Tf 0 g) >>"
+            ),
+        )
+    };
+    let objs: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 9 0 R >>".into()),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R \
+             /Annots [7 0 R] >>"
+                .into(),
+        ),
+        (
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R \
+             /Annots [8 0 R] >>"
+                .into(),
+        ),
+        (5, stream_obj("0 0 1 rg 40 40 60 60 re f")),
+        (6, stream_obj("0 0 1 rg 40 40 60 60 re f")),
+        widget(7, "f0", 3),
+        widget(8, "f1", 4),
+        (
+            9,
+            "<< /Fields [7 0 R 8 0 R] /NeedAppearances true /DA (/Helv 12 Tf 0 g) \
+             /DR << /Font << /Helv 10 0 R >> >> >>"
+                .into(),
+        ),
+        (10, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Name /Helv >>".into()),
+    ];
+    serialize_pdf(&objs)
+}
+
+/// Write the two-page form fixture to a temp file and return its path.
+pub fn two_page_form_fixture_path() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("pppdf_two_page_form.pdf");
+    std::fs::write(&path, build_two_page_form_pdf()).expect("write two-page form fixture");
+    path
+}

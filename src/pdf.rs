@@ -449,6 +449,19 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 );
             }
             if let Some(eng) = engine.as_mut() {
+                // Form events only ever target the page on screen (you can
+                // only interact with what you see). Flipping to an
+                // already-cached page sends no visible Render, so
+                // `last_visible` can still name the page we came from — and
+                // the unsolicited re-render below would repaint THAT page,
+                // hiding the edit just made (fields dead on every page
+                // reached by a cache-hit flip). Adopt the events' page as the
+                // visible one; its px/rot stay valid because a resize or
+                // rotate always sends a visible Render, so only the page
+                // index can go stale across a same-size flip.
+                if let (Some(&(page, _)), Some(lv)) = (form_events.last(), last_visible.as_mut()) {
+                    lv.0 = page;
+                }
                 for (page, ev) in form_events.drain(..) {
                     eng.handle_event(pdfium.bindings(), page, ev);
                 }
