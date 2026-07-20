@@ -10,6 +10,12 @@ Window (the flagship — test every release):
 - [ ] Minimize/restore via taskbar + Win+Down: animations play
 - [ ] Drag between two monitors with different DPI: crisp re-render, correct size (WM_DPICHANGED)
 - [ ] F11 cycle on a portrait PDF: height-fit (work-area height, page aspect, nearest edge) → fill → restore; on both monitors
+- [ ] Double-click the page background drives the same cycle, and interleaves with F11 (one press, one double-click, … keeps advancing)
+- [ ] Double-click while zoomed still resets to fit and never resizes the window
+- [ ] Double-click over a link (navigates), a form field (Pro: word-select / checkbox), the find bar, and the TOC panel: unchanged, no resize
+- [ ] Double-click with the F1 help up dismisses it without resizing
+- [ ] Double-click with the G prompt or the Ctrl+B prompt (Pro) open dismisses it without resizing; the next double-click cycles
+- [ ] Empty window (no PDF): double-click fills the work area, again restores
 - [ ] F11 height-fit snaps left when the window sits in the left half of the screen, right in the right half
 - [ ] F11 height-fit after rotating to landscape (R): wider window, clamped to the work width if it would overflow
 - [ ] F11 with no document open: two-state fill ↔ restore, no height-fit stage

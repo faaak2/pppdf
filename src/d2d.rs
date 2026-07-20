@@ -31,12 +31,12 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("\u{2191} \u{2193} \u{2192} \u{2190} / Enter / Esc", "Navigate the open overlay"),
     ("Ctrl+wheel", "Zoom at the cursor"),
     ("Drag (zoomed)", "Pan \u{b7} Ctrl+drag moves the window"),
-    ("Double-click or 0", "Back to fit"),
+    ("0 \u{b7} double-click when zoomed", "Back to fit"),
     ("R", "Rotate 90\u{b0} clockwise"),
     ("Ctrl+O", "Open file \u{b7} drop a PDF works too"),
     ("Ctrl+N", "Open a new empty window"),
     ("Ctrl+Shift+O", "Open a file in a new window"),
-    ("F11", "Fit screen height / fill / restore"),
+    ("F11 \u{b7} double-click the page", "Fit screen height / fill / restore"),
     ("Esc / Ctrl+W", "Quit (Esc closes the overlay first)"),
 ];
 

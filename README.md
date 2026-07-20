@@ -74,13 +74,13 @@ same rows minus a handful of self-evident ones, to stay readable.
 | Click a link | Follow it (web links open in your browser) |
 | Ctrl+wheel | Zoom at the cursor |
 | Drag (zoomed) | Pan · Ctrl+drag moves the window |
-| Double-click or 0 | Back to fit |
+| 0 · double-click when zoomed | Back to fit |
 | R | Rotate 90° clockwise |
 | Wheel (zoomed) | Scroll; one more notch at the edge flips the page |
 | Ctrl+O | Open file · drop a PDF works too |
 | Ctrl+N | Open a new empty window |
 | Ctrl+Shift+O | Open a file in a new window |
-| F11 | Fit screen height / fill / restore |
+| F11 · double-click the page | Fit screen height / fill / restore |
 | F1 | Show / hide the help overlay |
 | Esc / Ctrl+W | Quit (Esc closes the overlay first) |
 | Click a form field | Fill it · Tab/Shift+Tab next/previous · Esc leaves (Pro) |
