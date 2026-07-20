@@ -587,6 +587,19 @@ impl App {
         true
     }
 
+    /// Aspect (width/height) of the current page as displayed — rotation
+    /// applied. None when no document is open or it has no pages; F11's
+    /// height-fit stage keys off that None.
+    pub fn page_aspect(&self) -> Option<f32> {
+        match &self.mode {
+            Mode::Doc(d) if d.pages > 0 => {
+                let (w, h) = d.page_pt_rot();
+                Some(w / h)
+            }
+            _ => None,
+        }
+    }
+
     /// Pixel size the current page renders at (current zoom).
     pub fn current_px(&self) -> Option<SizeU> {
         let d = self.doc()?;
@@ -2021,6 +2034,24 @@ mod tests {
         let a1 = a.next_search_id();
         let a2 = a.next_search_id();
         assert!(a1 >= 1 && a2 > a1);
+    }
+
+    // --- F11 page aspect ---
+
+    #[test]
+    fn page_aspect_follows_rotation() {
+        let mut a = app_with_doc(3);
+        let portrait = LETTER.0 / LETTER.1;
+        assert!((a.page_aspect().unwrap() - portrait).abs() < 1e-6);
+        assert!(a.rotate_cw());
+        let landscape = LETTER.1 / LETTER.0;
+        assert!((a.page_aspect().unwrap() - landscape).abs() < 1e-6);
+    }
+
+    #[test]
+    fn page_aspect_none_without_pages() {
+        assert_eq!(App::new().page_aspect(), None);
+        assert_eq!(app_with_doc(0).page_aspect(), None);
     }
 
     #[cfg(feature = "pro")]
