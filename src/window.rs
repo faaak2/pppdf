@@ -2338,6 +2338,12 @@ impl Ui {
                         self.error_box(&format!("Could not save:\n{e}"));
                     }
                 },
+                // Placeholder: nothing sends SaveBookmarks yet (the Ctrl+B
+                // toggle UI lands in a later task, which replaces this arm
+                // with the real saves_inflight/toast handling mirroring
+                // Saved above).
+                #[cfg(feature = "pro")]
+                PdfReply::BookmarksSaved { .. } => {}
             }
         }
         self.reply_rx = Some(rx);

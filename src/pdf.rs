@@ -185,6 +185,11 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
     let mut last_unsolicited: Option<std::time::Instant> = None;
     #[cfg(feature = "pro")]
     let mut current_path: Option<PathBuf> = None;
+    // The password the current document was opened with — needed to
+    // shadow-load the on-disk bytes for a bookmark save. Kept only on
+    // the PDF thread, only in the Pro build.
+    #[cfg(feature = "pro")]
+    let mut current_password: Option<String> = None;
     #[cfg(feature = "pro")]
     let mut engine: Option<crate::pro::forms::FormEngine> = None;
 
@@ -269,6 +274,8 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let mut form_events: Vec<(u16, FormEvent)> = Vec::new();
         #[cfg(feature = "pro")]
         let mut save_requested = false;
+        #[cfg(feature = "pro")]
+        let mut bookmark_saves: Vec<(PathBuf, Vec<crate::types::Bookmark>)> = Vec::new();
         let mut queued_search: Option<ScanState> = None;
         for cmd in batch {
             match cmd {
@@ -305,6 +312,13 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 PdfCmd::Form { page, ev } => form_events.push((page, ev)),
                 #[cfg(feature = "pro")]
                 PdfCmd::SaveDoc => save_requested = true,
+                #[cfg(feature = "pro")]
+                PdfCmd::SaveBookmarks { path, bookmarks } => {
+                    // FIFO, NEVER coalesced: the UI counts one reply per
+                    // command into saves_inflight (a dropped reply would
+                    // block window destruction forever).
+                    bookmark_saves.push((path, bookmarks));
+                }
             }
         }
         // Dedup prefetches per page (keep the newest) and drop ones that
@@ -333,6 +347,27 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         }
         if let Some(s) = queued_search.take() {
             active_search = Some(s);
+        }
+
+        // Bookmark saves execute BEFORE any Load in this batch: every
+        // SaveBookmarks was sent while the pre-Load document was current
+        // (the UI can't know a newer document yet — Loaded hasn't been
+        // pumped). The path guard turns any residual mismatch (double
+        // Load, races) into a graceful error, never a wrong-file write.
+        #[cfg(feature = "pro")]
+        for (bpath, bmarks) in bookmark_saves.drain(..) {
+            let result = match (doc.as_mut(), &current_path) {
+                (Some(d), Some(p)) if *p == bpath => crate::pro::bookmarks::save_bookmarks(
+                    pdfium,
+                    d,
+                    &bpath,
+                    current_password.as_deref(),
+                    &bmarks,
+                ),
+                _ => Err("document changed".into()),
+            };
+            let _ = reply_tx.send(PdfReply::BookmarksSaved { result });
+            wake();
         }
 
         if let Some((path, password)) = load {
@@ -370,6 +405,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                         #[cfg(feature = "pro")]
                         {
                             current_path = Some(path);
+                        }
+                        #[cfg(feature = "pro")]
+                        {
+                            current_password = password;
                         }
                         doc = Some(d);
                         #[cfg(feature = "pro")]

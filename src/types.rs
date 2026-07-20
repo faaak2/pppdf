@@ -111,6 +111,12 @@ pub enum PdfCmd {
     /// Save the current document back to its source path.
     #[cfg(feature = "pro")]
     SaveDoc,
+    /// Persist the full user-bookmark set into the document file. `path`
+    /// names the document the UI meant — the PDF thread refuses to write
+    /// if it no longer matches the open document (a Load may be racing).
+    /// Every command gets exactly one `BookmarksSaved` reply.
+    #[cfg(feature = "pro")]
+    SaveBookmarks { path: PathBuf, bookmarks: Vec<Bookmark> },
     Shutdown,
 }
 
@@ -159,6 +165,11 @@ pub enum PdfReply {
     /// Result of a `SaveDoc` request.
     #[cfg(feature = "pro")]
     Saved {
+        result: Result<(), String>,
+    },
+    /// Result of a `SaveBookmarks` request. One reply per command, always.
+    #[cfg(feature = "pro")]
+    BookmarksSaved {
         result: Result<(), String>,
     },
 }
