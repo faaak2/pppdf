@@ -271,7 +271,10 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
         let mut prefetch: Vec<(u16, SizeU, u8)> = Vec::new();
         let mut superseded: Vec<u16> = Vec::new();
         #[cfg(feature = "pro")]
-        let mut form_events: Vec<(u16, FormEvent)> = Vec::new();
+        // Each entry is (visible view = (page, px, rot), event). The view
+        // rides along so a form edit re-renders the on-screen page even
+        // after a cache-hit flip left `last_visible` stale.
+        let mut form_events: Vec<((u16, SizeU, u8), FormEvent)> = Vec::new();
         #[cfg(feature = "pro")]
         let mut save_requested = false;
         #[cfg(feature = "pro")]
@@ -309,7 +312,7 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     active_search = None;
                 }
                 #[cfg(feature = "pro")]
-                PdfCmd::Form { page, ev } => form_events.push((page, ev)),
+                PdfCmd::Form { page, px, rot, ev } => form_events.push(((page, px, rot), ev)),
                 #[cfg(feature = "pro")]
                 PdfCmd::SaveDoc => save_requested = true,
                 #[cfg(feature = "pro")]
@@ -448,21 +451,16 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                     engine.is_some()
                 );
             }
+            // The view (page, px, rot) the latest form event was tagged with
+            // is what is on screen right now. Captured before draining so the
+            // unsolicited-render branch below can adopt it as `last_visible`
+            // — the fix for edits on a cache-hit-flipped page repainting the
+            // stale page/size. Only the LAST event's view matters: an
+            // intra-batch flip makes it the final on-screen page, while each
+            // event is still dispatched to its own page in the drain loop.
+            let form_view = form_events.last().map(|&(view, _)| view);
             if let Some(eng) = engine.as_mut() {
-                // Form events only ever target the page on screen (you can
-                // only interact with what you see). Flipping to an
-                // already-cached page sends no visible Render, so
-                // `last_visible` can still name the page we came from — and
-                // the unsolicited re-render below would repaint THAT page,
-                // hiding the edit just made (fields dead on every page
-                // reached by a cache-hit flip). Adopt the events' page as the
-                // visible one; its px/rot stay valid because a resize or
-                // rotate always sends a visible Render, so only the page
-                // index can go stale across a same-size flip.
-                if let (Some(&(page, _)), Some(lv)) = (form_events.last(), last_visible.as_mut()) {
-                    lv.0 = page;
-                }
-                for (page, ev) in form_events.drain(..) {
+                for ((page, _, _), ev) in form_events.drain(..) {
                     eng.handle_event(pdfium.bindings(), page, ev);
                 }
             }
@@ -493,6 +491,15 @@ fn run(cmd_rx: Receiver<PdfCmd>, reply_tx: Sender<PdfReply>, wake: impl Fn()) {
                 if visible.is_some() {
                     eng.take_invalidated();
                 } else {
+                    // No visible Render this batch to refresh the memo, but a
+                    // form event named the on-screen view — adopt it so the
+                    // unsolicited re-render targets what's displayed, not the
+                    // page/size we last explicitly rendered. Done ONLY here
+                    // (not when a visible render is present) so a real render
+                    // still owns `last_visible`.
+                    if let Some(view) = form_view {
+                        last_visible = Some(view);
+                    }
                     maybe_render_unsolicited(
                         eng,
                         &doc,

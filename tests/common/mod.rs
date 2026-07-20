@@ -199,24 +199,30 @@ pub fn wide_text_fixture_path() -> std::path::PathBuf {
     path
 }
 
-/// A TWO-page AcroForm, each page one identical-size text field ("f0"/"f1")
-/// at the same rect. Both pages the same 612x792 size on purpose: that is
-/// what makes a flip to page 2 a pure cache hit (identical fit px), the
-/// precondition for the stale-`last_visible` render bug. `NeedAppearances`
-/// forces PDFium to regenerate the field appearance so typed glyphs render.
-pub fn build_two_page_form_pdf() -> Vec<u8> {
+/// A TWO-page AcroForm, each page one text field ("f0"/"f1") at the same
+/// rect. `second_h` sets page 2's height: pass 792 for two identical-size
+/// pages (a flip to page 2 is then a pure cache hit — the precondition for
+/// the stale-`last_visible` render bug), or a different height to exercise
+/// the mixed-size path where the stale view also carries the wrong px.
+/// `NeedAppearances` makes PDFium regenerate the field appearance so typed
+/// glyphs render.
+#[cfg(feature = "pro")]
+pub fn build_two_page_form_pdf(second_h: u32) -> Vec<u8> {
     fn stream_obj(content: &str) -> String {
         format!("<< /Length {} >>\nstream\n{}\nendstream", content.len(), content)
     }
-    let widget = |id: u32, name: &str, page_ref: u32| {
+    let widget = |id: u32, name: &str, page_ref: u32, top: u32, bottom: u32| {
         (
             id,
             format!(
                 "<< /Type /Annot /Subtype /Widget /FT /Tx /T ({name}) /Ff 0 \
-                 /Rect [100 600 500 640] /P {page_ref} 0 R /DA (/Helv 12 Tf 0 g) >>"
+                 /Rect [100 {bottom} 500 {top}] /P {page_ref} 0 R /DA (/Helv 12 Tf 0 g) >>"
             ),
         )
     };
+    // Field near the top of each page, valid whatever the page height.
+    let (p1_top, p1_bot) = (752, 712);
+    let (p2_top, p2_bot) = (second_h - 40, second_h - 80);
     let objs: Vec<(u32, String)> = vec![
         (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 9 0 R >>".into()),
         (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into()),
@@ -228,14 +234,15 @@ pub fn build_two_page_form_pdf() -> Vec<u8> {
         ),
         (
             4,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R \
-             /Annots [8 0 R] >>"
-                .into(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 {second_h}] /Contents 6 0 R \
+                 /Annots [8 0 R] >>"
+            ),
         ),
         (5, stream_obj("0 0 1 rg 40 40 60 60 re f")),
         (6, stream_obj("0 0 1 rg 40 40 60 60 re f")),
-        widget(7, "f0", 3),
-        widget(8, "f1", 4),
+        widget(7, "f0", 3, p1_top, p1_bot),
+        widget(8, "f1", 4, p2_top, p2_bot),
         (
             9,
             "<< /Fields [7 0 R 8 0 R] /NeedAppearances true /DA (/Helv 12 Tf 0 g) \
@@ -247,9 +254,11 @@ pub fn build_two_page_form_pdf() -> Vec<u8> {
     serialize_pdf(&objs)
 }
 
-/// Write the two-page form fixture to a temp file and return its path.
-pub fn two_page_form_fixture_path() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join("pppdf_two_page_form.pdf");
-    std::fs::write(&path, build_two_page_form_pdf()).expect("write two-page form fixture");
+/// Write a two-page form fixture (page 2 height `second_h`) and return its
+/// path, keyed by height so same-size and mixed-size variants don't collide.
+#[cfg(feature = "pro")]
+pub fn two_page_form_fixture_path(second_h: u32) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("pppdf_two_page_form_{second_h}.pdf"));
+    std::fs::write(&path, build_two_page_form_pdf(second_h)).expect("write two-page form fixture");
     path
 }
