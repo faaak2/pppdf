@@ -86,6 +86,7 @@ same rows minus a handful of self-evident ones, to stay readable.
 | Click a form field | Fill it · Tab/Shift+Tab next/previous · Esc leaves (Pro) |
 | F | Mark form fields: highlight / frames / off (Pro) |
 | Ctrl+S | Save filled form in place (Pro) |
+| Ctrl+B | Add / remove a bookmark on this page (Pro) |
 
 ## Make it a PDF handler (optional)
 

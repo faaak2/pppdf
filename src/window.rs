@@ -156,6 +156,10 @@ pub struct Ui {
     /// the process and would kill the detached PDF thread possibly mid-write.
     #[cfg(feature = "pro")]
     pub saves_inflight: u32,
+    /// Pro: draw the current toast bottom-CENTER (the bookmark toasts sit
+    /// in the goto-pill spot) instead of bottom-right.
+    #[cfg(feature = "pro")]
+    pub badge_centered: bool,
     /// Free: the one-per-run "Pro feature" hint has been shown.
     #[cfg(not(feature = "pro"))]
     pub hint_shown: bool,
@@ -211,6 +215,8 @@ pub fn run(app: App, initial_pdf: Option<PathBuf>) -> Result<()> {
             pending_open: None,
             #[cfg(feature = "pro")]
             saves_inflight: 0,
+            #[cfg(feature = "pro")]
+            badge_centered: false,
             #[cfg(not(feature = "pro"))]
             hint_shown: false,
         });
@@ -404,6 +410,8 @@ impl Ui {
                     // caption-draggable page body resets to fit).
                     if wparam.0 as u32 == HTCAPTION {
                         self.dismiss_goto_entry();
+                        #[cfg(feature = "pro")]
+                        self.dismiss_bookmark_entry();
                         if self.app.reset_zoom() {
                             self.sync_renders();
                             self.invalidate();
@@ -495,6 +503,8 @@ impl Ui {
                     // Wheel navigation abandons a half-typed go-to-page entry —
                     // the prompt must not sit open while pages flip under it.
                     self.dismiss_goto_entry();
+                    #[cfg(feature = "pro")]
+                    self.dismiss_bookmark_entry();
                     // Precision touchpads send many small deltas (±20-60); accumulate to
                     // whole 120-unit notches instead of truncating each event to zero.
                     let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -565,6 +575,8 @@ impl Ui {
                     }
                     // A click also abandons the go-to-page entry (then acts normally).
                     self.dismiss_goto_entry();
+                    #[cfg(feature = "pro")]
+                    self.dismiss_bookmark_entry();
                     // Form fields win over links and window dragging.
                     #[cfg(feature = "pro")]
                     {
@@ -785,6 +797,8 @@ impl Ui {
                         }
                     }
                     self.dismiss_goto_entry();
+                    #[cfg(feature = "pro")]
+                    self.dismiss_bookmark_entry();
                     // Client-space double click (only reachable when zoomed / over links).
                     if self.app.reset_zoom() {
                         self.sync_renders();
@@ -1074,6 +1088,23 @@ impl Ui {
                         }
                         self.invalidate();
                     }
+                    // Bookmark-name entry: consumes printable chars with the
+                    // find-bar filter (drops control bytes; BMP-only via
+                    // char::from_u32 — the accepted shared limitation).
+                    // Sits above the find bar, though the two can't be open
+                    // at once (bookmark_toggle_ui closes the bar).
+                    #[cfg(feature = "pro")]
+                    if self.app.bookmark_entry_active() {
+                        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                        let c32 = wparam.0 as u32;
+                        if !ctrl && c32 >= 0x20 {
+                            if let Some(c) = char::from_u32(c32) {
+                                self.app.bookmark_entry_char(c);
+                                self.invalidate();
+                            }
+                        }
+                        return LRESULT(0);
+                    }
                     // Find bar: the first shared-code WM_CHAR consumer. One
                     // filter (`!ctrl && c >= 0x20`) drops Enter/Tab/Esc/
                     // Backspace chars and the control BYTES Ctrl chords
@@ -1240,6 +1271,30 @@ impl Ui {
             self.invalidate();
             return;
         }
+        // Bookmark-name entry (Ctrl+B on an unbookmarked page): modal like
+        // the goto prompt — Enter commits (empty = "Page N"), Esc cancels,
+        // Ctrl+F hands off to the find bar, all else swallowed (printables
+        // arrive via WM_CHAR).
+        #[cfg(feature = "pro")]
+        if self.app.bookmark_entry_active() {
+            match vk {
+                _ if vk == VK_RETURN.0 => {
+                    if let Some(name) = self.app.bookmark_entry_commit() {
+                        self.send_bookmarks();
+                        self.show_toast_centered(format!("Bookmarked: {name}"));
+                    }
+                }
+                _ if vk == VK_ESCAPE.0 => self.app.bookmark_entry_cancel(),
+                _ if vk == VK_BACK.0 => self.app.bookmark_entry_backspace(),
+                _ if vk == 0x46 && unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 => {
+                    self.app.bookmark_entry_cancel();
+                    self.search_open_ui();
+                }
+                _ => {}
+            }
+            self.invalidate();
+            return;
+        }
         // Typing mode: the focused field owns the keyboard. Only Esc
         // (commit + leave) and F1 stay app shortcuts; Space/G/R/0 type text.
         #[cfg(feature = "pro")]
@@ -1280,6 +1335,7 @@ impl Ui {
                 }
                 0x56 if ctrl => self.form_paste(), // Ctrl+V (copy/cut deferred)
                 0x53 if ctrl => self.save_doc(), // Ctrl+S
+                0x42 if ctrl => self.bookmark_toggle_ui(), // Ctrl+B (commits the field first)
                 0x46 if ctrl => {
                     // Ctrl+F leaves the field (commit) and opens the find bar.
                     self.form_kill_focus();
@@ -1319,6 +1375,16 @@ impl Ui {
                 }
             }
             0x4F if ctrl => self.open_dialog(), // Ctrl+O
+            #[cfg(feature = "pro")]
+            0x42 if ctrl => self.bookmark_toggle_ui(), // Ctrl+B
+            #[cfg(not(feature = "pro"))]
+            0x42 if ctrl => {
+                // Deliberate chord -> feedback on EVERY press (unlike the
+                // incidental form-field click hint, which is one-shot).
+                if self.app.doc().is_some() {
+                    self.show_toast("Custom bookmarks are a pppdf Pro feature".into());
+                }
+            }
             _ if vk == VK_F11.0 => self.toggle_fill(),
             _ if vk == VK_TAB.0 => {
                 self.app.toggle_overlay();
@@ -1431,12 +1497,20 @@ impl Ui {
             _ if vk == VK_RIGHT.0 => ov.expand_selected(),
             _ if vk == VK_LEFT.0 => ov.collapse_selected(),
             _ if vk == VK_RETURN.0 => {
-                let page = ov.activate();
-                d.overlay = None;
-                if let Some(page) = page {
-                    if self.app.goto(page) {
-                        self.sync_renders();
-                        self.show_badge();
+                match ov.activate() {
+                    Some(page) => {
+                        d.overlay = None;
+                        if self.app.goto(page) {
+                            self.sync_renders();
+                            self.show_badge();
+                        }
+                    }
+                    // A row with no page target (the Bookmarks header, or an
+                    // outline entry whose destination didn't resolve): toggle
+                    // its children instead of uselessly closing the panel.
+                    None => {
+                        let sel = ov.selected;
+                        ov.toggle(sel);
                     }
                 }
             }
@@ -1559,8 +1633,21 @@ impl Ui {
         }
     }
 
+    /// Close the bookmark-name prompt if open — same rationale as
+    /// dismiss_goto_entry: mouse interaction and the context menu must
+    /// not stack surfaces on top of an invisible keyboard owner.
+    #[cfg(feature = "pro")]
+    fn dismiss_bookmark_entry(&mut self) {
+        if self.app.bookmark_entry_active() {
+            self.app.bookmark_entry_cancel();
+            self.invalidate();
+        }
+    }
+
     fn show_menu(&mut self, sx: i32, sy: i32) {
         self.dismiss_goto_entry();
+        #[cfg(feature = "pro")]
+        self.dismiss_bookmark_entry();
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
             let _ = AppendMenuW(menu, MF_STRING, CMD_OPEN, w!("Open…\tCtrl+O"));
@@ -1680,13 +1767,15 @@ impl Ui {
                 ov.toggle(idx);
             } else {
                 ov.select(idx);
-                let page = ov.activate();
-                d.overlay = None; // jump closes the panel
-                if let Some(page) = page {
-                    if self.app.goto(page) {
-                        self.sync_renders();
-                        self.show_badge();
+                match ov.activate() {
+                    Some(page) => {
+                        d.overlay = None; // jump closes the panel
+                        if self.app.goto(page) {
+                            self.sync_renders();
+                            self.show_badge();
+                        }
                     }
+                    None => ov.toggle(idx), // header row: click toggles, panel stays
                 }
             }
             self.invalidate();
@@ -1941,6 +2030,55 @@ impl Ui {
         self.send_pdf(PdfCmd::SaveDoc);
     }
 
+    /// Ctrl+B: toggle a bookmark on the current page. Bookmarked ->
+    /// remove + auto-save; not bookmarked -> open the name prompt
+    /// (commit auto-saves). Auto-save writes ONLY bookmarks — the PDF
+    /// thread shadow-writes from the on-disk bytes, so pending form
+    /// edits stay pending (Ctrl+S's job).
+    #[cfg(feature = "pro")]
+    fn bookmark_toggle_ui(&mut self) {
+        let Some(d) = self.app.doc() else { return };
+        if d.pages == 0 {
+            return;
+        }
+        if self.app.bookmark_on_current().is_some() {
+            if self.app.bookmark_remove_current().is_some() {
+                if let Some(d) = self.app.doc_mut() {
+                    d.overlay = None; // panel would show the removed bookmark
+                }
+                self.send_bookmarks();
+                self.show_toast_centered("Bookmark removed".into());
+                self.invalidate();
+            }
+            return;
+        }
+        // Opening the prompt: it owns the keyboard. Commit any form edit,
+        // close the TOC panel and the find bar first — two text surfaces
+        // must never stack (the goto-prompt/Ctrl+F courtesy, extended).
+        self.form_kill_focus();
+        if let Some(d) = self.app.doc_mut() {
+            d.overlay = None;
+        }
+        self.search_close_ui();
+        if self.app.bookmark_entry_start() {
+            self.invalidate();
+        }
+    }
+
+    /// Ship the full current set to the PDF thread. Counts into
+    /// saves_inflight exactly like a form save: window destruction must
+    /// wait for the write (the PDF thread is detached).
+    #[cfg(feature = "pro")]
+    fn send_bookmarks(&mut self) {
+        if let Some(d) = self.app.doc() {
+            self.saves_inflight += 1;
+            self.send_pdf(PdfCmd::SaveBookmarks {
+                path: d.path.clone(),
+                bookmarks: d.bookmarks.clone(),
+            });
+        }
+    }
+
     // --- text search (Ctrl+F find bar) ---
 
     /// Open the find bar (Ctrl+F / F3): closes the TOC panel first — the
@@ -2129,11 +2267,23 @@ impl Ui {
 
     /// Transient bottom-right pill with arbitrary text (badge family).
     fn show_toast(&mut self, text: String) {
+        #[cfg(feature = "pro")]
+        {
+            self.badge_centered = false;
+        }
         self.badge = Some((text, 0));
         unsafe {
             SetTimer(Some(self.hwnd), TIMER_BADGE, 33, None);
         }
         self.invalidate();
+    }
+
+    /// Pro: same toast, but bottom-center (the bookmark add/remove
+    /// feedback — spec'd to sit where the goto pill sits).
+    #[cfg(feature = "pro")]
+    fn show_toast_centered(&mut self, text: String) {
+        self.show_toast(text);
+        self.badge_centered = true;
     }
 
     fn show_badge(&mut self) {
@@ -2143,14 +2293,24 @@ impl Ui {
         }
     }
 
-    fn badge_display(&self) -> Option<(&str, f32)> {
+    fn badge_display(&self) -> Option<(&str, f32, bool)> {
+        let centered = {
+            #[cfg(feature = "pro")]
+            {
+                self.badge_centered
+            }
+            #[cfg(not(feature = "pro"))]
+            {
+                false
+            }
+        };
         self.badge.as_ref().map(|(text, ticks)| {
             let alpha = if *ticks <= BADGE_HOLD_TICKS {
                 1.0
             } else {
                 1.0 - (*ticks - BADGE_HOLD_TICKS) as f32 / BADGE_FADE_TICKS as f32
             };
-            (text.as_str(), alpha.clamp(0.0, 1.0))
+            (text.as_str(), alpha.clamp(0.0, 1.0), centered)
         })
     }
 
@@ -2167,8 +2327,8 @@ impl Ui {
         let Some(rx) = self.reply_rx.take() else { return };
         while let Ok(reply) = rx.try_recv() {
             match reply {
-                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms } => {
-                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms);
+                PdfReply::Loaded { path, pages, page_sizes, outline, has_forms, bookmarks } => {
+                    self.app.doc_loaded(path, pages, page_sizes, outline, has_forms, bookmarks);
                     // Drop the renderer's memoized device bitmap with the
                     // document. Its `gen` key already prevents stale pixels;
                     // this releases the old document's GPU bitmap promptly.
@@ -2328,6 +2488,49 @@ impl Ui {
                         self.error_box(&format!("Could not save:\n{e}"));
                     }
                 },
+                #[cfg(feature = "pro")]
+                PdfReply::BookmarksSaved { result } => match result {
+                    Ok(()) => {
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
+                        // Same deferred-intent discipline as Saved(Ok), minus
+                        // the toast (the toggle already gave feedback) and
+                        // minus any form_dirty logic (bookmark saves never
+                        // touch form state).
+                        if let Some(path) = self.pending_open.take() {
+                            self.open_document(path);
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        if self.saves_inflight > 0 {
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                        if self.pending_close {
+                            self.pending_close = false;
+                            if self.app.form_dirty {
+                                self.quit();
+                            } else {
+                                unsafe {
+                                    let _ = DestroyWindow(self.hwnd);
+                                }
+                            }
+                            self.reply_rx = Some(rx);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        self.saves_inflight = self.saves_inflight.saturating_sub(1);
+                        crate::dlog!("ui: bookmark save failed: {e}");
+                        // The bookmark stays in DocState (the TOC keeps
+                        // working this session; the next successful toggle
+                        // rewrites the full set). A failing target file
+                        // deserves eyes, not a silent deferred close/open —
+                        // same conservative stance as Saved(Err).
+                        self.pending_close = false;
+                        self.pending_open = None;
+                        self.show_toast("Couldn't save bookmarks".into());
+                    }
+                },
             }
         }
         self.reply_rx = Some(rx);
@@ -2351,6 +2554,10 @@ impl Ui {
     /// falls through unhandled keys already); Pro typing mode is handled
     /// by nav_back/nav_forward killing form focus, like the wheel does.
     fn modal_active(&self) -> bool {
+        #[cfg(feature = "pro")]
+        if self.app.bookmark_entry_active() {
+            return true;
+        }
         matches!(self.app.mode, crate::app::Mode::Password { .. })
             || self.app.help_visible
             || self.app.goto_entry_active()

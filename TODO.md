@@ -8,4 +8,4 @@
 ## Pro edition
 
 - [ ] Let users place their own elements into the PDF (input fields, checkboxes, markers, etc.)
-- [ ] Set custom bookmarks
+- [x] Set custom bookmarks

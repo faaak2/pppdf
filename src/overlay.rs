@@ -24,12 +24,15 @@ pub struct OutlineState {
     pub selected: usize,
     /// DIP scroll offset into the row list, >= 0.
     pub scroll: f32,
+    /// Index of the "Bookmarks" section-header row, when one exists.
+    /// Set by App::toggle_overlay (never by new()); d2d styles that row.
+    pub header_idx: Option<usize>,
 }
 
 impl OutlineState {
     pub fn new(items: Vec<OutlineItem>) -> Self {
         let expanded = items.iter().map(|it| it.depth == 0).collect();
-        Self { items, expanded, selected: 0, scroll: 0.0 }
+        Self { items, expanded, selected: 0, scroll: 0.0, header_idx: None }
     }
 
     /// Indices into `items` of the rows currently shown, in display order.
@@ -298,5 +301,19 @@ mod tests {
         s.move_selection(1, 100.0);
         assert_eq!(s.activate(), None);
         assert!(matches!(s.hit_test(PointF { x: 5.0, y: 5.0 }, 100.0), OverlayHit::None));
+    }
+
+    #[test]
+    fn pageless_header_row_activates_to_none_and_header_idx_defaults_none() {
+        let mut s = OutlineState::new(vec![
+            OutlineItem { title: "Bookmarks".into(), page: None, depth: 0, has_children: true },
+            item("B1", 3, 1, false),
+        ]);
+        assert_eq!(s.header_idx, None, "callers opt in; new() never sets it");
+        assert_eq!(s.activate(), None, "header row has no page");
+        s.move_selection(1, 1000.0);
+        assert_eq!(s.activate(), Some(3));
+        // The depth-0 default-expansion rule covers the header for free.
+        assert_eq!(s.visible(), vec![0, 1]);
     }
 }

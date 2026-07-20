@@ -51,7 +51,10 @@ fn load_render_outline_links() {
         .send(PdfCmd::Load { path: common::fixture_path(), password: None })
         .unwrap();
     let (pages, page_sizes, outline) = match reply_rx.recv_timeout(WAIT).unwrap() {
-        PdfReply::Loaded { pages, page_sizes, outline, .. } => (pages, page_sizes, outline),
+        PdfReply::Loaded { pages, page_sizes, outline, bookmarks, .. } => {
+            assert!(bookmarks.is_empty(), "fixture has no bookmarks attachment");
+            (pages, page_sizes, outline)
+        }
         other => panic!("expected Loaded, got {other:?}"),
     };
     assert_eq!(pages, 3);
@@ -1257,6 +1260,337 @@ fn renders_take_priority_over_an_active_scan() {
         }
     }
     assert!(saw_page1_render);
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+}
+
+/// Pro bookmarks: SaveBookmarks writes the attachment into the file on
+/// disk; a fresh load reads it back through PdfReply::Loaded.
+#[cfg(feature = "pro")]
+#[test]
+fn bookmarks_save_reload_roundtrip() {
+    use pppdf::types::Bookmark;
+
+    let _pdfium = pdfium_lock();
+    // Own subdirectory: atomic_write's temp name is per-process, and other
+    // tests save under temp_dir too (see throttled_invalidate's comment).
+    let work_dir = std::env::temp_dir().join(format!("pppdf-bm-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let work = work_dir.join("book.pdf");
+    std::fs::write(&work, common::build_fixture_pdf()).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { bookmarks, .. } => assert!(bookmarks.is_empty()),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    let set = vec![
+        Bookmark { page: 2, name: "10 - Dungeons".into() },
+        Bookmark { page: 0, name: "2 - Town".into() },
+    ];
+    cmd_tx.send(PdfCmd::SaveBookmarks { path: work.clone(), bookmarks: set }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::BookmarksSaved { result } => result.expect("bookmark save must succeed"),
+        other => panic!("expected BookmarksSaved, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+
+    // A brand-new PDF thread loading from disk must see them (page-sorted
+    // by parse(), regardless of the order they were sent in).
+    let (reply_tx2, reply_rx2) = mpsc::channel();
+    let cmd_tx2 = pdf::spawn(reply_tx2, || {});
+    cmd_tx2.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx2.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { bookmarks, .. } => {
+            assert_eq!(
+                bookmarks,
+                vec![
+                    Bookmark { page: 0, name: "2 - Town".into() },
+                    Bookmark { page: 2, name: "10 - Dungeons".into() },
+                ]
+            );
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx2.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx2);
+    std::fs::remove_dir_all(&work_dir).ok();
+}
+
+/// THE core spec guarantee: a bookmark save must not persist form edits.
+/// Type into FullName and commit it into the LIVE document (KillFocus),
+/// never Ctrl+S — then save a bookmark. On disk: bookmark present,
+/// FullName still empty (the shadow-write went from disk bytes).
+#[cfg(feature = "pro")]
+#[test]
+fn bookmark_save_excludes_unsaved_form_edits() {
+    use pppdf::types::{Bookmark, FieldKind, FormEvent, FormField};
+
+    let _pdfium = pdfium_lock();
+    let src =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/form.pdf");
+    let work_dir = std::env::temp_dir().join(format!("pppdf-bm-excl-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let work = work_dir.join("form.pdf");
+    std::fs::copy(&src, &work).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { has_forms, .. } => assert!(has_forms),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Rendered { fields, .. } => fields,
+        other => panic!("expected Rendered, got {other:?}"),
+    };
+    // Top-most Text field = FullName (the fixture idiom used by every
+    // form test in this file).
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let f = texts[0];
+    let (cx, cy) =
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0);
+    for ev in [
+        FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 },
+        FormEvent::Char { c: 'A' as u16, modifiers: 0 },
+        FormEvent::Char { c: 'b' as u16, modifiers: 0 },
+        // Commit the value into the LIVE doc's field — but never save it.
+        FormEvent::KillFocus,
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+    }
+    cmd_tx
+        .send(PdfCmd::SaveBookmarks {
+            path: work.clone(),
+            bookmarks: vec![Bookmark { page: 0, name: "Camp".into() }],
+        })
+        .unwrap();
+    // Drain until the BookmarksSaved lands (form events may interleave
+    // FormDirty / unsolicited Rendered replies before it).
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saved = false;
+    while std::time::Instant::now() < deadline && !saved {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::BookmarksSaved { result }) => {
+                result.expect("bookmark save must succeed");
+                saved = true;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(saved, "no BookmarksSaved reply");
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+
+    // Disk: the typed text must NOT be there — FullName must read exactly as
+    // it does in the pristine fixture (a != "Ab" oracle would also pass on an
+    // unrelated lookup failure).
+    let values = pppdf::pro::forms::read_field_values(&work).unwrap();
+    let pristine = pppdf::pro::forms::read_field_values(&src).unwrap();
+    assert_eq!(
+        values.get("FullName"),
+        pristine.get("FullName"),
+        "bookmark save leaked an unsaved form edit to disk"
+    );
+    // ...but the bookmark must be.
+    let (reply_tx2, reply_rx2) = mpsc::channel();
+    let cmd_tx2 = pdf::spawn(reply_tx2, || {});
+    cmd_tx2.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx2.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { bookmarks, .. } => {
+            assert_eq!(bookmarks, vec![Bookmark { page: 0, name: "Camp".into() }]);
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx2.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx2);
+    std::fs::remove_dir_all(&work_dir).ok();
+}
+
+/// The other half of the double-write: a later FORM save (Ctrl+S) must
+/// carry the bookmarks along — the live doc's attachment was updated at
+/// toggle time, so SaveDoc can never wipe them.
+#[cfg(feature = "pro")]
+#[test]
+fn form_save_preserves_bookmarks() {
+    use pppdf::types::{Bookmark, FieldKind, FormEvent, FormField};
+
+    let _pdfium = pdfium_lock();
+    let src =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/form.pdf");
+    let work_dir = std::env::temp_dir().join(format!("pppdf-bm-keep-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let work = work_dir.join("form.pdf");
+    std::fs::copy(&src, &work).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { .. } => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::SaveBookmarks {
+            path: work.clone(),
+            bookmarks: vec![Bookmark { page: 0, name: "Keep me".into() }],
+        })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::BookmarksSaved { result } => result.expect("bookmark save must succeed"),
+        other => panic!("expected BookmarksSaved, got {other:?}"),
+    }
+    // Now a form edit + a FORM save (the fill_save_reload_roundtrip idiom,
+    // FullName only).
+    cmd_tx
+        .send(PdfCmd::Render { page: 0, px: SizeU { w: 612, h: 792 }, rot: 0, visible: true })
+        .unwrap();
+    let fields: Vec<FormField> = loop {
+        match reply_rx.recv_timeout(WAIT).unwrap() {
+            PdfReply::Rendered { fields, .. } => break fields,
+            _ => {}
+        }
+    };
+    let mut texts: Vec<&FormField> = fields.iter().filter(|f| f.kind == FieldKind::Text).collect();
+    texts.sort_by(|a, b| b.rect_pt.top.total_cmp(&a.rect_pt.top));
+    let f = texts[0];
+    let (cx, cy) =
+        ((f.rect_pt.left + f.rect_pt.right) / 2.0, (f.rect_pt.top + f.rect_pt.bottom) / 2.0);
+    for ev in [
+        FormEvent::MouseMove { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseDown { x: cx, y: cy, modifiers: 0 },
+        FormEvent::MouseUp { x: cx, y: cy, modifiers: 0 },
+        FormEvent::Char { c: 'A' as u16, modifiers: 0 },
+        FormEvent::Char { c: 'b' as u16, modifiers: 0 },
+        FormEvent::KillFocus,
+    ] {
+        cmd_tx.send(PdfCmd::Form { page: 0, ev }).unwrap();
+    }
+    cmd_tx.send(PdfCmd::SaveDoc).unwrap();
+    let deadline = std::time::Instant::now() + WAIT;
+    let mut saved = false;
+    while std::time::Instant::now() < deadline && !saved {
+        match reply_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(PdfReply::Saved { result }) => {
+                result.expect("form save must succeed");
+                saved = true;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(saved, "no Saved reply");
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+
+    // Disk now holds BOTH the form value and the bookmark.
+    let values = pppdf::pro::forms::read_field_values(&work).unwrap();
+    assert_eq!(values.get("FullName"), Some(&Some("Ab".to_string())));
+    let (reply_tx2, reply_rx2) = mpsc::channel();
+    let cmd_tx2 = pdf::spawn(reply_tx2, || {});
+    cmd_tx2.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx2.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { bookmarks, .. } => {
+            assert_eq!(bookmarks, vec![Bookmark { page: 0, name: "Keep me".into() }]);
+        }
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx2.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx2);
+    std::fs::remove_dir_all(&work_dir).ok();
+}
+
+/// Removing the last bookmark deletes the attachment entirely (no empty
+/// blob left behind) — observable as an empty set after reload.
+#[cfg(feature = "pro")]
+#[test]
+fn removing_all_bookmarks_deletes_the_attachment() {
+    use pppdf::types::Bookmark;
+
+    let _pdfium = pdfium_lock();
+    let work_dir = std::env::temp_dir().join(format!("pppdf-bm-del-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let work = work_dir.join("book.pdf");
+    std::fs::write(&work, common::build_fixture_pdf()).unwrap();
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { .. } => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx
+        .send(PdfCmd::SaveBookmarks {
+            path: work.clone(),
+            bookmarks: vec![Bookmark { page: 1, name: "Temp".into() }],
+        })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::BookmarksSaved { result } => result.expect("first save"),
+        other => panic!("expected BookmarksSaved, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::SaveBookmarks { path: work.clone(), bookmarks: vec![] }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::BookmarksSaved { result } => result.expect("empty-set save"),
+        other => panic!("expected BookmarksSaved, got {other:?}"),
+    }
+    cmd_tx.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx);
+
+    let (reply_tx2, reply_rx2) = mpsc::channel();
+    let cmd_tx2 = pdf::spawn(reply_tx2, || {});
+    cmd_tx2.send(PdfCmd::Load { path: work.clone(), password: None }).unwrap();
+    match reply_rx2.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { bookmarks, .. } => assert!(bookmarks.is_empty()),
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    cmd_tx2.send(PdfCmd::Shutdown).unwrap();
+    join_pdf_thread(&reply_rx2);
+    std::fs::remove_dir_all(&work_dir).ok();
+}
+
+/// The wrong-document guard: a SaveBookmarks whose path doesn't match the
+/// open document answers Err — never writes anywhere.
+#[cfg(feature = "pro")]
+#[test]
+fn bookmark_save_for_a_different_path_errors() {
+    use pppdf::types::Bookmark;
+
+    let _pdfium = pdfium_lock();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let cmd_tx = pdf::spawn(reply_tx, || {});
+    cmd_tx.send(PdfCmd::Load { path: common::fixture_path(), password: None }).unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::Loaded { .. } => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+    let elsewhere = std::env::temp_dir().join("pppdf-bm-nowhere.pdf");
+    std::fs::remove_file(&elsewhere).ok(); // stale leftovers must not fake the assert below
+    cmd_tx
+        .send(PdfCmd::SaveBookmarks {
+            path: elsewhere.clone(),
+            bookmarks: vec![Bookmark { page: 0, name: "X".into() }],
+        })
+        .unwrap();
+    match reply_rx.recv_timeout(WAIT).unwrap() {
+        PdfReply::BookmarksSaved { result } => {
+            assert!(result.is_err(), "mismatched path must refuse to write");
+        }
+        other => panic!("expected BookmarksSaved, got {other:?}"),
+    }
+    assert!(!elsewhere.exists(), "nothing may be written to the wrong path");
     cmd_tx.send(PdfCmd::Shutdown).unwrap();
     join_pdf_thread(&reply_rx);
 }

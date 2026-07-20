@@ -1,5 +1,6 @@
 //! Library facade so integration tests can reach the internals.
 pub mod app;
+pub mod bookmarks;
 pub mod d2d;
 pub mod dbglog;
 pub mod edition;
